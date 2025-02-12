@@ -105,4 +105,4 @@ To terminate the execution of DAGonFS it's necessary to unmount it, an example m
 # Open-Source external projects
 * [in-RAM file system](https://github.com/watkipet/fuse-cpp-ramfs) an open source project that implement an in-RAM file system
 * [libFUSE3](https://github.com/libfuse/libfuse) an interface for userspace programs to export a filesystem to the Linux kernel
-* [log4cplus](https://github.com/log4cplus/log4cplus) a simple to use C++23 logging API providing thread--safe, flexible, and arbitrarily granular control over log management and configuration. It is modeled after the Java log4j API
+* [log4cplus](https://github.com/log4cplus/log4cplus) a simple to use C++23 logging API providing thread--safe, flexible, and arbitrarily granular control over log management and configuration
