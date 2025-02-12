@@ -3,12 +3,29 @@ DAGonFileSystem (DAGonFS) is an ad-hoc file system written in C++ that transform
 
 # Motivation
 The DAGonStar workflow engine supports two types of workflows: taskflow and dataflow. The focus is on dataflow because DAGonStar implements a specific independence model called the workflow:// schema. This component evaluates all task dependencies and manages data transfer between tasks when these dependencies involve data. According to this paradigm, outputs are produced as files (or directories), with the scratch directory as the root. DAGonStar's design treats a workflow:// schema as the root of the current workflow, acting as a virtual file system. In this context, workflow://<unique_task_name>/ represents the root of the scratch directory created by the DAGonStar Runtime. In a high-performance computing environment, it is crucial to reduce execution time caused by I/O operations on persistent storage (such as file and directory creation). Developing a file system that uses RAM as a temporary storage device would help reduce execution time and improve DAGonStar's performance.
+![Motivation](/figures/MotivationDAGonFS.png)
+
+# Architecture
+DAGonFileSystem has been implemented in two versions, following two distinct models: Client-Server and Peer-to-Peer.
+
+## Client-Server model
+The Client-Server model involves the execution of two types of processes: a client process, also called the master process, which originates the requests for file system operations, and one or more server processes that will remain waiting for a request from the master process. Once a server process receives a request, it is served. The following image shows the modules, their interactions, and the data structures that are part of DAGonFS Client-Server.
+![Client-Server model](/figures/CSArchitecture.jpg)
+
+The actual data of the file in DAGonFS are stored in the DataBlock data strucutre.
+
+## Peer-to-Peer model
+The Peer-to-Peer model involves the execution of a generic peer process on all computational nodes where DAGonFS is running. In this model, unlike the previous one, all peers share the same responsibility, which is to wait for an operation originated by any of the peers. Once a request is received, all other peers respond to that request.
+The following figure shows the DAGonFS Peer-to-Peer modules, their interactions, and the data structures.
+![Peer-to-Peer model](/figures/P2PArchitecture.jpg)
+
+The actual data of the file in DAGonFS are stored in the DataBlock data strucutre.
 
 # Features
 * Trasparency with client proccesses
-* Two models of execution:
-  * Client-Server model, for execution on a single computational node
-  * Peer-to-Peer model, for execution on multiple computational node on hpc clusters
+* Two type of executable versions:
+  * Client-Server, for execution on a single computational node
+  * Peer-to-Peer, for execution on multiple computational node on hpc clusters
 * Possibility to save the file system state to persistent storage
 
 # Acknowledgments
@@ -48,11 +65,25 @@ cmake -DUSE_MPI=ON ../
 make
 ```
 # Demo
+In both models, when DAGonFS is launched, the path of a directory must be provided, which will serve as the mountpoint directory for DAGonFS. Once running, operations on DAGonFS can be performed on the directory just like any other directory in a common file system.
+The difference between the two models lies in where the operations on the mountpoint directory are executed: in the Client-Server model, operations can only be executed on the computational node where the master process is running, as it is the only one intercepting the system calls. In the Peer-to-Peer model, each computational node has its own mountpoint directory, which is considered an entry point for DAGonFS, and operations on DAGonFS can be executed on any of the computational nodes.
 DAGonFileSystem uses a launcher that read from a config file named "DAGonFS.ini" the values of the paramteres that would be given as input to DAGonFS executables. To run DAGonFileSystem make sure to have set the configuration file 'DAGonFS.ini' before launching and also to have copied it and the two DAGonFS executables in the same directory of the launcher.
 
+To run DAGonFileSystem, you need to assign values to the configuration variables within a "DAGonFS.ini" file.
+Once assigned, it is recommended to create your own folder inside which you should copy the newly configured "DAGonFS.ini" file.
 ```bash
-cd DAGonFS
-cd build
-cp ../src/DAGonFS.ini ./
+mkdir dagonfs_exec
+cp DAGonFS/src/DAGonFS.ini dagonfs_exec
+```
+Next, you need to copy the 3 executables found in the output folder of the DAGonFS installation into the newly created folder.
+```bash
+cp DAGonFS/build/DAGonFS_CS.exe dagonfs_exec
+cp DAGonFS/build/DAGonFS_P2P.exe dagonfs_exec
+cp DAGonFS/build/DAGonFS_Launcher dagonfs_exec
+```
+Finally, change th directory to the created one and run the DAGonFS launcher.
+```bash
+cd dagonfs_exec
 ./DAGonFS_Launcher
 ```
+To terminate the execution of DAGonFS it's necessary to unmount it, an example may be the ```fusermount3``` command with ```-u``` option followed by the given path for the mountpoint.
