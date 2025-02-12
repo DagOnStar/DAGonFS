@@ -17,6 +17,13 @@ Thematic Area: 3 – Development and testing of methodologies, middleware, and t
 
 # Performance
 The results obtained from file copy operations were excellent, as it was possible to obtain an improvement in execution time up to 47% compared to the execution time of the same operations on a Shared Network File System (NFS). Moreover, using DAGonFS during the execution of a dataflow with DAGonStar allows for a 37% improvement in execution time compared to NFS.
+The following plots show the execution time of the file copy operation execute on an NFS and with two model of DAGonFileSystem.
+![Execution time as the number of process varies](/figures/DAGonFS_P2P-processes.png)
+![Execution time as the data block size varies](/figures/DAGonFS_P2P-blocksize.png)
+
+Indeed, the following plots show the execution time of a dataflow with DAGonStar using DAGonFS.
+![DAGonStar execution as the number of process varies](/figures/DAGonFS_with_DAGonStar-processes.png)
+![DAGonStar execution as the data block size](/figures/DAGonFS_with_DAGonStar-blocksize.png)
 
 # References
 * De Vita Ciro Giuseppe, Caramiello Dario, Mellone Gennaro, Sánchez-Gallegos, Dante Domizzi, Mele Valeria, Cavallo Stefania, Di Luccio Diana.
