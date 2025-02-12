@@ -1,5 +1,8 @@
 # DAGonFileSystem
-DAGonFileSystem (DAGonFS) is an ad-hoc file system written in C++ that transforms a directory into a distributed user-space and in-RAM storage system. It's main purpose is the improvement of DAGonStar performance.
+DAGonFileSystem (DAGonFS) is a in-RAM and distributed ad-hoc file system written in C++ with the main purpose of improve the performance of the workflow engine DAGonStar.
+
+# Abstract
+The following repository presents the development and implementation of DAGonFileSystem (DAGonFS), an ad-hoc file system that transforms a directory into a distributed user-space and in-RAM storage system. The results obtained from file copy operations were excellent, as it was possible to obtain an improvement in execution time up to 47% compared to the execution time of the same operations on a Shared Network File System (NFS).
 
 # Motivation
 The DAGonStar workflow engine supports two types of workflows: taskflow and dataflow. The focus is on dataflow because DAGonStar implements a specific independence model called the workflow:// schema. This component evaluates all task dependencies and manages data transfer between tasks when these dependencies involve data. According to this paradigm, outputs are produced as files (or directories), with the scratch directory as the root. DAGonStar's design treats a workflow:// schema as the root of the current workflow, acting as a virtual file system. In this context, workflow://<unique_task_name>/ represents the root of the scratch directory created by the DAGonStar Runtime. In a high-performance computing environment, it is crucial to reduce execution time caused by I/O operations on persistent storage (such as file and directory creation). Developing a file system that uses RAM as a temporary storage device would help reduce execution time and improve DAGonStar's performance.
@@ -49,21 +52,32 @@ In: Proceedings of the 2nd Workshop on Workflows in Distributed Environments. Wi
 [link](https://dl.acm.org/doi/10.1145/3642978.3652836)
 
 # Requirements
-DAGonFileSystem was implemented using the OpenMPI (aviable at: https://github.com/open-mpi/ompi) and libfuse (available at: https://github.com/libfuse/libfuse https://osxfuse.github.io) (libfuse3-3.2 or later) libraries.
+DAGonFileSystem was implemented using the OpenMPI and libfuse libraries.
 The use of OpenMPI was crucial to making it a distributed system, enabling message exchanges between processes to distribute and collect data.
 Meanwhile, libfuse allowed for the interception of system calls to execute the file system functionalities implemented in DAGonFS. 
 Therefore, to be successfully compiled, the installation of OpenMPI 4.1.0 (or higher) and libfuse libfuse3-3.2 (or higher) is required.
 DAGonFileSystem builds with CMake version 3.0 or greater.
 
 # Installation
+Clone the repository and enter in the repository directory
 ```bash
 git clone https://github.com/DagOnStar/DAGonFS.git
 cd DAGonFS
+```
+Create the build directory and enter in the build directory
+```bash
 mkdir build
 cd build
+```
+Configure the building enviroment
+```bash
 cmake -DUSE_MPI=ON ../
+```
+Make DAGonFileSystem
+```bash
 make
 ```
+
 # Demo
 In both models, when DAGonFS is launched, the path of a directory must be provided, which will serve as the mountpoint directory for DAGonFS. Once running, operations on DAGonFS can be performed on the directory just like any other directory in a common file system.
 The difference between the two models lies in where the operations on the mountpoint directory are executed: in the Client-Server model, operations can only be executed on the computational node where the master process is running, as it is the only one intercepting the system calls. In the Peer-to-Peer model, each computational node has its own mountpoint directory, which is considered an entry point for DAGonFS, and operations on DAGonFS can be executed on any of the computational nodes.
@@ -81,9 +95,14 @@ cp DAGonFS/build/DAGonFS_CS.exe dagonfs_exec
 cp DAGonFS/build/DAGonFS_P2P.exe dagonfs_exec
 cp DAGonFS/build/DAGonFS_Launcher dagonfs_exec
 ```
-Finally, change th directory to the created one and run the DAGonFS launcher.
+Finally, change the directory to the created one and run the DAGonFS launcher.
 ```bash
 cd dagonfs_exec
 ./DAGonFS_Launcher
 ```
 To terminate the execution of DAGonFS it's necessary to unmount it, an example may be the ```fusermount3``` command with ```-u``` option followed by the given path for the mountpoint.
+
+# Open-Source external projects
+* [in-RAM file system](https://github.com/watkipet/fuse-cpp-ramfs) an open source project that implement an in-RAM file system
+* [libFUSE3](https://github.com/libfuse/libfuse) an interface for userspace programs to export a filesystem to the Linux kernel
+* [log4cplus](https://github.com/log4cplus/log4cplus) a simple to use C++23 logging API providing thread--safe, flexible, and arbitrarily granular control over log management and configuration. It is modeled after the Java log4j API
