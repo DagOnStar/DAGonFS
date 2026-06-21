@@ -36,6 +36,9 @@ DataBlock::~DataBlock() {
 }
 
 void DataBlock::setData(void* address) {
+	if (dataBlockAddress != address) {
+		free(dataBlockAddress);
+	}
 	dataBlockAddress = address;
 }
 
@@ -45,6 +48,6 @@ void* DataBlock::allocateBlock() {
 }
 
 void DataBlock::freeBlock() {
-	if (dataBlockAddress) free(dataBlockAddress);
+	free(dataBlockAddress);
+	dataBlockAddress = nullptr;
 }
-

@@ -121,7 +121,9 @@ FileSystem::FileSystem(int rank, int mpi_world_size) {
 }
 
 FileSystem::~FileSystem() {
-    fclose(timeFile);
+    if (timeFile != nullptr) {
+        fclose(timeFile);
+    }
 }
 
 /**
@@ -137,7 +139,7 @@ int FileSystem::start(int argc,char *argv[]) {
     if (!mountpoint) {
         if (mkdir(argv[2],0777) < 0) {
             LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() <<  "failed to create mountpoint parent directory");
-            return ret;
+            return errno;
         }
     }
     else {
@@ -148,7 +150,7 @@ int FileSystem::start(int argc,char *argv[]) {
     if (!mountpoint) {
         if (mkdir(fsPath.c_str(),0777) < 0) {
             LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() <<  "failed to create mountpoint directory");
-            return ret;
+            return errno;
         }
     }
     else closedir(mountpoint);
@@ -158,7 +160,7 @@ int FileSystem::start(int argc,char *argv[]) {
     if (!timeDir) {
         if (mkdir(timesDirName.c_str(),0777) < 0) {
             LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() <<  "failed to create times directory");
-            return ret;
+            return errno;
         }
     }
     else closedir(timeDir);
@@ -166,17 +168,19 @@ int FileSystem::start(int argc,char *argv[]) {
     timeFile = fopen(timesFileName.c_str(), "w");
     if (!timeFile) {
         LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() <<  "failed to create times file");
-        return ret;
+        return errno;
     }
 
     //LIBFUSE
     //Argument copying for fuse args
     //This operation is a prevention: the program also uses MPI, for this
     //  reason it's better keep the original args untouched
-    memcpy(argv[2], fsPath.c_str(), fsPath.length());
     ArgumentParser parser = ArgumentParser();
     parser.copy_args(argc, argv);
     char **copied_argv_for_fuse = parser.getCopiedArgs();
+    delete[] copied_argv_for_fuse[2];
+    copied_argv_for_fuse[2] = new char[fsPath.size() + 1];
+    strcpy(copied_argv_for_fuse[2], fsPath.c_str());
     fuse_args args_for_fuse = FUSE_ARGS_INIT(argc, copied_argv_for_fuse);
     fuse_cmdline_opts fuse_options;
 
@@ -354,6 +358,7 @@ void FileSystem::FuseGetAttr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
     //Fail if the inode hasn't been created yet
     if (ino >= INodeManager->getNumberOfINodes()) {
         fuse_reply_err(req, ENOENT);
+        return;
     }
 
     //TODO: What do we do if the inode was deleted?
@@ -439,6 +444,7 @@ void FileSystem::FuseSetAttr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, 
     // Fail if the inode hasn't been created yet
     if (ino >= INodeManager->getNumberOfINodes()) {
         fuse_reply_err(req, ENOENT);
+        return;
     }
 
     // TODO: What do we do if the inode was deleted?
@@ -1583,10 +1589,11 @@ void FileSystem::FuseGetLock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
         return;
     }
 
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tgetlk for " << ino);
-    // TODO: implement locking
+    // DAGonFS does not retain POSIX byte-range locks. Report that no lock
+    // conflicts with the requested range, as required by F_GETLK.
+    lock->l_type = F_UNLCK;
+    fuse_reply_lock(req, lock);
 
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Getting the lock -> FuseRamFs::FuseGetLock completed!");
 }

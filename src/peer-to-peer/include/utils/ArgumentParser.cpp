@@ -14,10 +14,8 @@ ArgumentParser::ArgumentParser(int argc, char** argv) {
 /* Destructor. If the copy of the arguments has not been deleted, the destructor will free the allocated memory
  */
 ArgumentParser::~ArgumentParser() {
-	/*
-	if (this->copied_args != nullptr)
-		delete_args(this->argc,this->copied_args);
-	*/
+	// FUSE may take ownership of and reallocate the argument array.
+	// Its cleanup routine must run before the copied arguments are released.
 }
 
 /* Function that make a copy of argv[] parameter of the main function
@@ -26,6 +24,7 @@ ArgumentParser::~ArgumentParser() {
  * @return The Copy of the argumetens
  */
 char ** ArgumentParser::copy_args(int argc, char * argv[]) {
+	this->argc = argc;
 	this->copied_args = new char*[argc];
 	for (int i = 0; i < argc; ++i) {
 		int len = (int) strlen(argv[i]) + 1;
@@ -40,8 +39,15 @@ char ** ArgumentParser::copy_args(int argc, char * argv[]) {
  * @param argv The actual data to free
  * */
 void ArgumentParser::delete_args(int argc, char** argv){
-	for (int i = 0; i < argc; i++) {
-		delete this->copied_args[i];
+	if (argv == nullptr) {
+		return;
 	}
-	delete this->copied_args;
+	for (int i = 0; i < argc; i++) {
+		delete[] argv[i];
+	}
+	delete[] argv;
+	if (argv == this->copied_args) {
+		this->copied_args = nullptr;
+		this->argc = 0;
+	}
 }

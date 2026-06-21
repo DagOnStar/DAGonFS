@@ -33,8 +33,12 @@ fuse_ino_t Directory::ChildINodeNumberWithName(const std::string& name) {
  @return The old inode number before the change.
  */
 fuse_ino_t Directory::UpdateChild(const std::string& name, fuse_ino_t ino) {
-    fuse_ino_t ino_ret = m_children[name];
-    m_children[name] = ino;
+    const auto child = m_children.find(name);
+    if (child == m_children.end()) {
+        return static_cast<fuse_ino_t>(-1);
+    }
+    fuse_ino_t ino_ret = child->second;
+    child->second = ino;
 
     // TODO: What about directory sizes? Shouldn't we increase the reported size of our dir?
 
@@ -42,8 +46,12 @@ fuse_ino_t Directory::UpdateChild(const std::string& name, fuse_ino_t ino) {
 }
 
 fuse_ino_t Directory::DeleteChild(const std::string& name) {
-    fuse_ino_t ino_ret = m_children[name];
-    m_children.erase(name);
+    const auto child = m_children.find(name);
+    if (child == m_children.end()) {
+        return static_cast<fuse_ino_t>(-1);
+    }
+    fuse_ino_t ino_ret = child->second;
+    m_children.erase(child);
     return ino_ret;
 }
 
@@ -60,4 +68,3 @@ bool Directory::hasChildren() {
     }
     return false;
 }
-

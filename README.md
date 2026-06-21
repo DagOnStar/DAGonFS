@@ -1,5 +1,12 @@
 # DAGonFileSystem
-DAGonFileSystem (DAGonFS) is a in-RAM and distributed ad-hoc file system written in C++ with the main purpose of improve the performance of the workflow engine DAGonStar.
+DAGonFileSystem (DAGonFS) is an in-memory, MPI-distributed FUSE filesystem written in C++ for improving I/O performance in DAGonStar workflows. It provides client-server and peer-to-peer deployment models and is designed for temporary workflow data rather than durable storage.
+
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Configuration and operation](docs/CONFIGURATION.md)
+- [POSIX/FUSE compatibility](docs/POSIX-COMPATIBILITY.md)
+- [Contributor guide](AGENTS.md)
 
 # Abstract
 The following repository presents the development and implementation of DAGonFileSystem (DAGonFS), an ad-hoc file system that transforms a directory into a distributed user-space and in-RAM storage system. The results obtained from file copy operations were excellent, as it was possible to obtain an improvement in execution time up to 47% compared to the execution time of the same operations on a Shared Network File System (NFS).
@@ -56,7 +63,7 @@ DAGonFileSystem was implemented using the OpenMPI and libfuse libraries.
 The use of OpenMPI was crucial to making it a distributed system, enabling message exchanges between processes to distribute and collect data.
 Meanwhile, libfuse allowed for the interception of system calls to execute the file system functionalities implemented in DAGonFS. 
 Therefore, to be successfully compiled, the installation of OpenMPI 4.1.0 (or higher) and libfuse libfuse3-3.2 (or higher) is required.
-DAGonFileSystem builds with CMake version 3.0 or greater.
+DAGonFileSystem requires CMake 3.20 or newer and a compiler with C++23 support.
 
 # Installation
 Clone the repository and enter in the repository directory
@@ -64,24 +71,19 @@ Clone the repository and enter in the repository directory
 git clone https://github.com/DagOnStar/DAGonFS.git
 cd DAGonFS
 ```
-Create the build directory and enter in the build directory
-```bash
-mkdir build
-cd build
-```
 Configure the building enviroment
 ```bash
-cmake -DUSE_MPI=ON ../
+cmake -S . -B build -DUSE_MPI=ON
 ```
 Make DAGonFileSystem
 ```bash
-make
+cmake --build build
 ```
 
 # Demo
 In both models, when DAGonFS is launched, the path of a directory must be provided, which will serve as the mountpoint directory for DAGonFS. Once running, operations on DAGonFS can be performed on the directory just like any other directory in a common file system.
 The difference between the two models lies in where the operations on the mountpoint directory are executed: in the Client-Server model, operations can only be executed on the computational node where the master process is running, as it is the only one intercepting the system calls. In the Peer-to-Peer model, each computational node has its own mountpoint directory, which is considered an entry point for DAGonFS, and operations on DAGonFS can be executed on any of the computational nodes.
-DAGonFileSystem uses a launcher that read from a config file named "DAGonFS.ini" the values of the paramteres that would be given as input to DAGonFS executables. To run DAGonFileSystem make sure to have set the configuration file 'DAGonFS.ini' before launching and also to have copied it and the two DAGonFS executables in the same directory of the launcher.
+DAGonFileSystem uses a launcher that reads `DAGonFS.ini` and starts the selected model through MPI. Configure the file and copy it, the launcher, and both executables into the same execution directory. See [Configuration and operation](docs/CONFIGURATION.md) for the configuration reference and shutdown procedure.
 
 To run DAGonFileSystem, you need to assign values to the configuration variables within a "DAGonFS.ini" file.
 Once assigned, it is recommended to create your own folder inside which you should copy the newly configured "DAGonFS.ini" file.

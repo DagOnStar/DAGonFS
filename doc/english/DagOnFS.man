@@ -1,26 +1,26 @@
-.TH DagOnFS 1 "19 May 2017" "Peter Watkins" "Peter Watkins"
+.TH DAGonFS 1 "21 June 2026" "DAGonFS" "DAGonFS"
 .SH NAME
-DagOnFS An example RAM Filesysetem for using FUSE and written in C++.
+DAGonFS \- MPI-distributed in-memory filesystem using FUSE3
 .SH SYNOPSIS
-DagOnFS
+.B DAGonFS_Launcher
 .br
 .SH DESCRIPTION
-\fBDagOnFS\fP An example RAM Filesysetem for using FUSE and written in C++.
-\fBDagOnFS\fP is free software, and is designed for operation on POSIX
-operating systems.  Redistribution and/or modification
-is permitted under the terms of the Lesser GNU General Public License, Version 3,
-as published by the Free Software Foundation. 
+.B DAGonFS
+is an in-memory FUSE3 filesystem for temporary workflow data. It coordinates file
+data between MPI processes using either a client-server or peer-to-peer model.
+It is not durable storage: unmounting or stopping the service discards its contents.
 .PP
-\fBDagOnFS\fP is distributed in the hope that it will be useful, but
-WITHOUT ANY WARRANTY, without even the implied warranty of MERCHANTABILITY
-or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
-for more details.
+.B DAGonFS_Launcher
+reads DAGonFS.ini in its current directory and invokes MPI with the configured model,
+mountpoint, and logging settings. The executable requires FUSE3 and Open MPI.
+.SH POSIX OPERATIONS
+The filesystem supports regular file and directory creation, lookup, reads, writes,
+renames, links, symbolic links, metadata changes, extended attributes, statfs, and
+the FUSE lifecycle operations. It reports no retained byte-range locks for getlk.
+Extensions such as fallocate, ioctl, polling, and retained byte-range locks are not
+provided.
 .SH ADDITIONAL INFORMATION
-The latest news and information regarding \fBDagOnFS\fP software is
-available through the official \fBDagOnFS\fP software web page located
-at: \fIhttp://www.github.com/watkipet/DagOnFS\fP.
+Project documentation is available in the repository's docs directory.
 .SH AUTHORS
 .TP
-Peter Watkins <\fIwatkipet@gmail.com\fP>
-Creator, Lead Developer
-
+DAGonFS contributors

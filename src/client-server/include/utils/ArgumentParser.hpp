@@ -11,7 +11,7 @@ private:
 	char **copied_args;
 
 public:
-	ArgumentParser(){};
+	ArgumentParser() : argc(0), copied_args(nullptr) {};
 	ArgumentParser(int argc, char **argv);
 	~ArgumentParser();
 	char **copy_args(int argc, char * argv[]);

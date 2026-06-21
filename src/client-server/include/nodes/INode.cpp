@@ -28,14 +28,18 @@ INode::INode() {
     INodeLogger.setLogLevel(ll);
 }
 
-INode::~INode() {}
+INode::~INode() {
+    for (auto& [name, attribute] : m_xattr) {
+        free(attribute.first);
+    }
+}
 
 void INode::Lookup() {
     m_nlookup++;
 }
 
 void INode::Forget(unsigned long nlookup) {
-    m_nlookup -= nlookup;
+    m_nlookup = nlookup >= m_nlookup ? 0 : m_nlookup - nlookup;
 }
 
 /**
@@ -50,12 +54,8 @@ void INode::RemoveHardLink() {
 
 int INode::SetXAttr(const string& name, const void* value, size_t size, int flags, uint32_t position) {
     LOG4CPLUS_TRACE(INodeLogger, INodeLogger.getName() << "\tSetting " << name << "attribute with value " << value <<" -> FuseRamFs::FuseSetXAttr");
-    if (m_xattr.find(name) == m_xattr.end()) {
-        if (flags & XATTR_CREATE) {
-            return EEXIST;
-        }
-    }
-    else {
+    const auto attribute = m_xattr.find(name);
+    if (attribute == m_xattr.end()) {
         if (flags & XATTR_REPLACE) {
             #ifdef __APPLE__
             return ENOATTR;
@@ -63,9 +63,14 @@ int INode::SetXAttr(const string& name, const void* value, size_t size, int flag
             return ENODATA;
             #endif
         }
+    } else if (flags & XATTR_CREATE) {
+        return EEXIST;
     }
 
     // TODO: What about overflow with size + position?
+    if (size > SIZE_MAX - position) {
+        return E2BIG;
+    }
     size_t newExtent = size + position;
 
     // Expand the space for the value if required.
@@ -106,6 +111,7 @@ int INode::RemoveXAttr(const string& name) {
         #endif
     }
 
+    free(it->second.first);
     m_xattr.erase(it);
 
     LOG4CPLUS_TRACE(INodeLogger, INodeLogger.getName() << "\tRemoving " << name << "attribute -> INode::RemoveXAttrAndReply completed!");

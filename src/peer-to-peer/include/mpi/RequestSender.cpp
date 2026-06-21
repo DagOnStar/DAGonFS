@@ -13,6 +13,14 @@
 
 using namespace std;
 
+namespace {
+template <size_t N>
+void copyRequestPath(char (&destination)[N], const string& source) {
+    strncpy(destination, source.c_str(), N - 1);
+    destination[N - 1] = '\0';
+}
+}
+
 void RequestSender::sendWriteRequest(int sourceRank, int mpiWorldSize) {
 	RequestPacket loopRequest;
 	loopRequest.type = WRITE;
@@ -37,7 +45,7 @@ void RequestSender::sendCreateFileRequest(string name, int sourceRank, int mpiWo
 	RequestPacket loopRequest;
 	loopRequest.type = CREATE_FILE;
 	FileCreationRequest fileCreateRequest;
-	memcpy(fileCreateRequest.name, name.c_str(), name.size());
+	copyRequestPath(fileCreateRequest.name, name);
 	for (int i=0 ; i<mpiWorldSize ; i++) {
 		MPI_Send(&loopRequest, sizeof(RequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
 		if (i != sourceRank) {
@@ -50,7 +58,7 @@ void RequestSender::sendDeleteFileRequest(string name, int sourceRank, int mpiWo
 	RequestPacket loopRequest;
 	loopRequest.type = DELETE_FILE;
 	FileDeletionRequest fileDeleteRequest;
-	memcpy(fileDeleteRequest.name, name.c_str(), name.size());
+	copyRequestPath(fileDeleteRequest.name, name);
 	for (int i=0 ; i<mpiWorldSize ; i++) {
 		MPI_Send(&loopRequest, sizeof(RequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
 		if (i != sourceRank) {
@@ -63,7 +71,7 @@ void RequestSender::sendCreateDirectoryRequest(string dirAbsPath, int sourceRank
 	RequestPacket loopRequest;
 	loopRequest.type = CREATE_DIR;
 	DirectoryCreationRequest dirCreateRequest;
-	memcpy(dirCreateRequest.absolutePath, dirAbsPath.c_str(), dirAbsPath.size());
+	copyRequestPath(dirCreateRequest.absolutePath, dirAbsPath);
 	for (int i=0; i< mpiWorldSize; i++) {
 		MPI_Send(&loopRequest, sizeof(RequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
 		if (i != sourceRank)
@@ -75,7 +83,7 @@ void RequestSender::sendDeleteDirectoryRequest(string dirAbsPath, int sourceRank
 	RequestPacket loopRequest;
 	loopRequest.type = DELETE_DIR;
 	DirectoryDeletionRequest dirDeleteRequest;
-	memcpy(dirDeleteRequest.absolutePath, dirAbsPath.c_str(), dirAbsPath.size());
+	copyRequestPath(dirDeleteRequest.absolutePath, dirAbsPath);
 	for (int i=0; i< mpiWorldSize; i++) {
 		MPI_Send(&loopRequest, sizeof(RequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
 		if (i != sourceRank)
@@ -87,8 +95,8 @@ void RequestSender::sendRenameRequest(std::string oldName, std::string newName, 
 	RequestPacket loopRequest;
 	loopRequest.type = RENAME;
 	RenameRequest renameRequest;
-	memcpy(renameRequest.oldName, oldName.c_str(), oldName.size());
-	memcpy(renameRequest.newName, newName.c_str(), newName.size());
+	copyRequestPath(renameRequest.oldName, oldName);
+	copyRequestPath(renameRequest.newName, newName);
 	for (int i=0; i< mpiWorldSize; i++) {
 		MPI_Send(&loopRequest, sizeof(RequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
 		if (i != sourceRank)

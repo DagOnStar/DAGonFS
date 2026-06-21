@@ -7,6 +7,13 @@
 
 using namespace std;
 
+string trim(string value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == string::npos) return "";
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
 map<string, string> readConfig(const string& filename) {
     map<string, string> config;
     ifstream file(filename);
@@ -21,12 +28,8 @@ map<string, string> readConfig(const string& filename) {
         if (line.empty() || line[0] == '#') continue; // Ignora linee vuote e commenti
         size_t pos = line.find('=');
         if (pos != string::npos) {
-            string key = line.substr(0, pos-1);
-            string value = line.substr(pos + 1);
-            if(value.length() == 1 || value.length() == 0)
-              value = "";
-            else
-              value = value.substr(1);
+            string key = trim(line.substr(0, pos));
+            string value = trim(line.substr(pos + 1));
             config[key] = value;
             cout<<"config["<<key<<"]="<<value<<endl;
         }
@@ -70,4 +73,3 @@ int main() {
 
     return ret;
 }
-
