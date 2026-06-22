@@ -7,6 +7,8 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+include(CTest)
+
 option(USE_MPI "Use MPI for distributed memory." OFF)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/CMake)
@@ -164,3 +166,11 @@ set_property(TARGET ${PROJECT_NAME}_Launcher PROPERTY CXX_STANDARD 23)
 
 # Installazione
 install(TARGETS ${PROJECT_NAME}_CS.exe ${PROJECT_NAME}_P2P.exe ${PROJECT_NAME}_Launcher DESTINATION bin)
+
+if(BUILD_TESTING)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(
+        NAME dagonfs-source-contract
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_source_contract.py
+    )
+endif()

@@ -21,7 +21,11 @@ Blocks::Blocks() {
 }
 
 Blocks::~Blocks() {
-
+	for (auto& [inode, blocks] : FileSystemDataBlocks) {
+		for (DataBlock* block : blocks) {
+			delete block;
+		}
+	}
 }
 
 void Blocks::createEmptyBlockListForInode(fuse_ino_t inode) {
@@ -36,7 +40,7 @@ void Blocks::setBlockListForInode(fuse_ino_t inode, vector<DataBlock*> &blockLis
 }
 
 bool Blocks::blockListExistForInode(fuse_ino_t inode) {
-	return FileSystemDataBlocks.find(inode) == FileSystemDataBlocks.end();
+	return FileSystemDataBlocks.find(inode) != FileSystemDataBlocks.end();
 }
 
 
@@ -63,16 +67,17 @@ void Blocks::addDataBlockToInode(fuse_ino_t inode, DataBlock* dataBlock) {
 }
 
 unsigned int Blocks::getNumberOfUsedBlocksOfInode(fuse_ino_t inode) {
-	return FileSystemDataBlocks[inode].size();
+	const auto blocks = FileSystemDataBlocks.find(inode);
+	return blocks == FileSystemDataBlocks.end() ? 0 : blocks->second.size();
 }
 
 unsigned int Blocks::getTotalBlockBytesOfInode(fuse_ino_t inode) {
-	unsigned int totalBytes = FileSystemDataBlocks[inode].size();
+	unsigned int totalBytes = getNumberOfUsedBlocksOfInode(inode);
 	return totalBytes * FILE_SYSTEM_SINGLE_BLOCK_SIZE;
 }
 
 bool Blocks::hasNoBlocks(fuse_ino_t inode) {
-	return FileSystemDataBlocks[inode].empty();
+	const auto blocks = FileSystemDataBlocks.find(inode);
+	return blocks == FileSystemDataBlocks.end() || blocks->second.empty();
 }
-
 

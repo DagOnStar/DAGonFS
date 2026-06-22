@@ -137,6 +137,7 @@ public:
      * @param conn Information on the capabilities of the connection to FUSE.
      */
     static void FuseInit(void *userdata, struct fuse_conn_info *conn);
+    static void FuseDestroy(void *userdata);
 
     /**
      * @brief Gets inode's attributes.
@@ -164,6 +165,7 @@ public:
      * @param nlookup The number of the references that the kernel is currently forgetting.
      */
     static void FuseForget(fuse_req_t req, fuse_ino_t ino, unsigned long nlookup);
+    static void FuseForgetMulti(fuse_req_t req, size_t count, struct fuse_forget_data *forgets);
 
     /**
      * @brief Sets the given attributes on the given inode.

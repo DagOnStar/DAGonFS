@@ -159,21 +159,21 @@ void Nodes::SetINodeAttributes(INode *inode, struct stat* attr, int to_set) {
     }
     if (to_set & FUSE_SET_ATTR_ATIME) {
         #ifdef __APPLE__
-        m_fuseEntryParam.attr.st_atimespec = attr->st_atimespec;
+        inode->m_fuseEntryParam.attr.st_atimespec = attr->st_atimespec;
         #else
         inode->m_fuseEntryParam.attr.st_atim = attr->st_atim;
         #endif
     }
     if (to_set & FUSE_SET_ATTR_MTIME) {
         #ifdef __APPLE__
-        m_fuseEntryParam.attr.st_mtimespec = attr->st_mtimespec;
+        inode->m_fuseEntryParam.attr.st_mtimespec = attr->st_mtimespec;
         #else
         inode->m_fuseEntryParam.attr.st_mtim = attr->st_mtim;
         #endif
     }
     #ifdef __APPLE__
     if (to_set & FUSE_SET_ATTR_CHGTIME) {
-        m_fuseEntryParam.attr.st_ctimespec = attr->st_ctimespec;
+        inode->m_fuseEntryParam.attr.st_ctimespec = attr->st_ctimespec;
     #else
     if (to_set & FUSE_SET_ATTR_CTIME) {
         inode->m_fuseEntryParam.attr.st_ctim = attr->st_ctim;
@@ -182,20 +182,20 @@ void Nodes::SetINodeAttributes(INode *inode, struct stat* attr, int to_set) {
 
     #ifdef __APPLE__
     if (to_set & FUSE_SET_ATTR_CRTIME) {
-        m_fuseEntryParam.attr.st_birthtimespec = attr->st_birthtimespec;
+        inode->m_fuseEntryParam.attr.st_birthtimespec = attr->st_birthtimespec;
     }
     // TODO: Can't seem to find this one.
     //    if (to_set & FUSE_SET_ATTR_BKUPTIME) {
     //        m_fuseEntryParam.attr.st_ = attr->st_mode;
     //    }
     if (to_set & FUSE_SET_ATTR_FLAGS) {
-        m_fuseEntryParam.attr.st_flags = attr->st_flags;
+        inode->m_fuseEntryParam.attr.st_flags = attr->st_flags;
     }
     #endif /* __APPLE__ */
 
     // TODO: What do we do if this fails? Do we care? Log the event?
     #ifdef __APPLE__
-    clock_gettime(CLOCK_REALTIME, &(m_fuseEntryParam.attr.st_ctimespec));
+    clock_gettime(CLOCK_REALTIME, &(inode->m_fuseEntryParam.attr.st_ctimespec));
     #else
     clock_gettime(CLOCK_REALTIME, &(inode->m_fuseEntryParam.attr.st_ctim));
     #endif

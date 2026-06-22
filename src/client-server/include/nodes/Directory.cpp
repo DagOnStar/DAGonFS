@@ -35,6 +35,7 @@ fuse_ino_t Directory::ChildINodeNumberWithName(const std::string& name) {
 fuse_ino_t Directory::UpdateChild(const std::string& name, fuse_ino_t ino) {
     const auto child = m_children.find(name);
     if (child == m_children.end()) {
+        m_children.emplace(name, ino);
         return static_cast<fuse_ino_t>(-1);
     }
     fuse_ino_t ino_ret = child->second;

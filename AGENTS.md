@@ -26,6 +26,9 @@ Run the checks appropriate to the change:
 cmake -S . -B build -DUSE_MPI=ON
 cmake --build build
 python3 -m py_compile tests/mount.py tests/usage.py
+python3 tests/test_source_contract.py
+# Requires a running DAGonFS mount:
+DAGONFS_MOUNTPOINT=/path/to/mount python3 tests/test_python_posix.py
 git diff --check
 ```
 

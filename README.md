@@ -6,6 +6,7 @@ DAGonFileSystem (DAGonFS) is an in-memory, MPI-distributed FUSE filesystem writt
 - [Architecture](docs/ARCHITECTURE.md)
 - [Configuration and operation](docs/CONFIGURATION.md)
 - [POSIX/FUSE compatibility](docs/POSIX-COMPATIBILITY.md)
+- [Performance methodology and tuning](docs/PERFORMANCE.md)
 - [Contributor guide](AGENTS.md)
 
 # Abstract

@@ -29,10 +29,11 @@ void DataBlockManager::addDataBlocksTo(vector<DataBlock*>& blockList, int nblock
 	int startingIndex = blockList.size();
 	LOG4CPLUS_INFO(DataBlockManagerLogger, DataBlockManagerLogger.getName() << "Master Process - Starting index for new blocks: " << startingIndex);
 	int newSize = blockList.size() + nblocks;
+	blockList.reserve(newSize);
 	LOG4CPLUS_INFO(DataBlockManagerLogger, DataBlockManagerLogger.getName() << "Master Process - New block list size: " << newSize);
 	int lastRank = blockList.size() == 0 ? 0 : blockList[startingIndex - 1]->getRank();
 	LOG4CPLUS_INFO(DataBlockManagerLogger, DataBlockManagerLogger.getName() << "Master Process - Last rank in list " << lastRank);
-	int rank_i = lastRank;
+	int rank_i = blockList.empty() ? startingRank : (lastRank + 1) % mpi_world_size;
 	LOG4CPLUS_INFO(DataBlockManagerLogger, DataBlockManagerLogger.getName() << "Master Process - Starting rank " << lastRank);
 
 	for (int i = startingIndex; i < newSize; i++) {

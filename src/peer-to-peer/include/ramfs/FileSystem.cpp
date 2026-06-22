@@ -65,9 +65,11 @@ DistributedCode *FileSystem::distributedProcessCode = nullptr;
  */
 FileSystem::FileSystem(int rank, int mpi_world_size) {
     FuseOperations.init        = FileSystem::FuseInit;
+    FuseOperations.destroy     = FileSystem::FuseDestroy;
     FuseOperations.getattr     = FileSystem::FuseGetAttr;
     FuseOperations.lookup      = FileSystem::FuseLookup;
     FuseOperations.forget      = FileSystem::FuseForget;
+    FuseOperations.forget_multi = FileSystem::FuseForgetMulti;
     FuseOperations.setattr     = FileSystem::FuseSetAttr;
     FuseOperations.readlink    = FileSystem::FuseReadLink;
     FuseOperations.mknod       = FileSystem::FuseMknod;
@@ -323,6 +325,11 @@ void FileSystem::FuseInit(void *userdata, struct fuse_conn_info *conn) {
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "FuseInit() completed!");
 }
 
+void FileSystem::FuseDestroy(void *userdata) {
+    (void) userdata;
+    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "FUSE session destroyed");
+}
+
 /**
  * This method create a new i-node and add it to the list of i-nodes of the file system.
  * The i-node number is generated in this method, and it's retured to the caller.
@@ -438,6 +445,16 @@ void FileSystem::FuseForget(fuse_req_t req, fuse_ino_t ino, unsigned long nlooku
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Forgetting -> FuseRamFs::FuseForget() completed!");
 }
 
+void FileSystem::FuseForgetMulti(fuse_req_t req, size_t count, struct fuse_forget_data *forgets) {
+    for (size_t index = 0; index < count; ++index) {
+        const fuse_ino_t ino = forgets[index].ino;
+        if (ino < INodeManager->getNumberOfINodes()) {
+            INodeManager->Forget(ino, forgets[index].nlookup);
+        }
+    }
+    fuse_reply_none(req);
+}
+
 void FileSystem::FuseSetAttr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set, struct fuse_file_info* fi) {
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Setting -> FuseRamFs::FuseSetAttr()");
 
@@ -499,13 +516,17 @@ void FileSystem::FuseMknod(fuse_req_t req, fuse_ino_t parent, const char* name, 
     // You can only make something inside a directory
     Directory *parentDir_p = dynamic_cast<Directory *>(parentInode);
     if (parentDir_p == nullptr) {
-        fuse_reply_err(req, EISDIR);
+        fuse_reply_err(req, ENOTDIR);
         return;
     }
 
     string tmp_string = string(name);
     if (tmp_string.length() > kMaxFilenameLength) {
         fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
+    if (parentDir_p->ChildINodeNumberWithName(tmp_string) != static_cast<fuse_ino_t>(-1)) {
+        fuse_reply_err(req, EEXIST);
         return;
     }
 
@@ -544,7 +565,7 @@ void FileSystem::FuseMknod(fuse_req_t req, fuse_ino_t parent, const char* name, 
         return;
     }
 
-    fuse_ino_t ino = RegisterINode(inode_type,mode | 0777, nlink, ctx_p->uid, ctx_p->gid);
+    fuse_ino_t ino = RegisterINode(inode_type, mode, nlink, ctx_p->uid, ctx_p->gid);
     INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
 
     // TODO: Handle: S_ISCHR S_ISBLK S_ISFIFO S_ISLNK S_ISSOCK S_TYPEISMQ S_TYPEISSEM S_TYPEISSHM
@@ -574,7 +595,12 @@ void FileSystem::FuseMkdir(fuse_req_t req, fuse_ino_t parent, const char* name, 
     // You can only make something inside a directory
     Directory *parentDir_p = dynamic_cast<Directory *>(parentInode);
     if (parentDir_p == nullptr) {
-        fuse_reply_err(req, EISDIR);
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+
+    if (parentDir_p->ChildINodeNumberWithName(string(name)) != static_cast<fuse_ino_t>(-1)) {
+        fuse_reply_err(req, EEXIST);
         return;
     }
 
@@ -582,7 +608,8 @@ void FileSystem::FuseMkdir(fuse_req_t req, fuse_ino_t parent, const char* name, 
     //    else if ((fi->flags & 3) != O_RDONLY)
     //        fuse_reply_err(req, EACCES);
 
-    fuse_ino_t ino = RegisterINode(DIRECTORY, S_IFDIR | 0777, 2, getgid(), getuid());
+    const struct fuse_ctx* ctx_p = fuse_req_ctx(req);
+    fuse_ino_t ino = RegisterINode(DIRECTORY, S_IFDIR | (mode & 0777), 2, ctx_p->gid, ctx_p->uid);
     Directory *dir_p = dynamic_cast<Directory *>(INodeManager->getINodeByINodeNumber(ino));
 
     // Insert the inode into the directory. TODO: What if it already exists?
@@ -764,7 +791,11 @@ void FileSystem::FuseSymlink(fuse_req_t req, const char* link, fuse_ino_t parent
     // You can only make something inside a directory
     Directory *dir = dynamic_cast<Directory *>(parent_p);
     if (dir == nullptr) {
-        fuse_reply_err(req, EISDIR);
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+    if (dir->ChildINodeNumberWithName(string(name)) != static_cast<fuse_ino_t>(-1)) {
+        fuse_reply_err(req, EEXIST);
         return;
     }
 
@@ -887,7 +918,7 @@ void FileSystem::FuseLink(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, 
     // ever give us a parent that isn't a dir? Test this.
     Directory *newParentDir_p = dynamic_cast<Directory *>(inode_p);
     if (newParentDir_p == nullptr) {
-        fuse_reply_err(req, EISDIR);
+        fuse_reply_err(req, ENOTDIR);
         return;
     }
 
@@ -906,6 +937,7 @@ void FileSystem::FuseLink(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, 
     if (existingIno != -1 && existingIno > 0) {
         // There's already a child with that name. Return an error.
         fuse_reply_err(req, EEXIST);
+        return;
     }
 
     // Create the new name and point it to the inode.
@@ -1526,12 +1558,16 @@ void FileSystem::FuseCreate(fuse_req_t req, fuse_ino_t parent, const char* name,
         fuse_reply_err(req, ENAMETOOLONG);
         return;
     }
+    if (parentDir_p->ChildINodeNumberWithName(tmp_string) != static_cast<fuse_ino_t>(-1)) {
+        fuse_reply_err(req, EEXIST);
+        return;
+    }
 
     const struct fuse_ctx* ctx_p = fuse_req_ctx(req);
 
     // TODO: It looks like, according to the documentation, that this will never be called to
     // make a dir--only a file. Test to make sure this is true.
-    fuse_ino_t ino = RegisterINode(REGULAR_FILE, S_IFREG | 0777, 1, ctx_p->gid, ctx_p->uid);
+    fuse_ino_t ino = RegisterINode(REGULAR_FILE, S_IFREG | (mode & 0777), 1, ctx_p->gid, ctx_p->uid);
     BlocksManager->createEmptyBlockListForInode(ino);
     INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
 
