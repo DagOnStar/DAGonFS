@@ -1,0 +1,159 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 780" width="1200" height="780" font-family="Helvetica, Arial, sans-serif">
+  <title>DAGonFS as the scratch space of a DAGonStar dataflow workflow</title>
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#374151"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1200" height="780" fill="#ffffff"/>
+  <text x="600" y="34" text-anchor="middle" font-size="19" font-weight="bold" fill="#1f2937">DAGonFS as the scratch space of a DAGonStar dataflow workflow</text>
+
+  <!-- Panel frames -->
+  <rect x="20"  y="56" width="290" height="470" rx="10" fill="#f9fafb" stroke="#e5e7eb"/>
+  <rect x="350" y="56" width="330" height="470" rx="10" fill="#f9fafb" stroke="#e5e7eb"/>
+  <rect x="720" y="56" width="460" height="470" rx="10" fill="#f9fafb" stroke="#e5e7eb"/>
+  <g font-size="15" font-weight="bold" fill="#1f2937">
+    <text x="36"  y="82">1 · Diamond dataflow DAG</text>
+    <text x="366" y="82">2 · Task scratch directories</text>
+    <text x="736" y="82">3 · DAGonFS volume (P = 4 ranks)</text>
+  </g>
+
+  <!-- Panel arrows -->
+  <line x1="314" y1="290" x2="346" y2="290" stroke="#374151" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="684" y1="290" x2="716" y2="290" stroke="#374151" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- 1. DAG -->
+  <g stroke="#374151" stroke-width="2" fill="none">
+    <line x1="154.2" y1="163.1" x2="111.9" y2="225.2" marker-end="url(#arr)"/>
+    <line x1="185.8" y1="163.1" x2="228.1" y2="225.2" marker-end="url(#arr)"/>
+    <line x1="110.8" y1="273.1" x2="153.1" y2="335.2" marker-end="url(#arr)"/>
+    <line x1="229.2" y1="273.1" x2="186.9" y2="335.2" marker-end="url(#arr)"/>
+  </g>
+  <g stroke-width="2" font-size="18" font-weight="bold" text-anchor="middle">
+    <circle cx="165" cy="140" r="28" fill="#dbeafe" stroke="#1d4ed8"/><text x="165" y="146" fill="#1e3a8a" stroke="none">A</text>
+    <circle cx="95"  cy="250" r="28" fill="#dcfce7" stroke="#15803d"/><text x="95"  y="256" fill="#14532d" stroke="none">B</text>
+    <circle cx="245" cy="250" r="28" fill="#fef3c7" stroke="#b45309"/><text x="245" y="256" fill="#78350f" stroke="none">C</text>
+    <circle cx="170" cy="360" r="28" fill="#ede9fe" stroke="#6d28d9"/><text x="170" y="366" fill="#4c1d95" stroke="none">D</text>
+  </g>
+  <g font-size="12.5" fill="#374151">
+    <text x="36" y="425">A writes f1.txt, B and C write f2.txt,</text>
+    <text x="36" y="443">D writes f3.txt.</text>
+    <text x="36" y="470">B and C read <tspan font-family="Menlo, monospace" font-size="11.5">workflow:///A/f1.txt</tspan></text>
+    <text x="36" y="490">D reads <tspan font-family="Menlo, monospace" font-size="11.5">workflow:///B/f2.txt</tspan></text>
+    <text x="36" y="508">and <tspan font-family="Menlo, monospace" font-size="11.5">workflow:///C/f2.txt</tspan></text>
+  </g>
+
+  <!-- 2. Scratch tree -->
+  <rect x="370" y="100" width="290" height="54" rx="6" fill="#e0f2fe" stroke="#0369a1" stroke-width="1.5"/>
+  <text x="515" y="123" text-anchor="middle" font-size="15" font-weight="bold" font-family="Menlo, monospace" fill="#0c4a6e">/tmp/dagonfs</text>
+  <text x="515" y="143" text-anchor="middle" font-size="12" fill="#0c4a6e">DAGonFS mount = DAGonStar scratch_dir_base</text>
+  <g stroke="#6b7280" stroke-width="1.5" fill="none">
+    <polyline points="392,154 392,410"/>
+    <line x1="392" y1="200" x2="420" y2="200"/>
+    <line x1="392" y1="270" x2="420" y2="270"/>
+    <line x1="392" y1="340" x2="420" y2="340"/>
+    <line x1="392" y1="410" x2="420" y2="410"/>
+  </g>
+  <g stroke="#374151" stroke-width="1.5">
+    <line x1="480" y1="200" x2="508" y2="200" marker-end="url(#arr)"/>
+    <line x1="480" y1="270" x2="508" y2="270" marker-end="url(#arr)"/>
+    <line x1="480" y1="340" x2="508" y2="340" marker-end="url(#arr)"/>
+    <line x1="480" y1="410" x2="508" y2="410" marker-end="url(#arr)"/>
+  </g>
+  <g font-family="Menlo, monospace" font-size="13" text-anchor="middle" stroke-width="1.5">
+    <rect x="420" y="185" width="60" height="30" rx="5" fill="#dbeafe" stroke="#1d4ed8"/><text x="450" y="205" font-weight="bold" fill="#1e3a8a">A/</text>
+    <rect x="510" y="185" width="150" height="30" rx="5" fill="#eff6ff" stroke="#1d4ed8"/><text x="585" y="205" fill="#1e3a8a">f1.txt · 1 MiB</text>
+    <rect x="420" y="255" width="60" height="30" rx="5" fill="#dcfce7" stroke="#15803d"/><text x="450" y="275" font-weight="bold" fill="#14532d">B/</text>
+    <rect x="510" y="255" width="150" height="30" rx="5" fill="#f0fdf4" stroke="#15803d"/><text x="585" y="275" fill="#14532d">f2.txt · 768 KiB</text>
+    <rect x="420" y="325" width="60" height="30" rx="5" fill="#fef3c7" stroke="#b45309"/><text x="450" y="345" font-weight="bold" fill="#78350f">C/</text>
+    <rect x="510" y="325" width="150" height="30" rx="5" fill="#fffbeb" stroke="#b45309"/><text x="585" y="345" fill="#78350f">f2.txt · 640 KiB</text>
+    <rect x="420" y="395" width="60" height="30" rx="5" fill="#ede9fe" stroke="#6d28d9"/><text x="450" y="415" font-weight="bold" fill="#4c1d95">D/</text>
+    <rect x="510" y="395" width="150" height="30" rx="5" fill="#f5f3ff" stroke="#6d28d9"/><text x="585" y="415" fill="#4c1d95">f3.txt · 384 KiB</text>
+  </g>
+  <g font-size="12.5" fill="#374151">
+    <text x="366" y="470">DAGonStar creates one working directory per task;</text>
+    <text x="366" y="490">a <tspan font-family="Menlo, monospace" font-size="11.5">workflow://</tspan> reference resolves to a file in</text>
+    <text x="366" y="508">the producer's directory.</text>
+  </g>
+
+  <!-- 3. DAGonFS volume -->
+  <rect x="740" y="100" width="420" height="54" rx="6" fill="#e0f2fe" stroke="#0369a1" stroke-width="1.5"/>
+  <text x="950" y="123" text-anchor="middle" font-size="14" font-weight="bold" fill="#0c4a6e">FUSE mount: one POSIX namespace</text>
+  <text x="950" y="143" text-anchor="middle" font-size="12" fill="#0c4a6e">file contents live in the aggregate RAM of the MPI ranks</text>
+  <g stroke="#374151" stroke-width="1.5">
+    <line x1="789.5"  y1="154" x2="789.5"  y2="178" marker-end="url(#arr)"/>
+    <line x1="896.5"  y1="154" x2="896.5"  y2="178" marker-end="url(#arr)"/>
+    <line x1="1003.5" y1="154" x2="1003.5" y2="178" marker-end="url(#arr)"/>
+    <line x1="1110.5" y1="154" x2="1110.5" y2="178" marker-end="url(#arr)"/>
+  </g>
+  <g fill="#ffffff" stroke="#9ca3af" stroke-width="1.2">
+    <rect x="740"  y="180" width="99" height="250" rx="6"/>
+    <rect x="847"  y="180" width="99" height="250" rx="6"/>
+    <rect x="954"  y="180" width="99" height="250" rx="6"/>
+    <rect x="1061" y="180" width="99" height="250" rx="6"/>
+  </g>
+  <g text-anchor="middle">
+    <g font-size="13" font-weight="bold" fill="#1f2937">
+      <text x="789.5"  y="199">Rank 0</text><text x="896.5"  y="199">Rank 1</text>
+      <text x="1003.5" y="199">Rank 2</text><text x="1110.5" y="199">Rank 3</text>
+    </g>
+    <g font-size="11" fill="#6b7280">
+      <text x="789.5"  y="214">RAM</text><text x="896.5"  y="214">RAM</text>
+      <text x="1003.5" y="214">RAM</text><text x="1110.5" y="214">RAM</text>
+    </g>
+  </g>
+  <!-- blocks: f1 N=8 (2,2,2,2); B/f2 N=6 (2,2,1,1); C/f2 N=5 (2,1,1,1); D/f3 N=3 (1,1,1,0) -->
+  <g font-family="Menlo, monospace" font-size="11" text-anchor="middle" stroke-width="1">
+    <!-- rank 0 -->
+    <rect x="748" y="222" width="83" height="22" fill="#dbeafe" stroke="#1d4ed8"/><text x="789.5" y="237" fill="#1e3a8a">A/f1 b0</text>
+    <rect x="748" y="247" width="83" height="22" fill="#dbeafe" stroke="#1d4ed8"/><text x="789.5" y="262" fill="#1e3a8a">A/f1 b1</text>
+    <rect x="748" y="272" width="83" height="22" fill="#dcfce7" stroke="#15803d"/><text x="789.5" y="287" fill="#14532d">B/f2 b0</text>
+    <rect x="748" y="297" width="83" height="22" fill="#dcfce7" stroke="#15803d"/><text x="789.5" y="312" fill="#14532d">B/f2 b1</text>
+    <rect x="748" y="322" width="83" height="22" fill="#fef3c7" stroke="#b45309"/><text x="789.5" y="337" fill="#78350f">C/f2 b0</text>
+    <rect x="748" y="347" width="83" height="22" fill="#fef3c7" stroke="#b45309"/><text x="789.5" y="362" fill="#78350f">C/f2 b1</text>
+    <rect x="748" y="372" width="83" height="22" fill="#ede9fe" stroke="#6d28d9"/><text x="789.5" y="387" fill="#4c1d95">D/f3 b0</text>
+    <!-- rank 1 -->
+    <rect x="855" y="222" width="83" height="22" fill="#dbeafe" stroke="#1d4ed8"/><text x="896.5" y="237" fill="#1e3a8a">A/f1 b2</text>
+    <rect x="855" y="247" width="83" height="22" fill="#dbeafe" stroke="#1d4ed8"/><text x="896.5" y="262" fill="#1e3a8a">A/f1 b3</text>
+    <rect x="855" y="272" width="83" height="22" fill="#dcfce7" stroke="#15803d"/><text x="896.5" y="287" fill="#14532d">B/f2 b2</text>
+    <rect x="855" y="297" width="83" height="22" fill="#dcfce7" stroke="#15803d"/><text x="896.5" y="312" fill="#14532d">B/f2 b3</text>
+    <rect x="855" y="322" width="83" height="22" fill="#fef3c7" stroke="#b45309"/><text x="896.5" y="337" fill="#78350f">C/f2 b2</text>
+    <rect x="855" y="347" width="83" height="22" fill="#ede9fe" stroke="#6d28d9"/><text x="896.5" y="362" fill="#4c1d95">D/f3 b1</text>
+    <!-- rank 2 -->
+    <rect x="962" y="222" width="83" height="22" fill="#dbeafe" stroke="#1d4ed8"/><text x="1003.5" y="237" fill="#1e3a8a">A/f1 b4</text>
+    <rect x="962" y="247" width="83" height="22" fill="#dbeafe" stroke="#1d4ed8"/><text x="1003.5" y="262" fill="#1e3a8a">A/f1 b5</text>
+    <rect x="962" y="272" width="83" height="22" fill="#dcfce7" stroke="#15803d"/><text x="1003.5" y="287" fill="#14532d">B/f2 b4</text>
+    <rect x="962" y="297" width="83" height="22" fill="#fef3c7" stroke="#b45309"/><text x="1003.5" y="312" fill="#78350f">C/f2 b3</text>
+    <rect x="962" y="322" width="83" height="22" fill="#ede9fe" stroke="#6d28d9"/><text x="1003.5" y="337" fill="#4c1d95">D/f3 b2</text>
+    <!-- rank 3 -->
+    <rect x="1069" y="222" width="83" height="22" fill="#dbeafe" stroke="#1d4ed8"/><text x="1110.5" y="237" fill="#1e3a8a">A/f1 b6</text>
+    <rect x="1069" y="247" width="83" height="22" fill="#dbeafe" stroke="#1d4ed8"/><text x="1110.5" y="262" fill="#1e3a8a">A/f1 b7</text>
+    <rect x="1069" y="272" width="83" height="22" fill="#dcfce7" stroke="#15803d"/><text x="1110.5" y="287" fill="#14532d">B/f2 b5</text>
+    <rect x="1069" y="297" width="83" height="22" fill="#fef3c7" stroke="#b45309"/><text x="1110.5" y="312" fill="#78350f">C/f2 b4</text>
+  </g>
+  <g font-size="12.5" fill="#374151">
+    <text x="736" y="458">Blocks of 128 KiB. A file of N blocks gives rank r the</text>
+    <text x="736" y="476">c<tspan font-size="9" dy="3">r</tspan><tspan dy="-3"> = ⌊N/P⌋ + [r &lt; N mod P] consecutive blocks after those</tspan></text>
+    <text x="736" y="494">of ranks 0…r−1. Contents are stored on close/fsync and</text>
+    <text x="736" y="512">loaded on open by MPI point-to-point transfers.</text>
+  </g>
+
+  <!-- Comparison band -->
+  <rect x="20" y="552" width="570" height="174" rx="10" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="40" y="580" font-size="15" font-weight="bold" fill="#374151">Scratch on a shared persistent file system (NFS, Lustre)</text>
+  <g font-size="13" fill="#374151">
+    <text x="40" y="608">• Small metadata operations and short-lived transfers pay</text>
+    <text x="52" y="626">the cost of durable, shared storage.</text>
+    <text x="40" y="654">• NFS: 230 file creations/s.</text>
+    <text x="40" y="682">• DAGonStar dataflow with 2000 × 8 KiB files: 270.4 s.</text>
+  </g>
+  <rect x="610" y="552" width="570" height="174" rx="10" fill="#ecfdf5" stroke="#15803d"/>
+  <text x="630" y="580" font-size="15" font-weight="bold" fill="#14532d">Scratch in DAGonFS (in memory, volatile)</text>
+  <g font-size="13" fill="#14532d">
+    <text x="630" y="608">• Capacity is the memory of the whole allocation; final</text>
+    <text x="642" y="626">outputs are staged out to persistent storage before unmount.</text>
+    <text x="630" y="654">• Client-server: 40,172 file creations/s.</text>
+    <text x="630" y="682">• Same dataflow: 22.9 s (11.8× faster than NFS).</text>
+  </g>
+  <text x="600" y="756" text-anchor="middle" font-size="11.5" fill="#6b7280">Medians on one node, 4 ranks, Slurm partition low-wn, November 2026 (README, Performance; docs/PERFORMANCE.md).</text>
+</svg>
