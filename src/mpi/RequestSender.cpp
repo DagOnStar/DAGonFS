@@ -1,0 +1,148 @@
+//
+// Created by frank on 1/15/25.
+//
+
+#include "RequestSender.hpp"
+
+#include <cstring>
+#include <iostream>
+#include <vector>
+#include <mpi.h>
+
+#include "mpi_data.hpp"
+
+using namespace std;
+
+namespace {
+
+PeerRequest makeRequest(RequestType type) {
+	PeerRequest request{};
+	request.type = type;
+	return request;
+}
+
+uint32_t boundedLength(const string &path) {
+	// Callers reject longer paths with ENAMETOOLONG before sending; this is a
+	// last line of defence that keeps the message well-formed.
+	return static_cast<uint32_t>(min(path.size(), DAGONFS_MAX_REQUEST_PATH - 1));
+}
+
+} // namespace
+
+namespace {
+
+/** Wire image of a request: header | first path | second path | value. */
+vector<char> encode(const PeerRequest &request, const string &first, const string &second, const string &value) {
+	PeerRequest header = request;
+	header.firstPathLength = boundedLength(first);
+	header.secondPathLength = boundedLength(second);
+	header.valueLength = static_cast<uint32_t>(min(value.size(), DAGONFS_MAX_REQUEST_VALUE));
+
+	vector<char> message(sizeof(PeerRequest) + header.firstPathLength + header.secondPathLength + header.valueLength);
+	char *cursor = message.data();
+	memcpy(cursor, &header, sizeof(PeerRequest));
+	cursor += sizeof(PeerRequest);
+	memcpy(cursor, first.data(), header.firstPathLength);
+	cursor += header.firstPathLength;
+	memcpy(cursor, second.data(), header.secondPathLength);
+	cursor += header.secondPathLength;
+	memcpy(cursor, value.data(), header.valueLength);
+	return message;
+}
+
+} // namespace
+
+void RequestSender::send(const PeerRequest &request, const string &first, const string &second,
+                         int sourceRank, int mpiWorldSize, bool includeSelf, const string &value) {
+	const vector<char> message = encode(request, first, second, value);
+	for (int i = 0; i < mpiWorldSize; i++) {
+		if (i != sourceRank || includeSelf) {
+			MPI_Send(message.data(), static_cast<int>(message.size()), MPI_BYTE, i, DAGONFS_TAG_REQUEST, MPI_COMM_WORLD);
+		}
+	}
+}
+
+void RequestSender::sendTo(const PeerRequest &request, const string &first, const string &second, int destination) {
+	const vector<char> message = encode(request, first, second, string());
+	MPI_Send(message.data(), static_cast<int>(message.size()), MPI_BYTE, destination, DAGONFS_TAG_REQUEST, MPI_COMM_WORLD);
+}
+
+void RequestSender::sendCreateFileRequest(string name, uint64_t globalId, int sourceRank, int mpiWorldSize) {
+	PeerRequest request = makeRequest(CREATE_FILE);
+	request.globalId = globalId;
+	send(request, name, string(), sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendDeleteFileRequest(string name, int sourceRank, int mpiWorldSize) {
+	send(makeRequest(DELETE_FILE), name, string(), sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendCreateDirectoryRequest(string dirAbsPath, int sourceRank, int mpiWorldSize) {
+	send(makeRequest(CREATE_DIR), dirAbsPath, string(), sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendDeleteDirectoryRequest(string dirAbsPath, int sourceRank, int mpiWorldSize) {
+	send(makeRequest(DELETE_DIR), dirAbsPath, string(), sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendRenameRequest(string oldName, string newName, int sourceRank, int mpiWorldSize) {
+	send(makeRequest(RENAME), oldName, newName, sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendLinkRequest(string targetName, string newName, int sourceRank, int mpiWorldSize) {
+	send(makeRequest(LINK), targetName, newName, sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendSymlinkRequest(string target, string newName, int sourceRank, int mpiWorldSize) {
+	send(makeRequest(SYMLINK), target, newName, sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendSetAttrRequest(string name, const MetadataPacket &meta, int sourceRank, int mpiWorldSize) {
+	PeerRequest request = makeRequest(SET_ATTR);
+	request.meta = meta;
+	send(request, name, string(), sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendSetXAttrRequest(string name, string attribute, string value, int flags,
+                                        int sourceRank, int mpiWorldSize) {
+	PeerRequest request = makeRequest(SET_XATTR);
+	request.meta.xattrFlags = flags;
+	send(request, name, attribute, sourceRank, mpiWorldSize, false, value);
+}
+
+void RequestSender::sendRemoveXAttrRequest(string name, string attribute, int sourceRank, int mpiWorldSize) {
+	send(makeRequest(REMOVE_XATTR), name, attribute, sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendMknodRequest(string name, uint32_t fileType, uint32_t mode, uint64_t rdev,
+                                     int sourceRank, int mpiWorldSize) {
+	PeerRequest request = makeRequest(MKNOD);
+	request.meta.fileType = fileType;
+	request.meta.mode = mode;
+	request.meta.rdev = rdev;
+	send(request, name, string(), sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendLockRequest(RequestType type, uint64_t file, const LockPacket &lock) {
+	PeerRequest request = makeRequest(type);
+	request.globalId = file;
+	request.lock = lock;
+	sendTo(request, string(), string(), DAGONFS_LOCK_COORDINATOR);
+}
+
+void RequestSender::sendLockReply(const LockPacket &lock, int destination) {
+	PeerRequest request = makeRequest(LOCK_REPLY);
+	request.lock = lock;
+	sendTo(request, string(), string(), destination);
+}
+
+void RequestSender::sendDeleteRequest(uint64_t key, int sourceRank, int mpiWorldSize) {
+	PeerRequest request = makeRequest(DELETE);
+	request.io.inode = static_cast<fuse_ino_t>(key);
+	send(request, string(), string(), sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendTerminationRequest(int sourceRank, int mpiWorldSize, bool includeSelf) {
+	cout << "Process " << sourceRank << " - Sending termination request" << endl;
+	send(makeRequest(TERMINATE), string(), string(), sourceRank, mpiWorldSize, includeSelf);
+}

@@ -1,4 +1,5 @@
 token.txt
 tests/test_files/
 build/
-.idea/
+.idea/__pycache__/
+*.pyc

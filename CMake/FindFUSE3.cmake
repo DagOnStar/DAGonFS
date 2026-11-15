@@ -10,23 +10,31 @@ IF (FUSE3_INCLUDE_DIR)
 ENDIF (FUSE3_INCLUDE_DIR)
 
 # find includes
-FIND_PATH (FUSE3_INCLUDE_DIR 
-	NAMES fuse.h
-	PATHS /usr/local/include/osxfuse /usr/local/include/fuse3/ /usr/include/fuse3/
-	NO_DEFAULT_PATH
+FIND_PATH(FUSE3_INCLUDE_DIR
+        NAMES fuse3/fuse_lowlevel.h fuse/fuse_lowlevel.h fuse_lowlevel.h
+        PATH_SUFFIXES include include/fuse3 include/osxfuse
+        PATHS
+            /opt/homebrew
+            /usr/local
+            /usr
+            /Library/Frameworks/macFUSE.framework/Versions/Current
 )
 
 
 # find lib
 if (APPLE)
-    SET(FUSE3_NAMES libosxfuse3.dylib fuse3)
+    SET(FUSE3_NAMES osxfuse3 fuse3 osxfuse)
 else (APPLE)
     SET(FUSE3_NAMES fuse3)
 endif (APPLE)
 
 FIND_LIBRARY(FUSE3_LIBRARIES
         NAMES ${FUSE3_NAMES}
-        PATHS /lib64 /lib /usr/lib64 /usr/lib /usr/local/lib64 /usr/local/lib /usr/lib/x86_64-linux-gnu
+        PATHS
+            /opt/homebrew/lib
+            /usr/local/lib64 /usr/local/lib
+            /Library/Frameworks/macFUSE.framework/Versions/Current/lib
+            /lib64 /lib /usr/lib64 /usr/lib /usr/lib/x86_64-linux-gnu
 )
 
 include ("FindPackageHandleStandardArgs")
