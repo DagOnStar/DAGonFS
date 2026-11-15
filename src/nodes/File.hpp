@@ -5,6 +5,7 @@
 #ifndef FILE_HPP
 #define FILE_HPP
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -32,6 +33,12 @@ public:
     uint64_t m_globalId;
     /** True when @ref m_buf differs from the distributed copy. */
     bool isWaitingForDistributedWrite;
+    /**
+     * Peer-to-peer: another peer has written the file back since @ref m_buf
+     * was loaded. Set by the listener, consumed by the FUSE thread, which
+     * reloads a clean buffer before serving the next read or write.
+     */
+    std::atomic<bool> m_remoteChanged{false};
 
 public:
     File();

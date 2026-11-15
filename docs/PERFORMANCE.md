@@ -14,7 +14,7 @@ For small files, FUSE crossings and metadata management dominate. For large file
 
 ## 2. Measured operation latency
 
-Table 1 reports the mean latency per operation in a peer-to-peer volume, measured on two nodes with two ranks each, from rank 0's mount (see [TESTING.md](TESTING.md) §4.1).
+Table 1 reports the mean latency per operation in a peer-to-peer volume, measured on two nodes with two ranks each, from rank 0's mount (see [TESTING.md](TESTING.md) §4.2).
 
 **Table 1 — peer-to-peer latency per operation across two nodes.**
 

@@ -123,26 +123,62 @@ Supported: creation, lookup and removal of files and directories,
 .BR rename (2)
 (including
 .BR RENAME_NOREPLACE ),
-hard and symbolic links, reads and writes at any offset, truncation,
+hard and symbolic links, FIFOs
+.RB ( mkfifo (3)),
+Unix-domain sockets and device nodes
+.RB ( mknod (2);
+devices need privilege), reads and writes at any offset,
+.BR mmap (2),
+truncation,
 .BR chmod ,
 .BR chown ,
 .BR utimensat ,
 extended attributes,
 .BR statfs ,
+.BR fsync ,
+.BR posix_fallocate (3)
 and
-.BR fsync .
-.B getlk
-always reports an unlocked range. Byte-range locks,
-.BR fallocate ,
-.BR ioctl ,
-.BR poll ,
-.B copy_file_range
+.BR fallocate (2)
+(allocate,
+.BR FALLOC_FL_KEEP_SIZE ,
+.BR FALLOC_FL_PUNCH_HOLE ,
+.BR FALLOC_FL_ZERO_RANGE ),
+.BR lseek (2)
+with
+.B SEEK_DATA
 and
-.B lseek
-data/hole queries are not provided; they fail with
-.BR ENOSYS .
-Devices, FIFOs and sockets cannot be created
-.RB ( EPERM ).
+.BR SEEK_HOLE ,
+.BR copy_file_range (2),
+.BR poll (2),
+and directory listing with attributes (readdirplus).
+.PP
+Advisory locks are cluster-wide: POSIX record locks
+.RB ( fcntl (2)
+.BR F_GETLK ,
+.BR F_SETLK ,
+.BR F_SETLKW ,
+and
+.BR lockf (3))
+and
+.BR flock (2)
+locks exclude processes on every node of the volume. A waiting request does not block the file system; it fails with
+.B EDEADLK
+when it would deadlock and with
+.B EINTR
+when a signal interrupts it. Closing a descriptor releases the process's record locks on the file after its data have been written back. The lock table is held by rank 0; other peers reach it through MPI.
+.PP
+.BR ioctl (2)
+fails with
+.BR ENOTTY .
+.B O_TMPFILE
+fails with
+.BR EOPNOTSUPP ,
+POSIX ACLs with
+.BR ENOTSUP ,
+and the
+.B fallocate
+modes collapse, insert and unshare with
+.BR EOPNOTSUPP .
 .SH ENVIRONMENT AND REQUIREMENTS
 Every node needs
 .BR /dev/fuse ,

@@ -134,6 +134,7 @@ void DistributedCode::replayLoop() {
 		case SET_ATTR: setAttrHandler(replay.request, replay.first); break;
 		case SET_XATTR: setXAttrHandler(replay.request, replay.first, replay.second, replay.value); break;
 		case REMOVE_XATTR: removeXAttrHandler(replay.first, replay.second); break;
+		case MKNOD: mknodHandler(replay.request, replay.first); break;
 		default: break;
 		}
 	}
@@ -203,9 +204,21 @@ void DistributedCode::start() {
 		case SET_ATTR:
 		case SET_XATTR:
 		case REMOVE_XATTR:
+		case MKNOD:
 			if (replayer.joinable()) {
 				enqueue(Replay{request, first, second, value, false});
 			}
+			break;
+		case LOCK_SET:
+		case LOCK_GET:
+		case LOCK_RELEASE:
+		case LOCK_CANCEL:
+			// Lock coordinator: bookkeeping and replies only, never a system
+			// call on the mount point, so it is served inline.
+			FileSystem::ServeLockRequest(source, request);
+			break;
+		case LOCK_REPLY:
+			FileSystem::CompleteLockRequest(request.lock);
 			break;
 		case DELETE:
 			Blocks::getInstance()->releaseLocalBlocks(request.io.inode);
@@ -401,6 +414,19 @@ void DistributedCode::setXAttrHandler(const PeerRequest &request, const string &
 #endif
 	if (result != 0) {
 		FileSystem::setXAttrFromThread = false;
+	}
+}
+
+void DistributedCode::mknodHandler(const PeerRequest &request, const string &name) {
+	const mode_t type = static_cast<mode_t>(request.meta.fileType) & S_IFMT;
+	if (!S_ISFIFO(type) && !S_ISSOCK(type) && !S_ISCHR(type) && !S_ISBLK(type)) {
+		return;
+	}
+	FileSystem::mknodFromThread = true;
+	if (mknod(localPath(name).c_str(), type | (static_cast<mode_t>(request.meta.mode) & 07777),
+	          static_cast<dev_t>(request.meta.rdev)) != 0) {
+		FileSystem::mknodFromThread = false;
+		cerr << "Process " << mpiRank << " - replicated mknod of " << name << " failed: " << strerror(errno) << endl;
 	}
 }
 

@@ -52,7 +52,37 @@ with Volume("/tmp/dagonfs", model="client-server", ranks=8,
 
 Use `model="client-server"` when every task runs on the node hosting rank 0. Use `model="peer-to-peer"` when tasks run on several nodes, each using the mount point of a rank on its own node (`volume.mountpoint(r)`, with `local_ranks` listing the ranks placed on the calling host). The same choice is available without Python as `dagonfs --model …` or as `dagonfs_model` in `DAGonFS.ini`.
 
-In a peer-to-peer volume, a file written and closed on one peer can be read on any other peer as soon as `close` returns. Namespace changes (creation, rename, removal) reach the other peers asynchronously, typically within milliseconds, so a consumer on another node should wait for the producer task's completion, which DAGonStar's dependency graph already enforces.
+In a peer-to-peer volume, a file written and closed on one peer can be read on any other peer as soon as `close` returns. Namespace changes (creation, rename, removal) reach the other peers asynchronously, typically within milliseconds, so a consumer on another node should wait for the producer task's completion, which DAGonStar's dependency graph already enforces. Tasks that run concurrently and update the same file must serialise their updates with `fcntl`/`lockf` or `flock` locks, which DAGonFS enforces across all peers.
+
+## Validated example: Python task scripts
+
+`tests/dagonstar/run_workflow.py` is a complete, tested example ([TESTING.md](TESTING.md) §2.2). It creates a volume with either model, copies the task scripts of `tests/dagonstar/tasks/` onto the volume and runs a fan-out/fan-in workflow whose tasks execute those scripts from the volume:
+
+```python
+python = sys.executable + " -B"            # do not write byte code into the volume
+workflow = Workflow("dagonfs-posix", config={"batch": {"scratch_dir_base": str(scratch),
+                                                      "remove_dir": "False", "threads": "6"}})
+workflow.add_task(DagonTask(TaskType.BATCH, "A",
+    f"{python} {bin0}/produce.py --shared {shared0} --parts 6 --size 1180425"))
+for i in range(6):
+    peer = i % len(mounts)                  # peer-to-peer: spread the tasks over the peers
+    workflow.add_task(DagonTask(TaskType.BATCH, f"B{i}",
+        f"{python} {bins[peer]}/transform.py --index {i} --input workflow:///A/data/part{i}.bin "
+        f"--manifest workflow:///A/manifest.json --shared {shared[peer]}"))
+outputs = " ".join(f"workflow:///B{i}/out.bin" for i in range(6))
+workflow.add_task(DagonTask(TaskType.BATCH, "C",
+    f"{python} {bins[-1]}/reduce.py --manifest workflow:///A/manifest.json --shared {shared[-1]} {outputs}"))
+workflow.make_dependencies()
+workflow.run()
+```
+
+The parallel tasks coordinate through a shared directory on the volume, with no service other than the file system: each appends a line to a ledger under an exclusive `fcntl.lockf` lock and increments a counter under `flock`. Locks are cluster-wide in both models, and releasing a lock publishes the data written under it, so the reducer finds exactly one ledger line and one increment per task even when the tasks use different peers. Run it with:
+
+```bash
+python3 tests/dagonstar/run_workflow.py --build-dir build --model peer-to-peer --ranks 4 -- --oversubscribe
+```
+
+Use `--width` for more parallel tasks; `--peers` restricts the peers used by tasks to the ranks placed on the local host.
 
 ## Operational procedure
 

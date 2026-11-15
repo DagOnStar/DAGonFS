@@ -24,6 +24,10 @@ public:
 	                 int sourceRank, int mpiWorldSize, bool includeSelf = false,
 	                 const std::string &value = std::string());
 
+	/** Header + bounded paths, sent as one message to @p destination only. */
+	static void sendTo(const PeerRequest &request, const std::string &first, const std::string &second,
+	                   int destination);
+
 	static void sendCreateFileRequest(std::string name, uint64_t globalId, int sourceRank, int mpiWorldSize);
 	static void sendDeleteFileRequest(std::string name, int sourceRank, int mpiWorldSize);
 	static void sendCreateDirectoryRequest(std::string dirAbsPath, int sourceRank, int mpiWorldSize);
@@ -35,6 +39,13 @@ public:
 	static void sendSetXAttrRequest(std::string name, std::string attribute, std::string value, int flags,
 	                                int sourceRank, int mpiWorldSize);
 	static void sendRemoveXAttrRequest(std::string name, std::string attribute, int sourceRank, int mpiWorldSize);
+	/** Peer-to-peer: create a FIFO, socket or device node (@p fileType) on every other peer. */
+	static void sendMknodRequest(std::string name, uint32_t fileType, uint32_t mode, uint64_t rdev,
+	                             int sourceRank, int mpiWorldSize);
+	/** Peer-to-peer: a lock request (LOCK_SET ... LOCK_CANCEL) to the lock coordinator. */
+	static void sendLockRequest(RequestType type, uint64_t file, const LockPacket &lock);
+	/** Peer-to-peer: the coordinator's answer to the lock request @p lock.token of @p destination. */
+	static void sendLockReply(const LockPacket &lock, int destination);
 	/** Client-server: storage ranks release their slices of the file with data key @p key. */
 	static void sendDeleteRequest(uint64_t key, int sourceRank, int mpiWorldSize);
 	static void sendTerminationRequest(int sourceRank, int mpiWorldSize, bool includeSelf);

@@ -9,13 +9,20 @@ Each test documents the defect it guards against, so a failure points directly
 at the filesystem behaviour that regressed.
 """
 
+import ctypes
+import ctypes.util
 import errno
+import fcntl
 import os
 from pathlib import Path
+import select
 import shutil
+import socket
 import subprocess
 import stat
+import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -29,6 +36,41 @@ MULTI_BLOCK = 128 * 1024 * 9 + 777
 
 def pattern(size, seed=0):
     return bytes((index * 31 + seed) % 251 for index in range(size))
+
+
+LOCK_HELPER = str(Path(__file__).resolve().parent / "lock_helper.py")
+
+
+def helper(*args, **kwargs):
+    """Run lock_helper.py to completion and return its output lines."""
+    result = subprocess.run([sys.executable, LOCK_HELPER] + [str(a) for a in args], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, universal_newlines=True, timeout=kwargs.get("timeout", 30))
+    if result.returncode != 0:
+        raise AssertionError("lock_helper.py {} failed: {}".format(args, result.stderr))
+    return result.stdout.split()
+
+
+def start_helper(*args):
+    """Start lock_helper.py in the background (stdin and stdout are pipes)."""
+    return subprocess.Popen([sys.executable, LOCK_HELPER] + [str(a) for a in args], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, universal_newlines=True)
+
+
+def read_line(process, timeout=10.0):
+    """Next stdout line of a helper, or None if it prints nothing within timeout seconds."""
+    ready, _, _ = select.select([process.stdout], [], [], timeout)
+    return process.stdout.readline().strip() if ready else None
+
+
+def fallocate(fd, mode, offset, length):
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong]
+    if libc.fallocate(fd, mode, offset, length) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE = 0x01, 0x02, 0x10
 
 
 @unittest.skipUnless(MOUNTPOINT, "set DAGONFS_MOUNTPOINT to run FUSE integration tests")
@@ -270,7 +312,274 @@ class PythonPosixIntegrationTests(unittest.TestCase):
         with self.assertRaises(OSError) as raised:
             os.getxattr(path, "user.dagonfs")
         self.assertEqual(raised.exception.errno, errno.ENODATA)
+        # POSIX ACLs are not enforced, hence refused rather than silently stored.
+        with self.assertRaises(OSError) as raised:
+            os.setxattr(path, "system.posix_acl_access", b"\x02\x00\x00\x00")
+        self.assertIn(raised.exception.errno, (errno.EOPNOTSUPP, errno.ENOTSUP))
 
+
+    # ------------------------------------------------------------ locks
+    def test_posix_record_locks_between_processes(self):
+        # fcntl/lockf byte-range locks were not retained (getlk always
+        # answered F_UNLCK, setlk was not implemented).
+        path = self.workdir / "records"
+        path.write_bytes(pattern(4096))
+        fd = os.open(str(path), os.O_RDWR)
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX, 100, 0, os.SEEK_SET)          # bytes 0-99
+            self.assertEqual(helper("try", path, "posix", "ex", 50, 10), ["busy"])
+            self.assertEqual(helper("try", path, "posix", "sh", 0, 1), ["busy"])
+            self.assertEqual(helper("try", path, "posix", "ex", 100, 100), ["granted"])
+            self.assertEqual(helper("getlk", path, 0, 0), ["wrlck", "0", "100"])
+            self.assertEqual(helper("getlk", path, 500, 10)[0], "unlck")
+            # Downgrade in place: readers may now share the range.
+            fcntl.lockf(fd, fcntl.LOCK_SH, 100, 0, os.SEEK_SET)
+            self.assertEqual(helper("try", path, "posix", "sh", 0, 100), ["granted"])
+            self.assertEqual(helper("try", path, "posix", "ex", 0, 100), ["busy"])
+            # A waiter is granted as soon as the range is unlocked.
+            fcntl.lockf(fd, fcntl.LOCK_EX, 100, 0, os.SEEK_SET)
+            waiter = start_helper("wait", path, "posix", "ex", 10, 10)
+            self.assertEqual(read_line(waiter), "waiting")
+            self.assertIsNone(read_line(waiter, 0.5), "the waiter must block while the range is locked")
+            fcntl.lockf(fd, fcntl.LOCK_UN, 100, 0, os.SEEK_SET)
+            self.assertEqual(read_line(waiter), "granted")
+            self.assertEqual(waiter.wait(10), 0)
+        finally:
+            os.close(fd)
+
+    def test_closing_any_descriptor_releases_record_locks(self):
+        path = self.workdir / "close-release"
+        path.write_bytes(b"x" * 10)
+        first = os.open(str(path), os.O_RDWR)
+        second = os.open(str(path), os.O_RDONLY)
+        fcntl.lockf(first, fcntl.LOCK_EX)
+        self.assertEqual(helper("try", path, "posix", "ex", 0, 0), ["busy"])
+        os.close(second)  # POSIX: any close by the owner releases its locks on the file
+        self.assertEqual(helper("try", path, "posix", "ex", 0, 0), ["granted"])
+        os.close(first)
+
+    def test_blocked_lock_is_interrupted_by_a_signal(self):
+        path = self.workdir / "interrupt"
+        path.write_bytes(b"x")
+        fd = os.open(str(path), os.O_RDWR)
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX)
+            self.assertEqual(helper("interrupt", path, "posix", "ex", 0, 0), ["interrupted"])
+            self.assertEqual(helper("interrupt", path, "flock", "ex", 0, 0), ["granted"])
+            # The interrupted waiter was withdrawn: unlocking grants nothing to it.
+            fcntl.lockf(fd, fcntl.LOCK_UN)
+            self.assertEqual(helper("try", path, "posix", "ex", 0, 0), ["granted"])
+        finally:
+            os.close(fd)
+
+    def test_lock_deadlock_is_detected(self):
+        path = self.workdir / "deadlock"
+        path.write_bytes(b"x" * 20)
+        fd = os.open(str(path), os.O_RDWR)
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX, 1, 0, os.SEEK_SET)
+            peer = start_helper("deadlock", path)
+            self.assertEqual(read_line(peer), "holding")
+            time.sleep(0.5)  # let the peer queue for byte 0
+            with self.assertRaises(OSError) as raised:
+                fcntl.lockf(fd, fcntl.LOCK_EX, 1, 10, os.SEEK_SET)
+            self.assertEqual(raised.exception.errno, errno.EDEADLK)
+        finally:
+            os.close(fd)
+        self.assertEqual(read_line(peer), "granted")
+        self.assertEqual(peer.wait(10), 0)
+
+    def test_flock_between_processes(self):
+        path = self.workdir / "flocked"
+        path.write_bytes(b"x")
+        with open(str(path), "rb") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
+            self.assertEqual(helper("try", path, "flock", "sh", 0, 0), ["granted"])
+            self.assertEqual(helper("try", path, "flock", "ex", 0, 0), ["busy"])
+            # flock and POSIX locks are independent.
+            self.assertEqual(helper("try", path, "posix", "ex", 0, 0), ["granted"])
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            waiter = start_helper("wait", path, "flock", "ex", 0, 0)
+            self.assertEqual(read_line(waiter), "waiting")
+            self.assertIsNone(read_line(waiter, 0.5))
+        # The last close of the open file description releases the lock.
+        self.assertEqual(read_line(waiter), "granted")
+        self.assertEqual(waiter.wait(10), 0)
+
+    def test_locked_read_modify_write_counter(self):
+        # Four processes increment a counter under a lock: no update may be lost.
+        counter = self.workdir / "counter"
+        for kind in ("posix", "flock"):
+            counter.write_bytes(b"0")
+            workers = [start_helper("count", counter, 25, kind) for _ in range(4)]
+            for worker in workers:
+                self.assertEqual(read_line(worker, 120), "done")
+                self.assertEqual(worker.wait(10), 0)
+            self.assertEqual(int(counter.read_bytes()), 100, kind)
+
+    # ------------------------------------------- space, ranges and copies
+    def test_fallocate_extends_punches_and_zeroes(self):
+        path = self.workdir / "allocated"
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            os.posix_fallocate(fd, 0, MULTI_BLOCK)
+            self.assertEqual(os.fstat(fd).st_size, MULTI_BLOCK)
+            self.assertEqual(os.pread(fd, MULTI_BLOCK, 0), bytes(MULTI_BLOCK))
+            payload = pattern(MULTI_BLOCK, 3)
+            os.pwrite(fd, payload, 0)
+            # Preallocation never shrinks nor changes content.
+            os.posix_fallocate(fd, 10, 100)
+            self.assertEqual(os.pread(fd, MULTI_BLOCK, 0), payload)
+            if not sys.platform.startswith("linux"):
+                return
+            fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 1000, 5000)
+            expected = payload[:1000] + bytes(5000) + payload[6000:]
+            self.assertEqual(os.pread(fd, MULTI_BLOCK, 0), expected)
+            size = MULTI_BLOCK
+            try:
+                fallocate(fd, FALLOC_FL_ZERO_RANGE, MULTI_BLOCK - 10, 30)
+            except OSError as error:
+                # Older kernels (e.g. RHEL 8, 4.18) do not forward FALLOC_FL_ZERO_RANGE to FUSE.
+                if error.errno not in (errno.EOPNOTSUPP, errno.ENOTSUP):
+                    raise
+            else:
+                size = MULTI_BLOCK + 20
+                self.assertEqual(os.fstat(fd).st_size, size)
+                self.assertEqual(os.pread(fd, 40, MULTI_BLOCK - 20), expected[-20:-10] + bytes(30))
+            fallocate(fd, FALLOC_FL_KEEP_SIZE, MULTI_BLOCK * 2, 4096)
+            self.assertEqual(os.fstat(fd).st_size, size)
+            with self.assertRaises(OSError) as raised:
+                fallocate(fd, 0x08, 0, 4096)  # FALLOC_FL_COLLAPSE_RANGE
+            self.assertIn(raised.exception.errno, (errno.EOPNOTSUPP, errno.ENOTSUP))
+            self.assertEqual(os.pread(fd, 1000, 0), payload[:1000])
+        finally:
+            os.close(fd)
+        self.assertGreaterEqual(path.stat().st_size, MULTI_BLOCK)
+
+    def test_seek_data_and_hole(self):
+        if not hasattr(os, "SEEK_DATA"):
+            self.skipTest("SEEK_DATA is unavailable")
+        path = self.workdir / "sparse-query"
+        path.write_bytes(pattern(10000))
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            self.assertEqual(os.lseek(fd, 0, os.SEEK_DATA), 0)
+            self.assertEqual(os.lseek(fd, 1234, os.SEEK_DATA), 1234)
+            self.assertEqual(os.lseek(fd, 0, os.SEEK_HOLE), 10000)
+            with self.assertRaises(OSError) as raised:
+                os.lseek(fd, 10000, os.SEEK_DATA)
+            self.assertEqual(raised.exception.errno, errno.ENXIO)
+        finally:
+            os.close(fd)
+
+    def test_copy_file_range(self):
+        if not hasattr(os, "copy_file_range"):
+            self.skipTest("os.copy_file_range needs Python 3.8")
+        source, target = self.workdir / "copy-source", self.workdir / "copy-target"
+        payload = pattern(MULTI_BLOCK, 5)
+        source.write_bytes(payload)
+        target.write_bytes(b"head")
+        with open(str(source), "rb") as src, open(str(target), "r+b") as dst:
+            copied, offset = 0, 4
+            while copied < len(payload):
+                count = os.copy_file_range(src.fileno(), dst.fileno(), len(payload) - copied, copied, offset)
+                self.assertGreater(count, 0)
+                copied += count
+                offset += count
+        self.assertEqual(target.read_bytes(), b"head" + payload)
+
+    def test_poll_and_ioctl_on_regular_files(self):
+        path = self.workdir / "polled"
+        path.write_bytes(b"ready")
+        with open(str(path), "r+b") as stream:
+            poller = select.poll()
+            poller.register(stream.fileno(), select.POLLIN | select.POLLOUT)
+            events = dict(poller.poll(1000))
+            self.assertTrue(events[stream.fileno()] & select.POLLIN)
+            self.assertTrue(events[stream.fileno()] & select.POLLOUT)
+            if sys.platform.startswith("linux"):
+                with self.assertRaises(OSError) as raised:
+                    fcntl.ioctl(stream.fileno(), 0x80086601, bytes(8))  # FS_IOC_GETFLAGS
+                self.assertEqual(raised.exception.errno, errno.ENOTTY)
+
+    # -------------------------------------------------- special files
+    def test_fifo(self):
+        # mknod of anything but a regular file used to fail with EPERM.
+        fifo = self.workdir / "pipe"
+        os.mkfifo(str(fifo), 0o640)
+        info = os.lstat(str(fifo))
+        self.assertTrue(stat.S_ISFIFO(info.st_mode))
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o640 & ~self._umask())
+        payload = pattern(100000)
+
+        def produce():
+            with open(str(fifo), "wb") as stream:
+                stream.write(payload)
+
+        writer = threading.Thread(target=produce)
+        writer.start()
+        with open(str(fifo), "rb") as stream:
+            received = stream.read()
+        writer.join(10)
+        self.assertEqual(received, payload)
+        self.assertIn("pipe", os.listdir(str(self.workdir)))
+        os.rename(str(fifo), str(self.workdir / "renamed-pipe"))
+        os.unlink(str(self.workdir / "renamed-pipe"))
+
+    def test_unix_domain_socket(self):
+        address = str(self.workdir / "s")
+        if len(address) >= 100 or not hasattr(socket, "AF_UNIX"):
+            self.skipTest("socket path too long for sockaddr_un")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(address)
+            server.listen(1)
+            self.assertTrue(stat.S_ISSOCK(os.lstat(address).st_mode))
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.connect(address)
+            connection, _ = server.accept()
+            client.sendall(b"over dagonfs")
+            self.assertEqual(connection.recv(64), b"over dagonfs")
+            connection.close()
+            client.close()
+        finally:
+            server.close()
+        os.unlink(address)
+
+    def test_device_nodes_need_privilege(self):
+        if os.geteuid() == 0:
+            self.skipTest("root may create device nodes")
+        with self.assertRaises(PermissionError):
+            os.mknod(str(self.workdir / "null"), stat.S_IFCHR | 0o666, os.makedev(1, 3))
+
+    def test_scandir_attributes_match_stat(self):
+        # readdirplus returns attributes with the names: they must agree with
+        # lookup, and repeated listings must keep the lookup counts balanced.
+        for round_ in range(3):
+            for index in range(40):
+                (self.workdir / "e{}".format(index)).write_bytes(b"x" * (index + round_))
+            os.mkdir(str(self.workdir / "sub"))
+            os.symlink("e0", str(self.workdir / "link"))
+            for entry in os.scandir(str(self.workdir)):
+                info = os.lstat(entry.path)
+                self.assertEqual(entry.inode(), info.st_ino)
+                self.assertEqual(entry.stat(follow_symlinks=False).st_size, info.st_size)
+                self.assertEqual(entry.is_dir(follow_symlinks=False), stat.S_ISDIR(info.st_mode))
+                self.assertEqual(entry.is_symlink(), stat.S_ISLNK(info.st_mode))
+            listing = subprocess.run(["ls", "-l", str(self.workdir)], stdout=subprocess.PIPE,
+                                     universal_newlines=True, check=True).stdout
+            self.assertIn("link -> e0", listing)
+            for index in range(40):
+                (self.workdir / "e{}".format(index)).unlink()
+            (self.workdir / "link").unlink()
+            (self.workdir / "sub").rmdir()
+        self.assertEqual(os.listdir(str(self.workdir)), [])
+
+    @staticmethod
+    def _umask():
+        mask = os.umask(0)
+        os.umask(mask)
+        return mask
 
 if __name__ == "__main__":
     unittest.main()

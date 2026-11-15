@@ -64,7 +64,84 @@ def peer_to_peer_checks(root, peer):
         raise AssertionError("directory removal did not replicate")
     concurrent_originators(first, last)
     metadata_replication(first, last)
+    cross_peer_locks(first, last)
     print("peer-to-peer replication checks: OK")
+
+
+def _helper(*args):
+    return subprocess.Popen([sys.executable, str(HERE / "lock_helper.py")] + [str(a) for a in args],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True)
+
+
+def _line(process, timeout=20.0):
+    import select
+    ready, _, _ = select.select([process.stdout], [], [], timeout)
+    return process.stdout.readline().strip() if ready else None
+
+
+def cross_peer_locks(first, last):
+    """Locks taken through one peer's mount exclude processes of another peer.
+
+    Also checks that a FIFO created on one peer is a FIFO on the other, and
+    that a counter incremented under a lock by processes on both peers loses
+    no update (each holder must observe the previous holder's write-back even
+    when it opened the file before acquiring the lock).
+    """
+    import fcntl
+    (first / "locked").write_bytes(b"0")
+    os.mkfifo(str(first / "fifo"))
+    if not wait_for(lambda: (last / "locked").exists() and (last / "fifo").exists(), 10):
+        raise AssertionError("files created on rank 0 are not visible on the last peer")
+    if not stat_is_fifo(last / "fifo"):
+        raise AssertionError("FIFO did not replicate as a FIFO")
+    for kind in ("posix", "flock"):
+        with open(str(first / "locked"), "r+b") as stream:
+            if kind == "posix":
+                fcntl.lockf(stream.fileno(), fcntl.LOCK_EX)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            probe = _helper("try", last / "locked", kind, "ex", 0, 0)
+            if _line(probe) != "busy":
+                raise AssertionError(f"{kind} lock held on rank 0 is not seen by the last peer")
+            probe.wait(10)
+            if kind == "posix":
+                probe = _helper("getlk", last / "locked", 0, 0)
+                answer = _line(probe)
+                probe.wait(10)
+                if not answer or not answer.startswith("wrlck"):
+                    raise AssertionError(f"F_GETLK on the last peer reported {answer!r}")
+            waiter = _helper("wait", last / "locked", kind, "ex", 0, 0)
+            if _line(waiter) != "waiting" or _line(waiter, 0.5) is not None:
+                raise AssertionError(f"{kind} waiter on the last peer did not block")
+        # Closing on rank 0 grants the waiter on the last peer.
+        if _line(waiter) != "granted" or waiter.wait(10) != 0:
+            raise AssertionError(f"{kind} waiter on the last peer was not granted after the release")
+        (first / "locked").write_bytes(b"0")
+        workers = [_helper("count", mount / "locked", 20, kind) for mount in (first, last, first, last)]
+        for worker in workers:
+            if _line(worker, 180) != "done" or worker.wait(10) != 0:
+                raise AssertionError(f"{kind} counter worker failed")
+        value = int((first / "locked").read_bytes())
+        if value != 80:
+            raise AssertionError(f"{kind}: counter is {value} after 80 locked increments on two peers")
+    # Unlocking without closing publishes the data written under the lock.
+    with open(str(first / "locked"), "r+b") as stream:
+        fcntl.lockf(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(b"written under the lock")
+        stream.flush()
+        fcntl.lockf(stream.fileno(), fcntl.LOCK_UN)
+        observed = (last / "locked").read_bytes()
+        if not observed.startswith(b"written under the lock"):
+            raise AssertionError(f"data written under a lock are not visible on the last peer after unlock: {observed!r}")
+    (first / "locked").unlink()
+    (first / "fifo").unlink()
+    if not wait_for(lambda: not (last / "locked").exists() and not (last / "fifo").exists(), 10):
+        raise AssertionError("removals did not replicate")
+
+
+def stat_is_fifo(path):
+    import stat
+    return stat.S_ISFIFO(os.lstat(str(path)).st_mode)
 
 
 def metadata_replication(first, last):

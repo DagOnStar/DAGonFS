@@ -9,7 +9,9 @@ enum INodeType {
     REGULAR_FILE,
     DIRECTORY,
     SYMBOLIC_LINK,
-    SPECIAL_INODE_TYPE_NO_BLOCK
+    SPECIAL_INODE_TYPE_NO_BLOCK,
+    /** FIFO, socket or device node: metadata only, opened by the kernel itself. */
+    SPECIAL_FILE
 };
 
 typedef unsigned int INodeID;

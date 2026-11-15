@@ -42,6 +42,8 @@ flowchart TB
     DP <-- "MPI_Isend / MPI_Irecv slices + ACK" --> R["Other ranks"]
     FS --> CP["Control plane<br/>RequestSender → DistributedCode listener<br/>(+ replayer thread in peer-to-peer)"]
     CP <-- "one PeerRequest message per rank" --> R
+    FS --> LT["Lock table (rank 0)<br/>fcntl · lockf · flock"]
+    CP <-- "LOCK_* requests and replies" --> LT
     CFG["--model · DAGonFS.ini · Volume API"] -.-> FS
 ```
 
@@ -53,6 +55,7 @@ flowchart TB
 * **Client-server.** Rank 0 mounts the file system and is the only originator. Ranks 1…P−1 run only the listener and store blocks.
 * **Peer-to-peer.** Every peer runs three threads: the FUSE thread serving its mount, the **listener** serving other peers' requests and data transfers, and the **replayer** applying their namespace and metadata operations (names, symbolic links, permissions, ownership, times, extended attributes) through the local mount. All peers therefore present the same tree. Files are identified across the cluster by a global id assigned at creation.
 * **Point-to-point data plane.** Transfers use non-blocking point-to-point messages and no collectives, so several peers can originate transfers concurrently. A write is acknowledged by every rank before `close` returns.
+* **Complete POSIX surface.** Every FUSE operation with a POSIX counterpart is implemented, in both models: besides files, directories, links and xattrs, this includes FIFOs and sockets, `fallocate`, `SEEK_DATA`/`SEEK_HOLE`, `copy_file_range`, `poll`, and **cluster-wide advisory locks** (`fcntl`, `lockf`, `flock`) served by one lock table on rank 0, with waiting, deadlock detection and interruption. See [docs/POSIX-COMPATIBILITY.md](docs/POSIX-COMPATIBILITY.md).
 
 Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -178,10 +181,11 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for every option and for clus
 | --- | --- |
 | Source contract (architectural invariants, no FUSE needed) | `python3 tests/test_source_contract.py` |
 | Build and smoke | `ctest --test-dir build` |
-| Mounted POSIX suite (16 scenarios) + replication checks | `python3 tests/mount.py --model peer-to-peer --ranks 4 -- --oversubscribe` |
+| Mounted POSIX suite (30 scenarios) + replication and cross-peer lock checks | `python3 tests/mount.py --model peer-to-peer --ranks 4 -- --oversubscribe` |
+| DAGonStar workflow with Python script tasks | `python3 tests/dagonstar/run_workflow.py --model peer-to-peer --ranks 4 -- --oversubscribe` |
 | Multi-node | `sbatch -N 2 --ntasks-per-node=2 tests/slurm/multinode.sbatch build` |
 
-The November 2026 assessment found and fixed 42 defects. They include cross-address-space `free()`, double FUSE replies, peer inode desynchronisation, concurrent collectives, unreplicated metadata, and inode numbers that were all 0. Before the fixes the client-server model crashed during the suite, and a peer-to-peer operation across nodes took about 400 ms. Afterwards both models pass on one node and across two Slurm nodes, including concurrent writers on two peers, and cross-node operations take 0.03–0.43 ms. See [docs/DEFECT-ANALYSIS.md](docs/DEFECT-ANALYSIS.md) and [docs/TESTING.md](docs/TESTING.md).
+The November 2026 assessment found and fixed 46 defects. They include cross-address-space `free()`, double FUSE replies, peer inode desynchronisation, concurrent collectives, unreplicated metadata, inode numbers that were all 0, and locks, FIFOs and space operations that were missing. Before the fixes the client-server model crashed during the suite, and a peer-to-peer operation across nodes took about 400 ms. Afterwards both models pass on one node and across two Slurm nodes, including concurrent writers on two peers, and cross-node operations take 0.03–0.43 ms. See [docs/DEFECT-ANALYSIS.md](docs/DEFECT-ANALYSIS.md) and [docs/TESTING.md](docs/TESTING.md).
 
 ## Performance
 
@@ -217,11 +221,11 @@ Earlier experiments, reported in the WiDE '24 paper, measured file copies up to 
 | [Architecture](docs/ARCHITECTURE.md) | Layers, models, request paths, consistency and failure models |
 | [Data plane](docs/DATA-PLANE.md) | Block layout, point-to-point transfers, ownership invariants, cost model |
 | [Protocol](docs/PROTOCOL.md) | MPI message formats and ordering |
-| [POSIX compatibility](docs/POSIX-COMPATIBILITY.md) | Supported operations and semantics |
+| [POSIX compatibility](docs/POSIX-COMPATIBILITY.md) | Supported operations, cluster-wide locks, special files and semantics |
 | [Configuration](docs/CONFIGURATION.md) | Build, creating volumes (CLI, ini, C++ and Python APIs), launcher, shutdown |
 | [Performance](docs/PERFORMANCE.md) | Methodology, tuning, DAGonFS vs. NFS benchmark with DAGonStar |
 | [DAGonStar integration](docs/DAGONSTAR-INTEGRATION.md) | Using DAGonFS as workflow scratch |
-| [Testing](docs/TESTING.md) | Harness and recorded results |
+| [Testing](docs/TESTING.md) | Harness, the DAGonStar workflow test and recorded results |
 | [Defect analysis](docs/DEFECT-ANALYSIS.md) | Assessment, defects and remedies |
 | [Manual page](docs/man/dagonfs.1) | `dagonfs(1)` and `DAGonFS_Launcher`; read it with `man docs/man/dagonfs.1` |
 | [Contributor guide](AGENTS.md) | Rules for changing the code |

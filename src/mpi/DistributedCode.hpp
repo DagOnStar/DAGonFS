@@ -70,6 +70,7 @@ public:
 	static void setXAttrHandler(const PeerRequest &request, const std::string &name, const std::string &attribute,
 	                            const std::string &value);
 	static void removeXAttrHandler(const std::string &name, const std::string &attribute);
+	static void mknodHandler(const PeerRequest &request, const std::string &name);
 	static void unmountFileSystem();
 	double getDAGonFSWriteSGElapsedTime() { return DAGonFSWriteSGElapsedTime; };
 	double getDAGonFSReadSGElapsedTime() { return DAGonFSReadSGElapsedTime; };

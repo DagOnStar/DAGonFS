@@ -22,15 +22,20 @@
 #include <cstring>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include <dirent.h>
 #include <fcntl.h>
 #include <mpi.h>
+#include <poll.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <thread>
 #ifdef __linux__
+#include <linux/falloc.h>
 #include <sys/syscall.h>
 #endif
 
@@ -40,6 +45,16 @@
 
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE (1 << 0)
+#endif
+// fallocate(2) modes (Linux values; defined here for non-Linux builds).
+#ifndef FALLOC_FL_KEEP_SIZE
+#define FALLOC_FL_KEEP_SIZE 0x01
+#endif
+#ifndef FALLOC_FL_PUNCH_HOLE
+#define FALLOC_FL_PUNCH_HOLE 0x02
+#endif
+#ifndef FALLOC_FL_ZERO_RANGE
+#define FALLOC_FL_ZERO_RANGE 0x10
 #endif
 
 using namespace std;
@@ -68,6 +83,12 @@ std::atomic<bool> FileSystem::symlinkFromThread{false};
 std::atomic<bool> FileSystem::setAttrFromThread{false};
 std::atomic<bool> FileSystem::setXAttrFromThread{false};
 std::atomic<bool> FileSystem::removeXAttrFromThread{false};
+std::atomic<bool> FileSystem::mknodFromThread{false};
+dagonfs::LockTable FileSystem::lockTable;
+std::mutex FileSystem::pendingLocksMutex;
+std::map<uint64_t, FileSystem::PendingLock> FileSystem::pendingLocks;
+std::atomic<uint64_t> FileSystem::nextLockToken{0};
+std::set<std::tuple<uint64_t, uint64_t, bool>> FileSystem::lockedOwners;
 std::atomic<uint64_t> FileSystem::pendingGlobalId{0};
 std::mutex FileSystem::globalIndexMutex;
 std::map<uint64_t, File *> FileSystem::globalIndex;
@@ -155,6 +176,18 @@ FileSystem::FileSystem(int rank, int mpi_world_size, dagonfs::Model model) {
     FuseOperations.access      = FileSystem::FuseAccess;
     FuseOperations.create      = FileSystem::FuseCreate;
     FuseOperations.getlk       = FileSystem::FuseGetLock;
+    FuseOperations.setlk       = FileSystem::FuseSetLock;
+    FuseOperations.flock       = FileSystem::FuseFlock;
+    FuseOperations.fallocate   = FileSystem::FuseFallocate;
+    FuseOperations.readdirplus = FileSystem::FuseReadDirPlus;
+    FuseOperations.poll        = FileSystem::FusePoll;
+    FuseOperations.ioctl       = FileSystem::FuseIoctl;
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 4)
+    FuseOperations.copy_file_range = FileSystem::FuseCopyFileRange;
+#endif
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 8)
+    FuseOperations.lseek       = FileSystem::FuseLseek;
+#endif
 
     m_stbuf.f_bsize   = Nodes::INodeBufBlockSize;      // File system block size
     m_stbuf.f_frsize  = Nodes::INodeBufBlockSize;      // Fundamental file system block size
@@ -341,7 +374,14 @@ void FileSystem::show_usage(const char *progname){
  */
 void FileSystem::FuseInit(void *userdata, struct fuse_conn_info *conn) {
     (void) userdata;
-    (void) conn;
+    // Byte-range and flock locks are served by the volume's lock table, so
+    // that they are visible to every process of every peer.
+    if (conn->capable & FUSE_CAP_POSIX_LOCKS) {
+        conn->want |= FUSE_CAP_POSIX_LOCKS;
+    }
+    if (conn->capable & FUSE_CAP_FLOCK_LOCKS) {
+        conn->want |= FUSE_CAP_FLOCK_LOCKS;
+    }
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Starting FuseInit()...");
 
     FileSystem::m_reclaimingINodes = false;
@@ -433,6 +473,13 @@ void FileSystem::Touch(INode *inode, bool modified) {
 }
 
 bool FileSystem::LoadFileContent(File *file, fuse_ino_t ino) {
+    // Peer-to-peer: another peer wrote the file back since the buffer was
+    // loaded. A clean buffer is reloaded, so that a reader that synchronises
+    // with the writer (a lock, or the writer's close) observes the new data;
+    // unflushed local writes are kept (the last write-back wins).
+    if (file->m_remoteChanged.exchange(false) && file->m_buf != nullptr && !file->isWaitingForWriting()) {
+        file->releaseBuffer();
+    }
     const size_t size = static_cast<size_t>(file->m_fuseEntryParam.attr.st_size);
     if (file->m_buf != nullptr) {
         // Already open here. In the peer-to-peer model another peer may have
@@ -591,6 +638,7 @@ void FileSystem::MirrorRemoteWrite(uint64_t id, size_t size) {
             return;
         }
         ApplyStoredSize(entry->second, size);
+        entry->second->m_remoteChanged = true;
         ino = entry->second->inodeNumber;
     }
     InvalidateINode(ino);
@@ -815,7 +863,7 @@ void FileSystem::FuseReadLink(fuse_req_t req, fuse_ino_t ino) {
 }
 
 void FileSystem::FuseMknod(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode, dev_t rdev) {
-    (void) rdev;
+    const bool replay = IsReplay(req, mknodFromThread);
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Making node -> FuseRamFs::FuseMknod()");
 
     INode *parentInode = GetINode(parent);
@@ -837,18 +885,34 @@ void FileSystem::FuseMknod(fuse_req_t req, fuse_ino_t parent, const char* name, 
         fuse_reply_err(req, EEXIST);
         return;
     }
-    // Only regular files are stored; devices, FIFOs and sockets are not supported.
-    if (!S_ISREG(mode)) {
-        fuse_reply_err(req, EPERM);
-        return;
-    }
-    // Peers replay a mknod as an exclusive create of the same path.
     const string fileName = parentDir_p->getDirName() + name;
-    if (peerToPeer && fileName.size() >= kMaxPathLength) {
+    if (peerToPeer && !replay && fileName.size() >= kMaxPathLength) {
         fuse_reply_err(req, ENAMETOOLONG);
         return;
     }
     const struct fuse_ctx* ctx_p = fuse_req_ctx(req);
+    if (S_ISFIFO(mode) || S_ISSOCK(mode) || S_ISCHR(mode) || S_ISBLK(mode)) {
+        // FIFOs, sockets and device nodes hold no data here: once the kernel
+        // knows their type it serves open, read and write itself.
+        fuse_ino_t ino = RegisterINode(SPECIAL_FILE, (mode & S_IFMT) | (mode & 07777), 1, ctx_p->gid, ctx_p->uid);
+        INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
+        inode_p->m_fuseEntryParam.attr.st_rdev = rdev;
+        parentDir_p->UpdateChild(string(name), ino);
+        Touch(parentDir_p, true);
+        inode_p->Lookup();
+        fuse_reply_entry(req, &(inode_p->m_fuseEntryParam));
+        if (peerToPeer && !replay) {
+            RequestSender::sendMknodRequest(fileName, static_cast<uint32_t>(mode & S_IFMT),
+                                            static_cast<uint32_t>(mode & 07777), static_cast<uint64_t>(rdev),
+                                            mpiRank, mpiWorldSize);
+        }
+        return;
+    }
+    if (!S_ISREG(mode)) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    // Peers replay a regular-file mknod as an exclusive create of the same path.
     fuse_ino_t ino = RegisterINode(REGULAR_FILE, S_IFREG | (mode & 07777), 1, ctx_p->gid, ctx_p->uid);
     INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
 
@@ -858,7 +922,7 @@ void FileSystem::FuseMknod(fuse_req_t req, fuse_ino_t parent, const char* name, 
 
     inode_p->Lookup();
     fuse_reply_entry(req, &(inode_p->m_fuseEntryParam));
-    if (peerToPeer) {
+    if (peerToPeer && !replay) {
         RequestSender::sendCreateFileRequest(fileName, globalId, mpiRank, mpiWorldSize);
     }
 }
@@ -1303,7 +1367,6 @@ void FileSystem::FuseOpen(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info*
  * Called on every close(2) of a descriptor: publish dirty content to the ranks.
  */
 void FileSystem::FuseFlush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
-    (void) fi;
     INode *inode = GetINode(ino);
     if (inode == nullptr) {
         fuse_reply_err(req, ENOENT);
@@ -1311,7 +1374,17 @@ void FileSystem::FuseFlush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info
     }
     File *file_p = dynamic_cast<File *>(inode);
     if (file_p != nullptr) {
+        // Write back first: the next holder of a lock must see the data.
         StoreFileContent(file_p, ino);
+        // POSIX: closing any descriptor of a file releases all the record
+        // locks that the process holds on it. The reply waits for the table.
+        const uint64_t key = LockKey(file_p);
+        if (IsLockCoordinator() || lockedOwners.erase({key, fi->lock_owner, false}) > 0) {
+            LockPacket release{};
+            release.owner = fi->lock_owner;
+            SubmitLock(req, LOCK_RELEASE, key, release);
+            return;
+        }
     }
     fuse_reply_err(req, 0);
 }
@@ -1332,6 +1405,7 @@ void FileSystem::FuseRelease(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
         return;
     }
 
+    const uint64_t key = LockKey(file_p);
     if (file_p->m_openCount > 0) {
         file_p->m_openCount--;
     }
@@ -1342,6 +1416,14 @@ void FileSystem::FuseRelease(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
             StoreFileContent(file_p, ino);
             file_p->releaseBuffer();
         }
+    }
+    // The last close of an open file description releases its flock lock.
+    if (fi->flock_release && (IsLockCoordinator() || lockedOwners.erase({key, fi->lock_owner, true}) > 0)) {
+        LockPacket release{};
+        release.owner = fi->lock_owner;
+        release.flags = DAGONFS_LOCK_FLOCK;
+        SubmitLock(req, LOCK_RELEASE, key, release);
+        return;
     }
     fuse_reply_err(req, 0);
 }
@@ -1374,12 +1456,43 @@ void FileSystem::FuseOpenDir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_in
     fuse_reply_open(req, fi);
 }
 
+namespace {
+
 /**
- * Directory offsets are positions in the ordered child map: 1 and 2 follow
- * "." and "..", child k is followed by offset k + 3. Offsets therefore stay
- * valid across calls, survive concurrent insertions/removals (which POSIX
- * allows to be reported or not) and never refer to heap memory.
+ * Fill a readdir (or readdirplus) reply. Directory offsets are positions in
+ * the ordered child map: 1 and 2 follow "." and "..", child k is followed by
+ * offset k + 3. Offsets therefore stay valid across calls, survive concurrent
+ * insertions/removals (which POSIX allows to be reported or not) and never
+ * refer to heap memory. @p add returns false when the entry does not fit.
  */
+template <typename Add>
+void listDirectory(Directory *dir, fuse_ino_t ino, off_t off, Add add) {
+    off_t position = off;
+    if (position == 0) {
+        if (!add(".", ino, position + 1)) return;
+        ++position;
+    }
+    if (position == 1) {
+        Directory *parentDir = dir->getParent();
+        const fuse_ino_t parentIno = parentDir == nullptr ? ino : parentDir->inodeNumber;
+        if (!add("..", parentIno, position + 1)) return;
+        ++position;
+    }
+    auto &children = dir->Children();
+    const size_t skip = static_cast<size_t>(position - 2);
+    if (skip >= children.size()) {
+        return;
+    }
+    auto child = children.begin();
+    std::advance(child, skip);
+    for (; child != children.end(); ++child) {
+        if (!add(child->first.c_str(), child->second, position + 1)) return;
+        ++position;
+    }
+}
+
+} // namespace
+
 void FileSystem::FuseReadDir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info* fi) {
     (void) fi;
 
@@ -1400,48 +1513,63 @@ void FileSystem::FuseReadDir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t 
 
     vector<char> buf(size);
     size_t bytesAdded = 0;
-    off_t position = off;
-    struct stat stbuf{};
-
-    auto add = [&](const char *entryName, fuse_ino_t entryIno, mode_t mode) {
+    listDirectory(dir, ino, off, [&](const char *entryName, fuse_ino_t entryIno, off_t next) {
+        struct stat stbuf{};
+        INode *entry = GetINode(entryIno);
         stbuf.st_ino = entryIno;
-        stbuf.st_mode = mode;
-        const size_t needed = fuse_add_direntry(req, buf.data() + bytesAdded, size - bytesAdded, entryName, &stbuf, position + 1);
+        stbuf.st_mode = entry == nullptr ? 0 : (entry->m_fuseEntryParam.attr.st_mode & S_IFMT);
+        const size_t needed = fuse_add_direntry(req, buf.data() + bytesAdded, size - bytesAdded, entryName, &stbuf, next);
         if (needed > size - bytesAdded) {
             return false;
         }
         bytesAdded += needed;
-        ++position;
         return true;
-    };
+    });
+    fuse_reply_buf(req, bytesAdded == 0 ? nullptr : buf.data(), bytesAdded);
+}
 
-    if (position == 0 && !add(".", ino, S_IFDIR)) {
-        fuse_reply_buf(req, buf.data(), bytesAdded);
+/**
+ * readdir that also returns each entry's attributes (used by ls -l, find,
+ * os.scandir): saves one lookup per entry. Every returned entry other than
+ * "." and ".." counts as a lookup, exactly as if FuseLookup had replied.
+ */
+void FileSystem::FuseReadDirPlus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info* fi) {
+    (void) fi;
+
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
+        fuse_reply_err(req, ENOENT);
         return;
     }
-    if (position == 1) {
-        Directory *parentDir = dir->getParent();
-        const fuse_ino_t parentIno = parentDir == nullptr ? ino : parentDir->inodeNumber;
-        if (!add("..", parentIno, S_IFDIR)) {
-            fuse_reply_buf(req, buf.data(), bytesAdded);
-            return;
-        }
+    Directory *dir = dynamic_cast<Directory *>(inode);
+    if (dir == nullptr) {
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+    if (off < 0) {
+        fuse_reply_err(req, EINVAL);
+        return;
     }
 
-    auto &children = dir->Children();
-    const size_t skip = static_cast<size_t>(position - 2);
-    if (skip < children.size()) {
-        auto child = children.begin();
-        std::advance(child, skip);
-        for (; child != children.end(); ++child) {
-            INode *childInode = GetINode(child->second);
-            const mode_t mode = childInode == nullptr ? 0 : (childInode->m_fuseEntryParam.attr.st_mode & S_IFMT);
-            if (!add(child->first.c_str(), child->second, mode)) {
-                break;
-            }
+    vector<char> buf(size);
+    size_t bytesAdded = 0;
+    listDirectory(dir, ino, off, [&](const char *entryName, fuse_ino_t entryIno, off_t next) {
+        INode *entry = GetINode(entryIno);
+        if (entry == nullptr) {
+            return true; // vanished meanwhile: skip it
         }
-    }
-
+        const bool dotEntry = strcmp(entryName, ".") == 0 || strcmp(entryName, "..") == 0;
+        const size_t needed = fuse_add_direntry_plus(req, buf.data() + bytesAdded, size - bytesAdded, entryName,
+                                                     &entry->m_fuseEntryParam, next);
+        if (needed > size - bytesAdded) {
+            return false;
+        }
+        bytesAdded += needed;
+        if (!dotEntry) {
+            INodeManager->LookupINode(entryIno);
+        }
+        return true;
+    });
     fuse_reply_buf(req, bytesAdded == 0 ? nullptr : buf.data(), bytesAdded);
 }
 
@@ -1492,6 +1620,12 @@ void FileSystem::FuseSetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 #ifndef __APPLE__
     const uint32_t position = 0;
 #endif
+    if (name == nullptr || strncmp(name, "system.posix_acl_", 17) == 0) {
+        // POSIX ACLs are not enforced, so they are not stored either: setfacl
+        // must not report success for an ACL that would be ignored.
+        fuse_reply_err(req, name == nullptr ? EINVAL : EOPNOTSUPP);
+        return;
+    }
     string path;
     if (peerToPeer && !replay) {
         if (size > DAGONFS_MAX_REQUEST_VALUE || position != 0) {
@@ -1689,16 +1823,447 @@ void FileSystem::FuseCreate(fuse_req_t req, fuse_ino_t parent, const char* name,
     }
 }
 
+// ------------------------------------------------------------------ locks
+
+bool FileSystem::IsLockCoordinator() {
+    return !peerToPeer || mpiRank == DAGONFS_LOCK_COORDINATOR;
+}
+
+uint64_t FileSystem::LockKey(File *file) {
+    // The cluster-wide identity: every peer names the file the same way.
+    return file->m_globalId;
+}
+
+namespace {
+
+/** struct flock (l_start, l_len) -> inclusive byte range; false if invalid. */
+bool lockRange(const struct flock *lock, int64_t &start, int64_t &end) {
+    int64_t first = lock->l_start;
+    int64_t length = lock->l_len;
+    if (length < 0) {
+        first += length;
+        length = -length;
+    }
+    if (first < 0) {
+        return false;
+    }
+    start = first;
+    end = length == 0 || length - 1 > dagonfs::kLockToEnd - first ? dagonfs::kLockToEnd : first + length - 1;
+    return true;
+}
+
+} // namespace
+
+std::vector<dagonfs::LockReply> FileSystem::ApplyLock(int rank, RequestType op, uint64_t file, const LockPacket &lock) {
+    dagonfs::LockRequest request;
+    request.file = file;
+    request.owner = dagonfs::LockOwner{rank, lock.owner,
+                                       (lock.flags & DAGONFS_LOCK_FLOCK) ? dagonfs::LockKind::Flock : dagonfs::LockKind::Posix};
+    request.type = lock.type;
+    request.start = lock.start;
+    request.end = lock.end;
+    request.pid = lock.pid;
+    request.wait = (lock.flags & DAGONFS_LOCK_WAIT) != 0;
+    request.token = lock.token;
+    switch (op) {
+    case LOCK_SET:
+        return lockTable.set(request);
+    case LOCK_GET:
+        return {lockTable.test(request)};
+    case LOCK_RELEASE: {
+        std::vector<dagonfs::LockReply> replies = lockTable.release(file, request.owner);
+        dagonfs::LockReply done;
+        done.rank = rank;
+        done.token = lock.token;
+        replies.push_back(done);
+        return replies;
+    }
+    case LOCK_CANCEL:
+        return lockTable.cancel(rank, lock.token, EINTR);
+    default:
+        return {};
+    }
+}
+
+void FileSystem::DeliverLockReplies(const std::vector<dagonfs::LockReply> &replies) {
+    for (const dagonfs::LockReply &reply : replies) {
+        LockPacket packet{};
+        packet.token = reply.token;
+        packet.error = reply.error;
+        packet.type = reply.type;
+        packet.start = reply.start;
+        packet.end = reply.end;
+        packet.pid = reply.pid;
+        if (reply.rank == mpiRank) {
+            CompleteLockRequest(packet);
+        } else {
+            RequestSender::sendLockReply(packet, reply.rank);
+        }
+    }
+}
+
+void FileSystem::SubmitLock(fuse_req_t req, RequestType op, uint64_t file, LockPacket lock) {
+    const uint64_t token = ++nextLockToken;
+    lock.token = token;
+    {
+        std::lock_guard<std::mutex> guard(pendingLocksMutex);
+        pendingLocks[token] = PendingLock{req, op == LOCK_GET};
+    }
+    if (IsLockCoordinator()) {
+        DeliverLockReplies(ApplyLock(mpiRank, op, file, lock));
+    } else {
+        RequestSender::sendLockRequest(op, file, lock);
+    }
+    if (op == LOCK_SET && (lock.flags & DAGONFS_LOCK_WAIT)) {
+        // Still waiting: let a signal interrupt the wait. The mutex keeps the
+        // request alive (no reply can be sent) while the callback is installed.
+        std::lock_guard<std::mutex> guard(pendingLocksMutex);
+        if (pendingLocks.count(token) != 0) {
+            fuse_req_interrupt_func(req, InterruptLock, reinterpret_cast<void *>(static_cast<uintptr_t>(token)));
+        }
+    }
+}
+
+void FileSystem::InterruptLock(fuse_req_t req, void *data) {
+    (void) req;
+    // Called with libfuse's request lock held, possibly from inside
+    // fuse_req_interrupt_func: the request must not be answered here.
+    const uint64_t token = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data));
+    std::thread(&FileSystem::CancelLock, token).detach();
+}
+
+void FileSystem::CancelLock(uint64_t token) {
+    {
+        std::lock_guard<std::mutex> guard(pendingLocksMutex);
+        if (pendingLocks.count(token) == 0) {
+            return; // already answered
+        }
+    }
+    if (IsLockCoordinator()) {
+        DeliverLockReplies(lockTable.cancel(mpiRank, token, EINTR));
+    } else {
+        LockPacket cancel{};
+        cancel.token = token;
+        RequestSender::sendLockRequest(LOCK_CANCEL, 0, cancel);
+    }
+}
+
+void FileSystem::ServeLockRequest(int source, const PeerRequest &request) {
+    if (!IsLockCoordinator()) {
+        return;
+    }
+    DeliverLockReplies(ApplyLock(source, request.type, request.globalId, request.lock));
+}
+
+void FileSystem::CompleteLockRequest(const LockPacket &lock) {
+    PendingLock pending{};
+    {
+        std::lock_guard<std::mutex> guard(pendingLocksMutex);
+        const auto entry = pendingLocks.find(lock.token);
+        if (entry == pendingLocks.end()) {
+            return;
+        }
+        pending = entry->second;
+        pendingLocks.erase(entry);
+    }
+    if (lock.error != 0) {
+        fuse_reply_err(pending.req, lock.error);
+        return;
+    }
+    if (pending.query) {
+        struct flock conflict{};
+        conflict.l_type = static_cast<short>(lock.type);
+        conflict.l_whence = SEEK_SET;
+        if (lock.type != F_UNLCK) {
+            conflict.l_start = static_cast<off_t>(lock.start);
+            conflict.l_len = lock.end == dagonfs::kLockToEnd ? 0 : static_cast<off_t>(lock.end - lock.start + 1);
+            conflict.l_pid = static_cast<pid_t>(lock.pid);
+        }
+        fuse_reply_lock(pending.req, &conflict);
+        return;
+    }
+    fuse_reply_err(pending.req, 0);
+}
+
 void FileSystem::FuseGetLock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi, struct flock* lock) {
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+    File *file = dynamic_cast<File *>(inode);
+    if (file == nullptr) {
+        // Only regular files are locked through the file system.
+        lock->l_type = F_UNLCK;
+        fuse_reply_lock(req, lock);
+        return;
+    }
+    LockPacket query{};
+    if (!lockRange(lock, query.start, query.end)) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    query.owner = fi->lock_owner;
+    query.type = lock->l_type;
+    query.pid = static_cast<uint32_t>(lock->l_pid);
+    SubmitLock(req, LOCK_GET, LockKey(file), query);
+}
+
+/**
+ * F_SETLK / F_SETLKW (POSIX record locks, also used by lockf). A blocking
+ * request stays pending, without blocking the FUSE loop, until the lock is
+ * granted, a deadlock is detected (EDEADLK) or a signal interrupts it (EINTR).
+ */
+void FileSystem::FuseSetLock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi, struct flock* lock, int sleep) {
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+    File *file = dynamic_cast<File *>(inode);
+    if (file == nullptr) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    LockPacket request{};
+    if (!lockRange(lock, request.start, request.end)) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    if (lock->l_type != F_RDLCK && lock->l_type != F_WRLCK && lock->l_type != F_UNLCK) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    request.owner = fi->lock_owner;
+    request.type = lock->l_type;
+    request.pid = static_cast<uint32_t>(lock->l_pid);
+    request.flags = sleep ? DAGONFS_LOCK_WAIT : 0;
+    if (peerToPeer && lock->l_type != F_WRLCK) {
+        // Unlocking (or downgrading) lets other peers in: publish the data
+        // written under the lock first, as close() does.
+        StoreFileContent(file, ino);
+    }
+    const uint64_t key = LockKey(file);
+    if (!IsLockCoordinator() && lock->l_type != F_UNLCK) {
+        lockedOwners.insert({key, fi->lock_owner, false});
+    }
+    SubmitLock(req, LOCK_SET, key, request);
+}
+
+/**
+ * flock(2). The owner is the open file description, and the lock is released
+ * by its last close (FuseRelease with flock_release).
+ */
+void FileSystem::FuseFlock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi, int op) {
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+    File *file = dynamic_cast<File *>(inode);
+    if (file == nullptr) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    LockPacket request{};
+    switch (op & ~LOCK_NB) {
+    case LOCK_SH: request.type = F_RDLCK; break;
+    case LOCK_EX: request.type = F_WRLCK; break;
+    case LOCK_UN: request.type = F_UNLCK; break;
+    default:
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    request.owner = fi->lock_owner;
+    request.start = 0;
+    request.end = dagonfs::kLockToEnd;
+    request.pid = static_cast<uint32_t>(fuse_req_ctx(req)->pid);
+    request.flags = DAGONFS_LOCK_FLOCK | ((op & LOCK_NB) ? 0 : DAGONFS_LOCK_WAIT);
+    if (peerToPeer && request.type != F_WRLCK) {
+        StoreFileContent(file, ino);
+    }
+    const uint64_t key = LockKey(file);
+    if (!IsLockCoordinator() && request.type != F_UNLCK) {
+        lockedOwners.insert({key, fi->lock_owner, true});
+    }
+    SubmitLock(req, LOCK_SET, key, request);
+}
+
+// ---------------------------------------------------- space and data ranges
+
+/**
+ * fallocate(2) and posix_fallocate(3). Memory is the backing store, so
+ * allocation only extends the file; hole punching and range zeroing write
+ * zeros. Other modes (collapse, insert, unshare) fail with EOPNOTSUPP.
+ */
+void FileSystem::FuseFallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset, off_t length, struct fuse_file_info* fi) {
     (void) fi;
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+    File *file = dynamic_cast<File *>(inode);
+    if (file == nullptr) {
+        fuse_reply_err(req, isDirectory(inode) ? EISDIR : ENODEV);
+        return;
+    }
+    if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)) {
+        fuse_reply_err(req, EOPNOTSUPP);
+        return;
+    }
+    const bool punch = (mode & FALLOC_FL_PUNCH_HOLE) != 0;
+    const bool zero = (mode & FALLOC_FL_ZERO_RANGE) != 0;
+    const bool keepSize = (mode & FALLOC_FL_KEEP_SIZE) != 0;
+    if (offset < 0 || length <= 0 || (punch && (zero || !keepSize))) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    if (length > std::numeric_limits<off_t>::max() - offset) {
+        fuse_reply_err(req, EFBIG);
+        return;
+    }
+    if (!LoadFileContent(file, ino)) {
+        fuse_reply_err(req, ENOMEM);
+        return;
+    }
+    const size_t begin = static_cast<size_t>(offset);
+    const size_t end = static_cast<size_t>(offset + length);
+    const size_t size = static_cast<size_t>(file->m_fuseEntryParam.attr.st_size);
+    const size_t newSize = keepSize ? size : std::max(size, end);
+    if (!file->ensureCapacity(std::max(newSize, size))) {
+        fuse_reply_err(req, ENOSPC);
+        return;
+    }
+    char *data = static_cast<char *>(file->m_buf);
+    bool changed = false;
+    if ((punch || zero) && begin < newSize) {
+        memset(data + begin, 0, std::min(end, newSize) - begin);
+        changed = true;
+    }
+    if (newSize > size) {
+        // The new tail reads back as zeros.
+        memset(data + size, 0, newSize - size);
+        SetSize(file, newSize);
+        changed = true;
+    }
+    if (changed) {
+        file->setWaiting();
+        Touch(file, true);
+    }
+    fuse_reply_err(req, 0);
+}
+
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 8)
+/**
+ * lseek(2) with SEEK_DATA / SEEK_HOLE (the kernel resolves the other
+ * whence values itself). Files are never sparse: all of [0, size) is data and
+ * the only hole is the implicit one at the end of the file.
+ */
+void FileSystem::FuseLseek(fuse_req_t req, fuse_ino_t ino, off_t off, int whence, struct fuse_file_info* fi) {
+    (void) fi;
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+    const off_t size = inode->m_fuseEntryParam.attr.st_size;
+    if (whence != SEEK_DATA && whence != SEEK_HOLE) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    if (off < 0 || off >= size) {
+        fuse_reply_err(req, ENXIO);
+        return;
+    }
+    fuse_reply_lseek(req, whence == SEEK_DATA ? off : size);
+}
+#endif
+
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 4)
+/**
+ * copy_file_range(2): copy between the front-end buffers of two open files
+ * without a round trip through the caller.
+ */
+void FileSystem::FuseCopyFileRange(fuse_req_t req, fuse_ino_t ino_in, off_t off_in, struct fuse_file_info* fi_in,
+                                   fuse_ino_t ino_out, off_t off_out, struct fuse_file_info* fi_out,
+                                   size_t len, int flags) {
+    (void) fi_in;
+    File *source = dynamic_cast<File *>(GetINode(ino_in));
+    File *target = dynamic_cast<File *>(GetINode(ino_out));
+    if (source == nullptr || target == nullptr) {
+        fuse_reply_err(req, GetINode(ino_in) == nullptr || GetINode(ino_out) == nullptr ? ENOENT : EINVAL);
+        return;
+    }
+    if (flags != 0 || off_in < 0 || off_out < 0) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    if (fi_out != nullptr && (fi_out->flags & O_APPEND)) {
+        fuse_reply_err(req, EBADF);
+        return;
+    }
+    if (!LoadFileContent(source, ino_in) || !LoadFileContent(target, ino_out)) {
+        fuse_reply_err(req, ENOMEM);
+        return;
+    }
+    const size_t sourceSize = std::min(static_cast<size_t>(source->m_fuseEntryParam.attr.st_size), source->m_capacity);
+    const size_t from = static_cast<size_t>(off_in);
+    const size_t to = static_cast<size_t>(off_out);
+    if (from >= sourceSize || len == 0) {
+        fuse_reply_write(req, 0);
+        return;
+    }
+    const size_t count = std::min(len, sourceSize - from);
+    if (source == target && from < to + count && to < from + count) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    if (count > static_cast<size_t>(std::numeric_limits<off_t>::max()) - to) {
+        fuse_reply_err(req, EFBIG);
+        return;
+    }
+    if (!target->ensureCapacity(to + count)) {
+        fuse_reply_err(req, ENOSPC);
+        return;
+    }
+    // ensureCapacity may move the buffer of the target (and of the source when they are the same file).
+    memmove(static_cast<char *>(target->m_buf) + to, static_cast<const char *>(source->m_buf) + from, count);
+    if (to + count > static_cast<size_t>(target->m_fuseEntryParam.attr.st_size)) {
+        SetSize(target, to + count);
+    }
+    target->setWaiting();
+    Touch(target, true);
+    setTimeNow(source->m_fuseEntryParam.attr, true, false, false);
+    fuse_reply_write(req, count);
+}
+#endif
+
+/** poll(2) / select(2): a regular file is always ready for reading and writing. */
+void FileSystem::FusePoll(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi, struct fuse_pollhandle* ph) {
+    (void) fi;
+    if (ph != nullptr) {
+        // Readiness never changes, so no notification will ever be sent.
+        fuse_pollhandle_destroy(ph);
+    }
     if (GetINode(ino) == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-    // DAGonFS does not retain POSIX byte-range locks. Report that no lock
-    // conflicts with the requested range, as required by F_GETLK.
-    lock->l_type = F_UNLCK;
-    fuse_reply_lock(req, lock);
+    fuse_reply_poll(req, POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM);
+}
+
+/** ioctl(2): no device-specific requests exist; the kernel's generic ones never get here. */
+#if FUSE_USE_VERSION < 35
+void FileSystem::FuseIoctl(fuse_req_t req, fuse_ino_t ino, int cmd, void* arg, struct fuse_file_info* fi,
+                           unsigned flags, const void* in_buf, size_t in_bufsz, size_t out_bufsz)
+#else
+void FileSystem::FuseIoctl(fuse_req_t req, fuse_ino_t ino, unsigned int cmd, void* arg, struct fuse_file_info* fi,
+                           unsigned flags, const void* in_buf, size_t in_bufsz, size_t out_bufsz)
+#endif
+{
+    (void) cmd; (void) arg; (void) fi; (void) flags; (void) in_buf; (void) in_bufsz; (void) out_bufsz;
+    fuse_reply_err(req, GetINode(ino) == nullptr ? ENOENT : ENOTTY);
 }
 
 /**

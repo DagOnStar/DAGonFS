@@ -46,6 +46,8 @@ flowchart TB
     DP <-- "point-to-point transfers" --> NET["Other ranks"]
     CP["Control plane<br/>RequestSender (originator) · DistributedCode (listener, replayer)"] --> DP
     FS --> CP
+    FS --> LT["Lock table<br/>record and flock locks (src/locks)"]
+    CP --> LT
     VOL["Volume API (src/volume)<br/>Options: model, root, flags · runVolume()"] --> FS
     VOL --> CP
 ```
@@ -58,7 +60,9 @@ flowchart TB
 
 **Data plane (`DataBlockManager`, `Blocks`, `DataBlock`).** File contents are divided into fixed blocks of $B = 128\ \text{KiB}$ and distributed over all ranks with a deterministic, contiguous layout (see [DATA-PLANE.md](DATA-PLANE.md)). Each rank keeps only the blocks it owns. No process-local address ever crosses an MPI boundary.
 
-**Control plane (`RequestSender`, `DistributedCode`).** The rank where an operation originates sends one self-describing request message to each other rank. Every rank that is not a pure originator runs a *listener* (`DistributedCode::start`). The listener serves data transfers, block releases and acknowledgements, and hands namespace replays to a separate *replayer* thread. The message formats are specified in [PROTOCOL.md](PROTOCOL.md).
+**Control plane (`RequestSender`, `DistributedCode`).** The rank where an operation originates sends one self-describing request message to each other rank. Every rank that is not a pure originator runs a *listener* (`DistributedCode::start`). The listener serves data transfers, block releases, acknowledgements and lock requests, and hands namespace replays to a separate *replayer* thread. The message formats are specified in [PROTOCOL.md](PROTOCOL.md).
+
+**Lock table (`dagonfs::LockTable`).** POSIX record locks and `flock` locks of the whole volume, with waiters and deadlock detection, as pure bookkeeping (no FUSE or MPI dependency, unit-tested by `tests/test_lock_table.cpp`). The table lives on rank 0: the client-server front end uses it directly, and in the peer-to-peer model rank 0 is the *lock coordinator* that the other peers query through the control plane ([PROTOCOL.md](PROTOCOL.md) §3.4). Lock replies may be deferred, so the FUSE loop never blocks on a lock.
 
 ### Threads per rank
 
@@ -125,7 +129,7 @@ The logical size `st_size` may differ from `m_storedSize` between synchronisatio
 
 ## 5. Peer-to-peer model
 
-Each peer mounts `<root>/<rank>` and holds a full replica of the namespace. A namespace mutation performed on peer $i$ (create, mknod, mkdir, unlink, rmdir, rename, link) follows four steps:
+Each peer mounts `<root>/<rank>` and holds a full replica of the namespace. A namespace or metadata mutation performed on peer $i$ (create, mknod, mkdir, unlink, rmdir, rename, link, symlink, setattr, xattrs) follows four steps:
 
 1. It is applied locally.
 2. It is acknowledged to the kernel.
@@ -136,7 +140,7 @@ A replayed request is recognised by the requesting thread: the FUSE context repo
 
 File data are addressed by a **cluster-wide identity** assigned at creation, $\mathit{gid} = ((r_c + 1) \ll 48) \,|\, \mathit{ino}_c$, where $r_c$ and $\mathit{ino}_c$ are the creating peer and its local inode number. The identity travels in the create message, so every peer indexes the same file under the same key, even though local inode numbers diverge (for example because symbolic links are not replicated).
 
-When a remote write changes a file, the listener updates the local replica's size. If the replayed create has not run yet, the size is kept as *pending* and applied when the create assigns the identity. The listener then invalidates the local kernel's cached pages, and only then acknowledges the write.
+When a remote write changes a file, the listener updates the local replica's size and marks the file as changed remotely, so that a buffer that is open locally and has no unflushed writes is reloaded before its next use. If the replayed create has not run yet, the size is kept as *pending* and applied when the create assigns the identity. The listener then invalidates the local kernel's cached pages, and only then acknowledges the write.
 
 ```mermaid
 sequenceDiagram
@@ -168,14 +172,15 @@ A replayed system call is served by the peer's own FUSE thread. That thread may 
   * *Namespace and metadata replication* is asynchronous and ordered per originating peer, by MPI's non-overtaking rule on a single communicator and tag. Names, symbolic links, permissions, ownership, timestamps and extended attributes changed on one peer appear on the others shortly afterwards.
   * *Data* follows **close-to-open** semantics. A writer's `close` (or `fsync`) returns only after every peer has stored its slice and updated its view of the file, so any `open` that starts afterwards on any peer where the name is visible observes the new content.
   * The kernel does not cache names or attributes (timeouts 0), because the listener changes them asynchronously. Concurrent mutations of the same object from different peers are not arbitrated: the last write-back wins.
+  * *Locks* are cluster-wide and also order data: releasing a lock (by `close`, unlock or downgrade) writes the file back first, and the next holder, on any peer, reloads its clean buffer if another peer changed the file.
 
 ## 7. Failure model and limitations
 
 DAGonFS keeps no replica, log or checkpoint. A rank failure loses the blocks that rank stores, and in the client-server model the loss of rank 0 also loses the namespace. MPI's default error handler aborts the job. The following limitations are inherent to the current design and are documented rather than hidden:
 
 1. **Whole-file front-end buffering.** A file opened on a front end must fit in that process's memory. The distributed copy multiplies total capacity, but not the size of a single open file.
-2. **No byte-range locks.** `getlk` reports `F_UNLCK`; `setlk`/`flock` are not registered.
-3. **No arbitration of concurrent writers.** Two peers that write the same file at the same time are not serialised: the last write-back wins (§6).
+2. **No arbitration of unsynchronised writers.** Two peers that write the same file at the same time without a lock are not serialised: the last write-back wins (§6). Writers that need mutual exclusion use advisory locks, which are cluster-wide.
+3. **Single lock coordinator.** Lock traffic of a peer-to-peer volume goes to rank 0; each lock or unlock costs one round trip to it.
 4. **Homogeneous ranks.** Messages are raw structures, so all ranks must run the same binary on the same architecture.
 
 ## 8. Source map
@@ -189,6 +194,7 @@ DAGonFS keeps no replica, log or checkpoint. A rank failure loses the blocks tha
 | Data plane | `src/mpi/DataBlockManager.*`, `src/blocks/*` |
 | Control plane | `src/mpi/RequestSender.*` (originator), `src/mpi/DistributedCode.*` (listener, replayer) |
 | Wire format | `src/mpi/mpi_data.hpp` |
+| Lock table | `src/locks/LockTable.*` |
 | Launcher | `src/DAGonFS_Launcher.cpp` |
 | Python API | `python/dagonfs/` |
 

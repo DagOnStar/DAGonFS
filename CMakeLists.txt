@@ -90,6 +90,7 @@ add_library(dagonfs_core STATIC
         src/mpi/DataBlockManager.cpp
         src/mpi/DistributedCode.cpp
         src/mpi/RequestSender.cpp
+        src/locks/LockTable.cpp
         src/utils/ArgumentParser.cpp
 )
 target_compile_definitions(dagonfs_core PUBLIC
@@ -153,6 +154,9 @@ if(BUILD_TESTING)
         NAME dagonfs-usage
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/usage.py ${CMAKE_CURRENT_BINARY_DIR}
     )
+    # The lock table is pure bookkeeping: unit-tested without MPI or FUSE.
+    add_executable(test_lock_table tests/test_lock_table.cpp src/locks/LockTable.cpp)
+    add_test(NAME dagonfs-lock-table COMMAND test_lock_table)
     add_test(
         NAME dagonfs-launcher-dry-run
         COMMAND ${PROJECT_NAME}_Launcher ${CMAKE_CURRENT_SOURCE_DIR}/src/DAGonFS.ini --dry-run

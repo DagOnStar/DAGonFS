@@ -18,7 +18,8 @@ REQUIRED_OPERATIONS = (
     "unlink", "rmdir", "symlink", "rename", "link", "open", "read", "write",
     "flush", "release", "fsync", "opendir", "readdir", "releasedir", "fsyncdir",
     "statfs", "setxattr", "getxattr", "listxattr", "removexattr", "access",
-    "create", "getlk",
+    "create", "getlk", "setlk", "flock", "fallocate", "readdirplus", "poll",
+    "ioctl", "copy_file_range", "lseek",
     "destroy", "forget_multi",
 )
 
@@ -82,11 +83,51 @@ class FuseSourceContractTests(unittest.TestCase):
                     with self.subTest(handler=name, line=line):
                         self.fail(f"{name}: '{line}' is followed by '{following}'")
 
-    def test_getlk_always_replies(self):
+    def test_locks_are_served_by_the_lock_table(self):
+        # getlk used to answer F_UNLCK unconditionally and setlk/flock were
+        # missing: every lock request now goes through the volume's table.
         text = source("ramfs/FileSystem.cpp")
-        start = text.index("void FileSystem::FuseGetLock")
+        for handler in ("FuseGetLock", "FuseSetLock", "FuseFlock"):
+            start = text.index("void FileSystem::" + handler)
+            body = text[start:text.index("\n}\n", start)]
+            with self.subTest(handler=handler):
+                self.assertIn("SubmitLock(req, ", body)
+        # A deferred reply is sent exactly once, by CompleteLockRequest.
+        start = text.index("void FileSystem::CompleteLockRequest")
         body = text[start:text.index("\n}\n", start)]
-        self.assertIn("fuse_reply_lock(req, lock);", body)
+        self.assertIn("pendingLocks.erase(entry);", body)
+        # An interrupt never replies from inside libfuse's callback.
+        start = text.index("void FileSystem::InterruptLock")
+        body = text[start:text.index("\n}\n", start)]
+        self.assertNotIn("fuse_reply", body)
+        self.assertIn(".detach()", body)
+        # close() releases record locks (flush) and flock locks (release).
+        for handler, call in (("FuseFlush", "LOCK_RELEASE"), ("FuseRelease", "flock_release")):
+            start = text.index("void FileSystem::" + handler)
+            body = text[start:text.index("\n}\n", start)]
+            with self.subTest(handler=handler):
+                self.assertIn(call, body)
+        self.assertIn("FUSE_CAP_POSIX_LOCKS", text)
+        self.assertIn("FUSE_CAP_FLOCK_LOCKS", text)
+
+    def test_lock_requests_are_served_by_the_listener_without_system_calls(self):
+        listener = source("mpi/DistributedCode.cpp")
+        start = listener.index("void DistributedCode::start()")
+        body = listener[start:listener.index("\n}\n", start)]
+        self.assertIn("FileSystem::ServeLockRequest(source, request);", body)
+        self.assertIn("FileSystem::CompleteLockRequest(request.lock);", body)
+        table = source("locks/LockTable.cpp")
+        for call in ("fuse_", "MPI_", "open(", "fcntl("):
+            with self.subTest(call=call):
+                self.assertNotIn(call, table, "the lock table is pure bookkeeping")
+
+    def test_special_files_are_created_and_replicated(self):
+        text = source("ramfs/FileSystem.cpp")
+        start = text.index("void FileSystem::FuseMknod")
+        body = text[start:text.index("\n}\n", start)]
+        self.assertIn("S_ISFIFO(mode)", body)
+        self.assertIn("sendMknodRequest(", body)
+        self.assertNotIn("EPERM", body)
 
     def test_batched_forget_replies_once(self):
         text = source("ramfs/FileSystem.cpp")
@@ -139,13 +180,14 @@ class FuseSourceContractTests(unittest.TestCase):
 
     def test_replays_are_identified_per_request_and_never_block_the_listener(self):
         text = source("ramfs/FileSystem.cpp")
-        self.assertEqual(text.count("const bool replay = IsReplay(req, "), 10)
+        self.assertEqual(text.count("const bool replay = IsReplay(req, "), 11)
         self.assertIn("fuse_req_ctx(req)->pid", text)
         listener = source("mpi/DistributedCode.cpp")
         start = listener.index("void DistributedCode::start()")
         body = listener[start:listener.index("\n}\n", start)]
         for call in ("createFile(", "deleteFile(", "createDir(", "deleteDir(", "renameHandler(", "linkHandler(",
-                     "symlinkHandler(", "setAttrHandler(", "setXAttrHandler(", "removeXAttrHandler("):
+                     "symlinkHandler(", "setAttrHandler(", "setXAttrHandler(", "removeXAttrHandler(",
+                     "mknodHandler("):
             with self.subTest(call=call):
                 self.assertNotIn(call, body, "the listener must queue replays, not perform them")
 

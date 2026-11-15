@@ -20,11 +20,18 @@
  * contain only value types: process-local addresses are never transmitted.
  *
  * Namespace and metadata requests (CREATE_FILE ... LINK, SYMLINK ...
- * REMOVE_XATTR) are only sent in the peer-to-peer model; DELETE is only sent
- * in the client-server model.
+ * REMOVE_XATTR, MKNOD) and lock requests (LOCK_*) are only sent in the
+ * peer-to-peer model; DELETE is only sent in the client-server model.
+ *
+ * Lock requests go from a peer to the lock coordinator (rank 0), which answers
+ * each of them, possibly much later (a waiting lock), with one LOCK_REPLY.
  */
 typedef enum {WRITE, READ, CREATE_FILE, DELETE_FILE, CREATE_DIR, DELETE_DIR, RENAME, TERMINATE, LINK, DELETE,
-              SYMLINK, SET_ATTR, SET_XATTR, REMOVE_XATTR} RequestType;
+              SYMLINK, SET_ATTR, SET_XATTR, REMOVE_XATTR, MKNOD,
+              LOCK_SET, LOCK_GET, LOCK_RELEASE, LOCK_CANCEL, LOCK_REPLY} RequestType;
+
+/** Rank that holds the lock table of a volume. */
+constexpr int DAGONFS_LOCK_COORDINATOR = 0;
 
 /** Message tags: requests go to the listener; data and acknowledgements to the transfer's two ends. */
 constexpr int DAGONFS_TAG_REQUEST = 0;  ///< PeerRequest, originator -> listener
@@ -67,7 +74,29 @@ typedef struct MetadataPacket {
 	int64_t mtimeSeconds;
 	int64_t mtimeNanoseconds;
 	int32_t xattrFlags;     ///< SET_XATTR: XATTR_CREATE / XATTR_REPLACE as requested
+	uint32_t fileType;      ///< MKNOD: S_IFIFO, S_IFSOCK, S_IFCHR or S_IFBLK
+	uint64_t rdev;          ///< MKNOD: device number
 } MetadataPacket;
+
+/** LockPacket.flags */
+constexpr uint32_t DAGONFS_LOCK_FLOCK = 1u << 0;  ///< flock lock (otherwise a POSIX record lock)
+constexpr uint32_t DAGONFS_LOCK_WAIT = 1u << 1;   ///< wait for the lock (F_SETLKW, flock without LOCK_NB)
+
+/**
+ * LOCK_*: an advisory lock request on the file PeerRequest.globalId, or its
+ * reply. The owner is (sending rank, owner); the token identifies the
+ * requester's pending FUSE request and is echoed in the LOCK_REPLY.
+ */
+typedef struct LockPacket {
+	uint64_t owner;         ///< FUSE lock owner on the requesting rank
+	uint64_t token;         ///< requester's identifier of the pending request
+	int64_t start;          ///< first byte
+	int64_t end;            ///< last byte, inclusive (INT64_MAX: to the end of the file)
+	uint32_t pid;           ///< locking process (as seen by the holder's kernel)
+	int32_t type;           ///< F_RDLCK, F_WRLCK or F_UNLCK
+	uint32_t flags;         ///< DAGONFS_LOCK_*
+	int32_t error;          ///< LOCK_REPLY: 0 or a POSIX error
+} LockPacket;
 
 typedef struct PeerRequest {
 	RequestType type;
@@ -77,12 +106,14 @@ typedef struct PeerRequest {
 	uint32_t secondPathLength;
 	/** Length in bytes of the value that follows the paths (SET_XATTR), <= DAGONFS_MAX_REQUEST_VALUE. */
 	uint32_t valueLength;
-	/** CREATE_FILE: cluster-wide identity, ((creator rank + 1) << 48) | creator inode. */
+	/** CREATE_FILE, LOCK_*: cluster-wide identity, ((creator rank + 1) << 48) | creator inode. */
 	uint64_t globalId;
 	/** WRITE / READ: parameters of the data-plane transfer that follows; DELETE: io.inode. */
 	IORequestPacket io;
-	/** SET_ATTR / SET_XATTR. */
+	/** SET_ATTR / SET_XATTR / MKNOD. */
 	MetadataPacket meta;
+	/** LOCK_* (the file is globalId). */
+	LockPacket lock;
 } PeerRequest;
 
 #endif //MPI_DATA_HPP

@@ -29,8 +29,10 @@ uint32_t boundedLength(const string &path) {
 
 } // namespace
 
-void RequestSender::send(const PeerRequest &request, const string &first, const string &second,
-                         int sourceRank, int mpiWorldSize, bool includeSelf, const string &value) {
+namespace {
+
+/** Wire image of a request: header | first path | second path | value. */
+vector<char> encode(const PeerRequest &request, const string &first, const string &second, const string &value) {
 	PeerRequest header = request;
 	header.firstPathLength = boundedLength(first);
 	header.secondPathLength = boundedLength(second);
@@ -45,12 +47,24 @@ void RequestSender::send(const PeerRequest &request, const string &first, const 
 	memcpy(cursor, second.data(), header.secondPathLength);
 	cursor += header.secondPathLength;
 	memcpy(cursor, value.data(), header.valueLength);
+	return message;
+}
 
+} // namespace
+
+void RequestSender::send(const PeerRequest &request, const string &first, const string &second,
+                         int sourceRank, int mpiWorldSize, bool includeSelf, const string &value) {
+	const vector<char> message = encode(request, first, second, value);
 	for (int i = 0; i < mpiWorldSize; i++) {
 		if (i != sourceRank || includeSelf) {
 			MPI_Send(message.data(), static_cast<int>(message.size()), MPI_BYTE, i, DAGONFS_TAG_REQUEST, MPI_COMM_WORLD);
 		}
 	}
+}
+
+void RequestSender::sendTo(const PeerRequest &request, const string &first, const string &second, int destination) {
+	const vector<char> message = encode(request, first, second, string());
+	MPI_Send(message.data(), static_cast<int>(message.size()), MPI_BYTE, destination, DAGONFS_TAG_REQUEST, MPI_COMM_WORLD);
 }
 
 void RequestSender::sendCreateFileRequest(string name, uint64_t globalId, int sourceRank, int mpiWorldSize) {
@@ -98,6 +112,28 @@ void RequestSender::sendSetXAttrRequest(string name, string attribute, string va
 
 void RequestSender::sendRemoveXAttrRequest(string name, string attribute, int sourceRank, int mpiWorldSize) {
 	send(makeRequest(REMOVE_XATTR), name, attribute, sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendMknodRequest(string name, uint32_t fileType, uint32_t mode, uint64_t rdev,
+                                     int sourceRank, int mpiWorldSize) {
+	PeerRequest request = makeRequest(MKNOD);
+	request.meta.fileType = fileType;
+	request.meta.mode = mode;
+	request.meta.rdev = rdev;
+	send(request, name, string(), sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendLockRequest(RequestType type, uint64_t file, const LockPacket &lock) {
+	PeerRequest request = makeRequest(type);
+	request.globalId = file;
+	request.lock = lock;
+	sendTo(request, string(), string(), DAGONFS_LOCK_COORDINATOR);
+}
+
+void RequestSender::sendLockReply(const LockPacket &lock, int destination) {
+	PeerRequest request = makeRequest(LOCK_REPLY);
+	request.lock = lock;
+	sendTo(request, string(), string(), destination);
 }
 
 void RequestSender::sendDeleteRequest(uint64_t key, int sourceRank, int mpiWorldSize) {

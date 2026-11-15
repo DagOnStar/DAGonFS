@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Byte-compile test helpers
-        run: python3 -m py_compile tests/mount.py tests/usage.py tests/test_python_posix.py tests/test_source_contract.py python/dagonfs/__init__.py python/dagonfs/volume.py bench/fsbench.py bench/workflow.py bench/run.py bench/plot.py
+        run: python3 -m py_compile tests/*.py tests/dagonstar/*.py tests/dagonstar/tasks/*.py python/dagonfs/*.py bench/*.py
       - name: Architectural invariants
         run: python3 tests/test_source_contract.py -v
       - name: Whitespace errors introduced by the change
@@ -104,6 +104,16 @@ jobs:
             python3 tests/mount.py --build-dir build --model ${{ matrix.model }} --ranks "$ranks" \
               --root "$RUNNER_TEMP/dagonfs-$ranks" -- --oversubscribe
           done
+      - name: DAGonStar workflow with Python script tasks
+        if: steps.fuse.outputs.available == 'true'
+        timeout-minutes: 10
+        run: |
+          if python3 -m pip install --quiet dagonstar; then
+            python3 tests/dagonstar/run_workflow.py --build-dir build --model ${{ matrix.model }} --ranks 4 \
+              --root "$RUNNER_TEMP/dagonfs-wf" -- --oversubscribe
+          else
+            echo "::warning::DAGonStar could not be installed; skipping the workflow test"
+          fi
       - name: Upload job logs
         if: failure()
         uses: actions/upload-artifact@v4

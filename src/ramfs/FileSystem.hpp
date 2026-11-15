@@ -17,13 +17,17 @@
 #include <cstdio>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
+#include <tuple>
 
 #include "../utils/fuse_headers.hpp"
 #include "../nodes/Nodes.hpp"
 #include "../blocks/Blocks.hpp"
 #include "../mpi/DistributedCode.hpp"
 #include "../volume/Options.hpp"
+#include "../locks/LockTable.hpp"
+#include "../mpi/mpi_data.hpp"
 
 #include "../utils/log_level.hpp"
 
@@ -136,6 +140,44 @@ private:
     /** @brief FindPath, plus "/" for the root; the path other peers replay a metadata change on. */
     static std::string ReplicatedPath(fuse_ino_t ino);
 
+    // ----------------------------------------------------------- locks
+    /**
+     * The volume's lock table. Used on the lock coordinator only: the
+     * client-server front end, or rank 0 of a peer-to-peer volume.
+     */
+    static dagonfs::LockTable lockTable;
+    /** A lock request whose FUSE reply waits for the lock table's answer. */
+    struct PendingLock {
+        fuse_req_t req;
+        bool query;     ///< F_GETLK: reply with fuse_reply_lock
+    };
+    static std::mutex pendingLocksMutex;
+    static std::map<uint64_t, PendingLock> pendingLocks;
+    static std::atomic<uint64_t> nextLockToken;
+    /**
+     * Peer-to-peer, non-coordinator peers, FUSE thread only: (file, owner,
+     * flock?) that may hold locks, so that closing a file that was never
+     * locked needs no round trip to the coordinator.
+     */
+    static std::set<std::tuple<uint64_t, uint64_t, bool>> lockedOwners;
+    /** True if this rank holds the lock table. */
+    static bool IsLockCoordinator();
+    /**
+     * Register @p req as pending under a new token and submit the lock
+     * operation @p op (LOCK_SET, LOCK_GET or LOCK_RELEASE) on @p file. The reply
+     * to @p req is sent when the table answers, possibly from another thread.
+     */
+    static void SubmitLock(fuse_req_t req, RequestType op, uint64_t file, LockPacket lock);
+    /** Apply a lock operation of @p rank to the local table and return the replies. */
+    static std::vector<dagonfs::LockReply> ApplyLock(int rank, RequestType op, uint64_t file, const LockPacket &lock);
+    /** Send each reply to its requester (locally, or through the control plane). */
+    static void DeliverLockReplies(const std::vector<dagonfs::LockReply> &replies);
+    /** FUSE interrupt of a waiting lock request: withdraw it (EINTR). */
+    static void InterruptLock(fuse_req_t req, void *data);
+    static void CancelLock(uint64_t token);
+    /** Lock-table identity of an open file. */
+    static uint64_t LockKey(File *file);
+
 public:
     /** All the supported filesystem operations mapped to object-methods. */
     static struct fuse_lowlevel_ops FuseOperations;
@@ -161,6 +203,7 @@ public:
     static std::atomic<bool> setAttrFromThread;
     static std::atomic<bool> setXAttrFromThread;
     static std::atomic<bool> removeXAttrFromThread;
+    static std::atomic<bool> mknodFromThread;
     /** Cluster-wide identity carried by a replayed create. */
     static std::atomic<uint64_t> pendingGlobalId;
     /** Local file with the given cluster-wide identity, or nullptr. */
@@ -173,6 +216,10 @@ public:
     static void MirrorRemoteWrite(uint64_t id, size_t size);
     /** Replay thread: identify itself, so that its requests are recognised as replays. */
     static void MarkReplayThread();
+    /** Lock coordinator: serve a lock request received from peer @p source. */
+    static void ServeLockRequest(int source, const PeerRequest &request);
+    /** Reply to the pending FUSE request that @p lock answers. */
+    static void CompleteLockRequest(const LockPacket &lock);
     /** True once this peer's FUSE loop has ended. */
     static bool IsLocallyUnmounted() { return loopEnded.load(); }
     static std::atomic<bool> unmountFromThread;
@@ -233,6 +280,26 @@ public:
     static void FuseAccess(fuse_req_t req, fuse_ino_t ino, int mask);
     static void FuseCreate(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, struct fuse_file_info *fi);
     static void FuseGetLock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, struct flock *lock);
+    static void FuseSetLock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, struct flock *lock, int sleep);
+    static void FuseFlock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, int op);
+    static void FuseFallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset, off_t length, struct fuse_file_info *fi);
+    static void FuseReadDirPlus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi);
+    static void FusePoll(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi, struct fuse_pollhandle *ph);
+#if FUSE_USE_VERSION < 35
+    static void FuseIoctl(fuse_req_t req, fuse_ino_t ino, int cmd, void *arg, struct fuse_file_info *fi,
+                          unsigned flags, const void *in_buf, size_t in_bufsz, size_t out_bufsz);
+#else
+    static void FuseIoctl(fuse_req_t req, fuse_ino_t ino, unsigned int cmd, void *arg, struct fuse_file_info *fi,
+                          unsigned flags, const void *in_buf, size_t in_bufsz, size_t out_bufsz);
+#endif
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 4)
+    static void FuseCopyFileRange(fuse_req_t req, fuse_ino_t ino_in, off_t off_in, struct fuse_file_info *fi_in,
+                                  fuse_ino_t ino_out, off_t off_out, struct fuse_file_info *fi_out,
+                                  size_t len, int flags);
+#endif
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 8)
+    static void FuseLseek(fuse_req_t req, fuse_ino_t ino, off_t off, int whence, struct fuse_file_info *fi);
+#endif
     static void FuseRead(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi);
     static void FuseWrite(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off_t off, struct fuse_file_info *fi);
 

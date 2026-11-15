@@ -56,6 +56,9 @@ INode* Nodes::createEmptyINode(INodeType type) {
         case SPECIAL_INODE_TYPE_NO_BLOCK:
             newINode = new SpecialINode(SPECIAL_INODE_TYPE_NO_BLOCK);
             break;
+        case SPECIAL_FILE:
+            newINode = new SpecialINode(SPECIAL_FILE);
+            break;
         default:
             newINode = nullptr;
             break;
