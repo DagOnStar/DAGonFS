@@ -165,7 +165,7 @@ A replayed system call is served by the peer's own FUSE thread. That thread may 
 
 * **Client-server.** Rank 0 serialises all requests (the FUSE loop is single-threaded), so the file system is linearizable from the point of view of applications on node 0. The kernel's attribute and entry caches (1 s timeouts) stay coherent because every mutation flows through the same process.
 * **Peer-to-peer.**
-  * *Namespace replication* is asynchronous and ordered per originating peer, by MPI's non-overtaking rule on a single communicator and tag. A name created on one peer appears on the others shortly afterwards.
+  * *Namespace and metadata replication* is asynchronous and ordered per originating peer, by MPI's non-overtaking rule on a single communicator and tag. Names, symbolic links, permissions, ownership, timestamps and extended attributes changed on one peer appear on the others shortly afterwards.
   * *Data* follows **close-to-open** semantics. A writer's `close` (or `fsync`) returns only after every peer has stored its slice and updated its view of the file, so any `open` that starts afterwards on any peer where the name is visible observes the new content.
   * The kernel does not cache names or attributes (timeouts 0), because the listener changes them asynchronously. Concurrent mutations of the same object from different peers are not arbitrated: the last write-back wins.
 
@@ -174,8 +174,8 @@ A replayed system call is served by the peer's own FUSE thread. That thread may 
 DAGonFS keeps no replica, log or checkpoint. A rank failure loses the blocks that rank stores, and in the client-server model the loss of rank 0 also loses the namespace. MPI's default error handler aborts the job. The following limitations are inherent to the current design and are documented rather than hidden:
 
 1. **Whole-file front-end buffering.** A file opened on a front end must fit in that process's memory. The distributed copy multiplies total capacity, but not the size of a single open file.
-2. **Metadata not replicated in peer-to-peer mode.** `chmod`, `chown`, `utimens`, extended attributes and symbolic links are local to the peer that performed them.
-3. **No byte-range locks.** `getlk` reports `F_UNLCK`; `setlk`/`flock` are not registered.
+2. **No byte-range locks.** `getlk` reports `F_UNLCK`; `setlk`/`flock` are not registered.
+3. **No arbitration of concurrent writers.** Two peers that write the same file at the same time are not serialised: the last write-back wins (§6).
 4. **Homogeneous ranks.** Messages are raw structures, so all ranks must run the same binary on the same architecture.
 
 ## 8. Source map

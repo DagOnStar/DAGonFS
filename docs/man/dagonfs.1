@@ -1,0 +1,175 @@
+.TH DAGONFS 1 "15 November 2026" "DAGonFS" "User Commands"
+.SH NAME
+dagonfs, DAGonFS_Launcher \- MPI-distributed, in-memory FUSE file system for workflow scratch data
+.SH SYNOPSIS
+.B mpirun \-np
+.I P
+[\fImpirun-options\fR]
+.B dagonfs
+[\fB\-m\fR|\fB\-\-model\fR \fIclient-server\fR|\fIpeer-to-peer\fR]
+[\fB\-c\fR|\fB\-\-config\fR \fIfile\fR]
+[\fB\-f\fR|\fB\-d\fR]
+[\fB\-\-log\fR]
+[\fIroot\fR]
+.br
+.B DAGonFS_Launcher
+[\fIDAGonFS.ini\fR]
+[\fB\-m\fR|\fB\-\-model\fR \fImodel\fR]
+[\fB\-n\fR|\fB\-\-dry-run\fR]
+.SH DESCRIPTION
+.B dagonfs
+turns a directory into a POSIX namespace whose file contents are spread over the
+memory of the processes of an MPI job. It is designed for the scratch data of
+scientific workflows, such as those run by DAGonStar. It does not provide durable
+storage: unmounting the file system or ending the job discards its contents.
+.PP
+.B dagonfs
+runs on every rank of the job. The deployment model is chosen for each volume when it is created:
+.TP
+.B client-server
+(default) Rank 0 mounts
+.I root
+and serves every request. Ranks 1 to P\-1 store blocks.
+.TP
+.B peer-to-peer
+Rank
+.I r
+mounts
+.IR root / r .
+Every peer serves its own mount and replicates namespace and metadata changes to
+the other peers. Data written and closed on one peer can be read on any other.
+.PP
+A file's content is held by the front end while the file is open. It is
+distributed to all ranks in blocks of 128 KiB on
+.BR fsync ,
+on a flush of a dirty file, and on the last close (close-to-open consistency).
+.SH OPTIONS
+.TP
+.BR \-m ", " \-\-model " " \fImodel\fR
+.B client-server
+(alias
+.BR cs )
+or
+.B peer-to-peer
+(alias
+.BR p2p ).
+.TP
+.BR \-c ", " \-\-config " " \fIfile\fR
+Read
+.BR dagonfs_model ,
+.BR dagonfs_root_dir ,
+.B fuse_mode
+and
+.B enable_logging
+from the
+.B [DAGonFS_config]
+section of an ini file.
+.TP
+.B \-f
+Run FUSE in the foreground (default; required under MPI).
+.TP
+.B \-d
+Foreground, with a trace of every FUSE request.
+.TP
+.B \-\-log
+Verbose logging. The legacy form is a trailing
+.B 1
+(and
+.B 0
+to disable it).
+.TP
+.I root
+Mount point (client-server) or parent of the per-rank mount points (peer-to-peer).
+It may be omitted when the configuration file sets
+.BR dagonfs_root_dir .
+Missing directories are created.
+.PP
+Precedence, from lowest to highest: built-in defaults, the program name, the
+configuration file, explicit options. The names
+.B DAGonFS_CS.exe
+and
+.B DAGonFS_P2P.exe
+are symbolic links to
+.B dagonfs
+that select the client-server and peer-to-peer model by default, so legacy
+invocations keep working.
+.SH LAUNCHER
+.B DAGonFS_Launcher
+reads a configuration file (default
+.BR ./DAGonFS.ini )
+and runs
+.B mpirun
+through
+.BR execvp (3),
+without a shell. Keys of the
+.B [DAGonFS_config]
+section:
+.BR num_processes " (required), " machinefile ", " mpirun ", " executable ,
+.BR dagonfs_model ", " dagonfs_root_dir " (required), " fuse_mode ", " enable_logging .
+.B \-\-model
+overrides
+.BR dagonfs_model ;
+.B \-\-dry-run
+prints the command instead of running it.
+.SH STOPPING A VOLUME
+Unmount the front end, for example
+.BR "fusermount3 \-u" " " \fIroot\fR,
+or any one peer's mount point in peer-to-peer mode. The other ranks then shut down
+by themselves. Killing the MPI job instead leaves stale mount points, which must be
+removed with
+.BR "fusermount3 \-u" .
+.SH POSIX OPERATIONS
+Supported: creation, lookup and removal of files and directories,
+.BR rename (2)
+(including
+.BR RENAME_NOREPLACE ),
+hard and symbolic links, reads and writes at any offset, truncation,
+.BR chmod ,
+.BR chown ,
+.BR utimensat ,
+extended attributes,
+.BR statfs ,
+and
+.BR fsync .
+.B getlk
+always reports an unlocked range. Byte-range locks,
+.BR fallocate ,
+.BR ioctl ,
+.BR poll ,
+.B copy_file_range
+and
+.B lseek
+data/hole queries are not provided; they fail with
+.BR ENOSYS .
+Devices, FIFOs and sockets cannot be created
+.RB ( EPERM ).
+.SH ENVIRONMENT AND REQUIREMENTS
+Every node needs
+.BR /dev/fuse ,
+a set-uid
+.B fusermount3
+and libfuse 3. A peer-to-peer volume requires an MPI library providing
+.BR MPI_THREAD_MULTIPLE .
+All ranks must run the same binary on the same architecture.
+.SH EXIT STATUS
+0 when the volume was unmounted normally; non-zero when it could not be mounted.
+Startup errors are reported on standard error with the rank number.
+.SH EXAMPLES
+.nf
+mpirun \-np 4 dagonfs \-\-model client\-server \-f /tmp/dagonfs
+mpirun \-np 4 dagonfs \-\-model peer\-to\-peer \-f /tmp/dagonfs   # /tmp/dagonfs/0 ... /3
+mpirun \-np 4 dagonfs \-\-config DAGonFS.ini
+DAGonFS_Launcher \-\-model peer\-to\-peer \-\-dry\-run
+fusermount3 \-u /tmp/dagonfs
+.fi
+.SH SEE ALSO
+.BR fusermount3 (1),
+.BR mpirun (1).
+The project documentation (architecture, protocol, configuration, performance,
+DAGonStar integration) is installed under
+.BR share/doc/DAGonFS
+and maintained in the
+.B docs
+directory of the source tree.
+.SH AUTHORS
+DAGonFS contributors, University of Naples "Parthenope".

@@ -9,9 +9,12 @@ The documents are written to be read in order by a newcomer, and individually as
 | [PROTOCOL.md](PROTOCOL.md) | MPI message formats and ordering guarantees of both control planes |
 | [POSIX-COMPATIBILITY.md](POSIX-COMPATIBILITY.md) | Supported operations, error semantics, close-to-open consistency |
 | [CONFIGURATION.md](CONFIGURATION.md) | Prerequisites, build, command line, launcher, shutdown, cluster use |
-| [PERFORMANCE.md](PERFORMANCE.md) | Measurement methodology and tuning |
+| [PERFORMANCE.md](PERFORMANCE.md) | Methodology, tuning, and the DAGonFS vs. NFS benchmark with DAGonStar workflows |
 | [DAGONSTAR-INTEGRATION.md](DAGONSTAR-INTEGRATION.md) | Using DAGonFS as the scratch space of DAGonStar workflows |
 | [TESTING.md](TESTING.md) | Validation levels, test harness, recorded results |
-| [DEFECT-ANALYSIS.md](DEFECT-ANALYSIS.md) | November 2026 assessment: defects D1–D39, root causes and remedies |
+| [DEFECT-ANALYSIS.md](DEFECT-ANALYSIS.md) | November 2026 assessment: defects D1–D42, root causes and remedies |
+| [man/dagonfs.1](man/dagonfs.1) | Manual page of `dagonfs` and `DAGonFS_Launcher` (`man docs/man/dagonfs.1`) |
 
-Contributor rules are in [../AGENTS.md](../AGENTS.md); the manual page is in [../doc/english](../doc/english).
+Contributor rules are in [../AGENTS.md](../AGENTS.md). The benchmark scripts are in [../bench](../bench), and the figures in [../figures](../figures).
+
+The manual page is installed to `share/man/man1`. When `groff` is available, the build also formats it as text and PostScript (and as PDF with `ps2pdf`), installed under `share/doc/DAGonFS` together with these documents.

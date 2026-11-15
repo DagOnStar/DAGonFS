@@ -30,15 +30,21 @@ uint32_t boundedLength(const string &path) {
 } // namespace
 
 void RequestSender::send(const PeerRequest &request, const string &first, const string &second,
-                         int sourceRank, int mpiWorldSize, bool includeSelf) {
+                         int sourceRank, int mpiWorldSize, bool includeSelf, const string &value) {
 	PeerRequest header = request;
 	header.firstPathLength = boundedLength(first);
 	header.secondPathLength = boundedLength(second);
+	header.valueLength = static_cast<uint32_t>(min(value.size(), DAGONFS_MAX_REQUEST_VALUE));
 
-	vector<char> message(sizeof(PeerRequest) + header.firstPathLength + header.secondPathLength);
-	memcpy(message.data(), &header, sizeof(PeerRequest));
-	memcpy(message.data() + sizeof(PeerRequest), first.data(), header.firstPathLength);
-	memcpy(message.data() + sizeof(PeerRequest) + header.firstPathLength, second.data(), header.secondPathLength);
+	vector<char> message(sizeof(PeerRequest) + header.firstPathLength + header.secondPathLength + header.valueLength);
+	char *cursor = message.data();
+	memcpy(cursor, &header, sizeof(PeerRequest));
+	cursor += sizeof(PeerRequest);
+	memcpy(cursor, first.data(), header.firstPathLength);
+	cursor += header.firstPathLength;
+	memcpy(cursor, second.data(), header.secondPathLength);
+	cursor += header.secondPathLength;
+	memcpy(cursor, value.data(), header.valueLength);
 
 	for (int i = 0; i < mpiWorldSize; i++) {
 		if (i != sourceRank || includeSelf) {
@@ -71,6 +77,27 @@ void RequestSender::sendRenameRequest(string oldName, string newName, int source
 
 void RequestSender::sendLinkRequest(string targetName, string newName, int sourceRank, int mpiWorldSize) {
 	send(makeRequest(LINK), targetName, newName, sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendSymlinkRequest(string target, string newName, int sourceRank, int mpiWorldSize) {
+	send(makeRequest(SYMLINK), target, newName, sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendSetAttrRequest(string name, const MetadataPacket &meta, int sourceRank, int mpiWorldSize) {
+	PeerRequest request = makeRequest(SET_ATTR);
+	request.meta = meta;
+	send(request, name, string(), sourceRank, mpiWorldSize);
+}
+
+void RequestSender::sendSetXAttrRequest(string name, string attribute, string value, int flags,
+                                        int sourceRank, int mpiWorldSize) {
+	PeerRequest request = makeRequest(SET_XATTR);
+	request.meta.xattrFlags = flags;
+	send(request, name, attribute, sourceRank, mpiWorldSize, false, value);
+}
+
+void RequestSender::sendRemoveXAttrRequest(string name, string attribute, int sourceRank, int mpiWorldSize) {
+	send(makeRequest(REMOVE_XATTR), name, attribute, sourceRank, mpiWorldSize);
 }
 
 void RequestSender::sendDeleteRequest(uint64_t key, int sourceRank, int mpiWorldSize) {

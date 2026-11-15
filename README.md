@@ -51,7 +51,7 @@ flowchart TB
 
 * **One implementation, one binary.** A single source tree (`src/`) builds `dagonfs`. The model is a run-time property of the volume (`dagonfs::VolumeOptions`), and the code contains no compile-time model switches.
 * **Client-server.** Rank 0 mounts the file system and is the only originator. Ranks 1…P−1 run only the listener and store blocks.
-* **Peer-to-peer.** Every peer runs three threads: the FUSE thread serving its mount, the **listener** serving other peers' requests and data transfers, and the **replayer** applying their namespace operations through the local mount. All peers therefore present the same tree. Files are identified across the cluster by a global id assigned at creation.
+* **Peer-to-peer.** Every peer runs three threads: the FUSE thread serving its mount, the **listener** serving other peers' requests and data transfers, and the **replayer** applying their namespace and metadata operations (names, symbolic links, permissions, ownership, times, extended attributes) through the local mount. All peers therefore present the same tree. Files are identified across the cluster by a global id assigned at creation.
 * **Point-to-point data plane.** Transfers use non-blocking point-to-point messages and no collectives, so several peers can originate transfers concurrently. A write is acknowledged by every rank before `close` returns.
 
 Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -178,14 +178,28 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for every option and for clus
 | --- | --- |
 | Source contract (architectural invariants, no FUSE needed) | `python3 tests/test_source_contract.py` |
 | Build and smoke | `ctest --test-dir build` |
-| Mounted POSIX suite (15 scenarios) + replication checks | `python3 tests/mount.py --model peer-to-peer --ranks 4 -- --oversubscribe` |
+| Mounted POSIX suite (16 scenarios) + replication checks | `python3 tests/mount.py --model peer-to-peer --ranks 4 -- --oversubscribe` |
 | Multi-node | `sbatch -N 2 --ntasks-per-node=2 tests/slurm/multinode.sbatch build` |
 
-The November 2026 assessment found and fixed 39 defects, including cross-address-space `free()`, double FUSE replies, peer inode desynchronisation and concurrent collectives. Before the fixes the client-server model crashed during the suite, and a peer-to-peer operation across nodes took about 400 ms. Afterwards both models pass on one node and across two Slurm nodes, including concurrent writers on two peers, and cross-node operations take 0.03–0.43 ms. See [docs/DEFECT-ANALYSIS.md](docs/DEFECT-ANALYSIS.md) and [docs/TESTING.md](docs/TESTING.md).
+The November 2026 assessment found and fixed 42 defects. They include cross-address-space `free()`, double FUSE replies, peer inode desynchronisation, concurrent collectives, unreplicated metadata, and inode numbers that were all 0. Before the fixes the client-server model crashed during the suite, and a peer-to-peer operation across nodes took about 400 ms. Afterwards both models pass on one node and across two Slurm nodes, including concurrent writers on two peers, and cross-node operations take 0.03–0.43 ms. See [docs/DEFECT-ANALYSIS.md](docs/DEFECT-ANALYSIS.md) and [docs/TESTING.md](docs/TESTING.md).
 
 ## Performance
 
-In file-copy experiments, DAGonFS cut execution time by up to 47% compared with NFS. A DAGonStar dataflow using DAGonFS ran 37% faster than on NFS.
+We compared DAGonFS with the cluster's NFS home directory as the scratch space of **real DAGonStar workflows** (Slurm job 19406, one node, 4 ranks, November 2026). DAGonFS ran a large-file dataflow (8 × 128 MiB) **2.4× faster** than NFS, and a small-file dataflow (2000 files of 8 KiB staged by 8 tasks) **9.1× faster**.
+
+![DAGonStar workflows on NFS, tmpfs and DAGonFS](figures/bench-workflow.png)
+
+| Workload (median) | NFS | DAGonFS client-server | DAGonFS peer-to-peer | tmpfs (node-local bound) |
+| --- | ---: | ---: | ---: | ---: |
+| File creation (ops/s) | 331 | 18,797 | 15,522 | 402,111 |
+| 4 KiB files written (files/s) | 194 | 4,562 | 4,393 | 187,894 |
+| 512 MiB write / read (MiB/s) | 496 / 287 | 963 / 1,656 | 928 / 1,671 | 4,077 / 5,774 |
+| DAGonStar, 8 × 128 MiB (s) | 59.7 | 25.1 | 26.5 | 14.3 |
+| DAGonStar, 2000 × 8 KiB (s) | 208.6 | 22.9 | 23.5 | 14.4 |
+
+Unlike tmpfs, DAGonFS presents one namespace to tasks on different nodes, and its capacity is the memory of the whole allocation. Charts for every micro-benchmark, a discussion and memory-sizing advice are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md) §4. The benchmark itself is in [bench/](bench).
+
+Earlier experiments, reported in the WiDE '24 paper, measured file copies up to 47% faster than on NFS, and a DAGonStar dataflow 37% faster:
 
 | File copy vs. number of processes | File copy vs. block size |
 | --- | --- |
@@ -195,7 +209,6 @@ In file-copy experiments, DAGonFS cut execution time by up to 47% compared with 
 | --- | --- |
 | ![DAGonStar execution as the number of process varies](figures/DAGonFS_with_DAGonStar-processes.png) | ![DAGonStar execution as the data block size](figures/DAGonFS_with_DAGonStar-blocksize.png) |
 
-Methodology and tuning: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## Documentation
 
@@ -206,10 +219,11 @@ Methodology and tuning: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 | [Protocol](docs/PROTOCOL.md) | MPI message formats and ordering |
 | [POSIX compatibility](docs/POSIX-COMPATIBILITY.md) | Supported operations and semantics |
 | [Configuration](docs/CONFIGURATION.md) | Build, creating volumes (CLI, ini, C++ and Python APIs), launcher, shutdown |
-| [Performance](docs/PERFORMANCE.md) | Methodology and tuning |
+| [Performance](docs/PERFORMANCE.md) | Methodology, tuning, DAGonFS vs. NFS benchmark with DAGonStar |
 | [DAGonStar integration](docs/DAGONSTAR-INTEGRATION.md) | Using DAGonFS as workflow scratch |
 | [Testing](docs/TESTING.md) | Harness and recorded results |
 | [Defect analysis](docs/DEFECT-ANALYSIS.md) | Assessment, defects and remedies |
+| [Manual page](docs/man/dagonfs.1) | `dagonfs(1)` and `DAGonFS_Launcher`; read it with `man docs/man/dagonfs.1` |
 | [Contributor guide](AGENTS.md) | Rules for changing the code |
 
 ## References

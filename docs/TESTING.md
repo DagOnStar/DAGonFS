@@ -40,6 +40,7 @@ Each scenario in `tests/test_python_posix.py` is named after the behaviour it pr
 | `test_directory_rename_updates_link_counts` | D14 |
 | `test_posix_errors_for_directory_operations` | D15, D16 |
 | `test_large_directory_listing_and_recursive_removal` | D7 (600 entries, multi-buffer `readdir`, `rm -rf`) |
+| `test_inode_numbers_identify_files` | D41 (distinct `st_ino`, hard links share it, `cat f f > g`) |
 | `test_exclusive_create_and_xattrs` | D11, `O_EXCL`, xattr lifecycle |
 
 The suite can also be pointed at any existing mount: `DAGONFS_MOUNTPOINT=/path python3 tests/test_python_posix.py`.
@@ -51,6 +52,7 @@ The suite can also be pointed at any existing mount: `DAGONFS_MOUNTPOINT=/path p
 | Write on rank 0, read on peer *p*; rewrite on *p*, read on rank 0 | D20, D21, D34 |
 | Directory rename and removal replicate | D14, D23, D25 |
 | Two peers create and write 12 files each **simultaneously**, then read each other's files | D34–D39 (concurrent originators) |
+| `chmod`, `utime` (nanosecond times), `setxattr`/`removexattr` and `symlink` on rank 0 are observed on peer *p*; removal of the link replicates | D40 |
 
 ## 3. Multi-node validation with Slurm
 
@@ -63,6 +65,11 @@ sbatch -p <partition> -N 2 --ntasks-per-node=2 tests/slurm/multinode.sbatch buil
 Every allocated node needs `/dev/fuse`, a set-uid `fusermount3` and the libfuse3 runtime. On clusters where only some node classes provide FUSE, select them with `-w`/`--constraint`.
 
 ## 4. Recorded results
+
+### 4.0 Metadata replication and D41 (15 November 2026)
+
+After D40–D42 were fixed, the sixteen-scenario suite was run on the login node with both models at 1, 2, 3 and 4 ranks. All scenarios passed, the peer-to-peer replication checks (including metadata replication) passed, and every job shut down cleanly. The performance study of [PERFORMANCE.md](PERFORMANCE.md) §4 then ran six real DAGonStar workflows on each volume, and every task's output was checked.
+
 
 Validation of the unified code base on 15 November 2026: a single `dagonfs` executable, with the model selected by `--model`.
 

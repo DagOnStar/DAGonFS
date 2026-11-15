@@ -63,7 +63,45 @@ def peer_to_peer_checks(root, peer):
     if not wait_for(lambda: not (last / "p2p-renamed").exists(), 10):
         raise AssertionError("directory removal did not replicate")
     concurrent_originators(first, last)
+    metadata_replication(first, last)
     print("peer-to-peer replication checks: OK")
+
+
+def metadata_replication(first, last):
+    """chmod, utime, extended attributes and symbolic links made on one peer reach the other."""
+    (first / "meta").write_bytes(b"metadata")
+    if not wait_for(lambda: (last / "meta").exists(), 10):
+        raise AssertionError("file created on rank 0 is not visible on the last peer")
+    os.chmod(first / "meta", 0o640)
+    os.utime(first / "meta", ns=(1_000_000_000_123_456_789, 1_234_567_890_987_654_321))
+    os.symlink("meta", first / "meta-link")
+    checks = [
+        ("mode", lambda: (os.stat(last / "meta").st_mode & 0o7777) == 0o640),
+        ("mtime", lambda: os.stat(last / "meta").st_mtime_ns == 1_234_567_890_987_654_321),
+        ("atime", lambda: os.stat(last / "meta").st_atime_ns == 1_000_000_000_123_456_789),
+        ("symlink", lambda: os.path.islink(last / "meta-link") and os.readlink(last / "meta-link") == "meta"),
+    ]
+    if hasattr(os, "setxattr"):
+        os.setxattr(first / "meta", "user.dagonfs", b"x" * 1000)
+        checks.append(("xattr", lambda: os.getxattr(last / "meta", "user.dagonfs") == b"x" * 1000))
+    for name, check in checks:
+        if not wait_for(lambda: _quietly(check), 10):
+            raise AssertionError(f"{name} change did not replicate")
+    if hasattr(os, "removexattr"):
+        os.removexattr(first / "meta", "user.dagonfs")
+        if not wait_for(lambda: "user.dagonfs" not in os.listxattr(last / "meta"), 10):
+            raise AssertionError("xattr removal did not replicate")
+    (first / "meta-link").unlink()
+    (first / "meta").unlink()
+    if not wait_for(lambda: not os.path.lexists(last / "meta-link") and not (last / "meta").exists(), 10):
+        raise AssertionError("removal of the symbolic link did not replicate")
+
+
+def _quietly(check):
+    try:
+        return check()
+    except OSError:
+        return False
 
 
 def concurrent_originators(first, last, files=12):

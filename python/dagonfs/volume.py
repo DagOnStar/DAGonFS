@@ -69,7 +69,9 @@ class Volume:
         self.root = Path(root)
         self.model = model
         self.ranks = ranks
-        self.executable = str(executable or os.environ.get("DAGONFS") or shutil.which("dagonfs") or "dagonfs")
+        executable = str(executable or os.environ.get("DAGONFS") or shutil.which("dagonfs") or "dagonfs")
+        # The job runs from the root's parent directory: resolve relative paths now.
+        self.executable = os.path.abspath(executable) if os.sep in executable else executable
         self.mpirun = mpirun or os.environ.get("MPIRUN", "mpirun")
         self.mpirun_args = list(mpirun_args)
         self.local_ranks = [r for r in local_ranks if self.mounts(r)]

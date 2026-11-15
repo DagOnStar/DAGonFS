@@ -8,7 +8,7 @@ The assessment combined three techniques.
 
 1. **Static review** of every FUSE handler against the libfuse low-level contract (exactly one reply per request; `fuse_reply_none` only for `forget`) and of every MPI exchange against the MPI standard's matching and ownership rules.
 2. **Differential review** of the two source trees, which had been maintained by hand as near-copies and had drifted.
-3. **Dynamic testing** on a production HPC system (Rocky Linux 8.10, GCC 12.2, Open MPI 4.1.4, libfuse 3.3.0): a regression suite of fifteen POSIX scenarios, written *before* the fixes so that each scenario reproduces a suspected defect, executed against both models with 1, 2 and 4 ranks on one node and with 4 ranks across two nodes under Slurm. It was complemented by a per-operation latency micro-benchmark, a concurrent two-peer workload, and repeated stress runs to expose timing-dependent failures.
+3. **Dynamic testing** on a production HPC system (Rocky Linux 8.10, GCC 12.2, Open MPI 4.1.4, libfuse 3.3.0): a regression suite of POSIX scenarios (fifteen at the start of the assessment, sixteen after D41), written *before* the fixes so that each scenario reproduces a suspected defect, executed against both models with 1, 2 and 4 ranks on one node and with 4 ranks across two nodes under Slurm. It was complemented by a per-operation latency micro-benchmark, a concurrent two-peer workload, and repeated stress runs to expose timing-dependent failures.
 
 Against the unmodified code, the client-server file system terminated with a segmentation fault (exit status 139) during the suite; once the daemon had died, every remaining scenario failed with a disconnected mount (3 failures, 12 errors out of 15). After remediation, all fifteen scenarios pass on both models in every configuration, as do the cross-peer replication and concurrency checks, including 20 consecutive stress runs.
 
@@ -80,7 +80,17 @@ The remaining defects of this section were latent behind D33: the 400 ms seriali
 
 **D39 — Reads bounded by a size that another thread changes.** A descriptor that was already open kept its buffer while a remote write enlarged the file, and `read` was bounded only by `st_size`. *Remedy:* reads are bounded by the buffer capacity as well, and an open file's buffer grows when the reported size does.
 
-## 6. Lifecycle, launcher and build defects
+**D40 — Metadata not replicated.** Earlier versions of this document listed this defect as a design limitation. `chmod`, `chown`, `utimensat`, extended attributes and symbolic links changed only the peer on which they were made. A workflow that marked a script executable on one node, or that relied on modification times or xattrs, therefore saw different files on different nodes. *Remedy:* four new requests: `SYMLINK`, `SET_ATTR`, `SET_XATTR` and `REMOVE_XATTR`. They are replayed by the replayer like the namespace requests (`symlink`, `chmod`/`lchown`/`utimensat`, `lsetxattr`, `lremovexattr`). `SET_ATTR` carries the attribute values as applied by the originator, and a "now" timestamp is resolved once there, so every peer stores the same time. An attribute value travels in the same message as the request, bounded at 64 KiB (Linux's `XATTR_SIZE_MAX`).
+
+## 6. Defects found by the performance study
+
+The benchmarks of [PERFORMANCE.md](PERFORMANCE.md) §4 run real DAGonStar workflows, whose tasks are ordinary shell tools. They found two more defects that the Python suite had not exercised.
+
+**D41 — Every file reported inode number 0.** The FUSE entry carried the inode number, but the `st_ino` field of the attributes was never set. Every `stat` therefore returned `st_ino = 0`. Tools that identify a file by `(st_dev, st_ino)` take distinct files for the same one: `cat a a > b` failed with "input file is output file", `cp` and `tar` treat files as hard links of each other, and `find` and `rsync` can skip files. *Observed:* every DAGonStar task that concatenated its inputs failed on DAGonFS. *Remedy:* `st_ino` is set when an inode is initialised. A new scenario (`test_inode_numbers_identify_files`) checks distinct and shared inode numbers and the `cat` idiom.
+
+**D42 — Python volume API and relative executables.** `dagonfs.Volume` starts `mpirun` from the parent of the mount root, so a relative `executable` path such as `build/dagonfs` could not be found. *Remedy:* paths containing a directory separator are made absolute when the `Volume` is created.
+
+## 7. Lifecycle, launcher and build defects
 
 **D27 — Workers left blocked.** If the front end failed before mounting, it returned without sending `TERMINATE`, leaving every other rank blocked forever. *Remedy:* `FileSystem::start` always notifies termination.
 
@@ -94,7 +104,7 @@ The remaining defects of this section were latent behind D33: the 400 ms seriali
 
 **D32 — Integer overflow in MPI counts.** Byte counts per rank were `int`, overflowing above 2 GiB per rank. *Remedy:* counts in units of a block-sized MPI datatype.
 
-## 7. Structural remedy
+## 8. Structural remedy
 
 The client-server and peer-to-peer front ends were originally two hand-maintained copies of the code in `src/client-server` and `src/peer-to-peer`, and their divergence caused several of the defects above. They are now **one code base**:
 

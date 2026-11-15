@@ -11,7 +11,8 @@
   - `main.cpp`: a thin wrapper around `runVolume`;
   - `DAGonFS_Launcher.cpp`: the ini-driven launcher.
 - `python/dagonfs/` contains the Python volume API (standard library only).
-- `doc/` contains the installed manual page; `docs/` contains maintained project documentation.
+- `docs/` contains all documentation: the Markdown documents and the manual page (`docs/man/dagonfs.1`, installed by `docs/CMakeLists.txt`). Keep the manual page consistent with `docs/CONFIGURATION.md` and `dagonfs --help`.
+- `bench/` contains the benchmark (`fsbench.py`, `workflow.py`, `run.py`, `plot.py`, `slurm/bench.sbatch`). Its charts go to `figures/bench-*.png`, and its results are recorded in `docs/PERFORMANCE.md`.
 - `tests/` contains the source-contract tests, the mounted suite and the harness. Do not require a mounted filesystem in unit tests.
 
 ### Deployment models
@@ -26,7 +27,7 @@
 - The data plane is point-to-point: post every `MPI_Isend`/`MPI_Irecv` before waiting. Never use collectives, because several peers originate transfers concurrently. A `WRITE` completes only after an ACK from every rank.
 - The listener waits with `waitForRequest` (an `MPI_Iprobe` back-off), never with a blocking `MPI_Probe`.
 - The listener never issues a system call on a mount point. Namespace replays go to the replayer thread's FIFO.
-- Replicated FUSE handlers call `IsReplay(req, ...)` as their first statement. A replay is identified by the replayer's thread id and is never re-broadcast.
+- Every change to the namespace or to metadata (names, links, symbolic links, mode, ownership, times, xattrs) must be replicated in peer-to-peer mode. Replicated FUSE handlers call `IsReplay(req, ...)` as their first statement. A replay is identified by the replayer's thread id and is never re-broadcast.
 - The data plane addresses files by their cluster-wide `m_globalId`, never by local inode numbers. The listener reaches files only through the global-id index, never through the inode table.
 
 ## Engineering rules
@@ -45,7 +46,7 @@ Run the checks appropriate to the change:
 ```bash
 cmake -S . -B build -DUSE_MPI=ON
 cmake --build build
-python3 -m py_compile tests/*.py python/dagonfs/*.py
+python3 -m py_compile tests/*.py python/dagonfs/*.py bench/*.py
 python3 tests/test_source_contract.py
 # Requires a running DAGonFS mount:
 DAGONFS_MOUNTPOINT=/path/to/mount python3 tests/test_python_posix.py

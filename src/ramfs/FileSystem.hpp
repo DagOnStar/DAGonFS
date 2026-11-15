@@ -133,6 +133,8 @@ private:
     static void UpdateDirectoryPaths(Directory *dir, Directory *parent, const std::string &path);
     /** @brief Absolute path (relative to the mount point) of one name of @p ino, or "". */
     static std::string FindPath(fuse_ino_t ino);
+    /** @brief FindPath, plus "/" for the root; the path other peers replay a metadata change on. */
+    static std::string ReplicatedPath(fuse_ino_t ino);
 
 public:
     /** All the supported filesystem operations mapped to object-methods. */
@@ -155,6 +157,10 @@ public:
     static std::atomic<bool> deleteDirFromThread;
     static std::atomic<bool> renameFromThread;
     static std::atomic<bool> linkFromThread;
+    static std::atomic<bool> symlinkFromThread;
+    static std::atomic<bool> setAttrFromThread;
+    static std::atomic<bool> setXAttrFromThread;
+    static std::atomic<bool> removeXAttrFromThread;
     /** Cluster-wide identity carried by a replayed create. */
     static std::atomic<uint64_t> pendingGlobalId;
     /** Local file with the given cluster-wide identity, or nullptr. */

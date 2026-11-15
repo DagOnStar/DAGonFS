@@ -20,6 +20,7 @@
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <mpi.h>
@@ -91,6 +92,7 @@ struct Replay {
 	PeerRequest request;
 	string first;
 	string second;
+	string value;
 	bool stop;
 };
 
@@ -128,6 +130,10 @@ void DistributedCode::replayLoop() {
 		case DELETE_DIR: deleteDir(replay.request, replay.first, replay.second); break;
 		case RENAME: renameHandler(replay.request, replay.first, replay.second); break;
 		case LINK: linkHandler(replay.request, replay.first, replay.second); break;
+		case SYMLINK: symlinkHandler(replay.first, replay.second); break;
+		case SET_ATTR: setAttrHandler(replay.request, replay.first); break;
+		case SET_XATTR: setXAttrHandler(replay.request, replay.first, replay.second, replay.value); break;
+		case REMOVE_XATTR: removeXAttrHandler(replay.first, replay.second); break;
 		default: break;
 		}
 	}
@@ -162,13 +168,16 @@ void DistributedCode::start() {
 		memcpy(&request, message.data(), sizeof(PeerRequest));
 		const size_t firstLength = request.firstPathLength;
 		const size_t secondLength = request.secondPathLength;
+		const size_t valueLength = request.valueLength;
 		if (firstLength >= DAGONFS_MAX_REQUEST_PATH || secondLength >= DAGONFS_MAX_REQUEST_PATH ||
-		    sizeof(PeerRequest) + firstLength + secondLength != static_cast<size_t>(count)) {
+		    valueLength > DAGONFS_MAX_REQUEST_VALUE ||
+		    sizeof(PeerRequest) + firstLength + secondLength + valueLength != static_cast<size_t>(count)) {
 			cerr << "Process " << mpiRank << " - ignoring malformed request from " << source << endl;
 			continue;
 		}
 		const string first(message.data() + sizeof(PeerRequest), firstLength);
 		const string second(message.data() + sizeof(PeerRequest) + firstLength, secondLength);
+		const string value(message.data() + sizeof(PeerRequest) + firstLength + secondLength, valueLength);
 
 		if (source == mpiRank) {
 			// Only termination is ever addressed to the sending peer itself.
@@ -190,8 +199,12 @@ void DistributedCode::start() {
 		case DELETE_DIR:
 		case RENAME:
 		case LINK:
+		case SYMLINK:
+		case SET_ATTR:
+		case SET_XATTR:
+		case REMOVE_XATTR:
 			if (replayer.joinable()) {
-				enqueue(Replay{request, first, second, false});
+				enqueue(Replay{request, first, second, value, false});
 			}
 			break;
 		case DELETE:
@@ -207,7 +220,7 @@ void DistributedCode::start() {
 	if (replayer.joinable()) {
 		// Finish the replays already received, then end this peer's FUSE loop
 		// (unless it has ended already: this peer originated the termination).
-		enqueue(Replay{PeerRequest{}, string(), string(), true});
+		enqueue(Replay{PeerRequest{}, string(), string(), string(), true});
 		replayer.join();
 		if (!FileSystem::IsLocallyUnmounted()) {
 			unmountFileSystem();
@@ -335,5 +348,70 @@ void DistributedCode::linkHandler(const PeerRequest &, const string &first, cons
 	FileSystem::linkFromThread = true;
 	if (link(localPath(first).c_str(), localPath(second).c_str()) != 0) {
 		FileSystem::linkFromThread = false;
+	}
+}
+
+void DistributedCode::symlinkHandler(const string &target, const string &newName) {
+	FileSystem::symlinkFromThread = true;
+	if (symlink(target.c_str(), localPath(newName).c_str()) != 0) {
+		FileSystem::symlinkFromThread = false;
+	}
+}
+
+void DistributedCode::setAttrHandler(const PeerRequest &request, const string &name) {
+	// Each system call below is one FUSE setattr request, recognised as a replay.
+	const MetadataPacket &meta = request.meta;
+	const string path = localPath(name);
+	if (meta.mask & DAGONFS_ATTR_MODE) {
+		FileSystem::setAttrFromThread = true;
+		if (chmod(path.c_str(), static_cast<mode_t>(meta.mode & 07777)) != 0) {
+			FileSystem::setAttrFromThread = false;
+		}
+	}
+	if (meta.mask & (DAGONFS_ATTR_UID | DAGONFS_ATTR_GID)) {
+		const uid_t uid = (meta.mask & DAGONFS_ATTR_UID) ? static_cast<uid_t>(meta.uid) : static_cast<uid_t>(-1);
+		const gid_t gid = (meta.mask & DAGONFS_ATTR_GID) ? static_cast<gid_t>(meta.gid) : static_cast<gid_t>(-1);
+		FileSystem::setAttrFromThread = true;
+		if (lchown(path.c_str(), uid, gid) != 0) {
+			FileSystem::setAttrFromThread = false;
+		}
+	}
+	if (meta.mask & (DAGONFS_ATTR_ATIME | DAGONFS_ATTR_MTIME)) {
+		struct timespec times[2];
+		times[0].tv_sec = static_cast<time_t>(meta.atimeSeconds);
+		times[0].tv_nsec = (meta.mask & DAGONFS_ATTR_ATIME) ? static_cast<long>(meta.atimeNanoseconds) : UTIME_OMIT;
+		times[1].tv_sec = static_cast<time_t>(meta.mtimeSeconds);
+		times[1].tv_nsec = (meta.mask & DAGONFS_ATTR_MTIME) ? static_cast<long>(meta.mtimeNanoseconds) : UTIME_OMIT;
+		FileSystem::setAttrFromThread = true;
+		if (utimensat(AT_FDCWD, path.c_str(), times, AT_SYMLINK_NOFOLLOW) != 0) {
+			FileSystem::setAttrFromThread = false;
+		}
+	}
+}
+
+void DistributedCode::setXAttrHandler(const PeerRequest &request, const string &name, const string &attribute,
+                                      const string &value) {
+	FileSystem::setXAttrFromThread = true;
+#ifdef __APPLE__
+	const int result = setxattr(localPath(name).c_str(), attribute.c_str(), value.data(), value.size(), 0,
+	                            request.meta.xattrFlags | XATTR_NOFOLLOW);
+#else
+	const int result = lsetxattr(localPath(name).c_str(), attribute.c_str(), value.data(), value.size(),
+	                             request.meta.xattrFlags);
+#endif
+	if (result != 0) {
+		FileSystem::setXAttrFromThread = false;
+	}
+}
+
+void DistributedCode::removeXAttrHandler(const string &name, const string &attribute) {
+	FileSystem::removeXAttrFromThread = true;
+#ifdef __APPLE__
+	const int result = removexattr(localPath(name).c_str(), attribute.c_str(), XATTR_NOFOLLOW);
+#else
+	const int result = lremovexattr(localPath(name).c_str(), attribute.c_str());
+#endif
+	if (result != 0) {
+		FileSystem::removeXAttrFromThread = false;
 	}
 }

@@ -125,7 +125,7 @@ class FuseSourceContractTests(unittest.TestCase):
         self.assertIn("DAGONFS_MAX_REQUEST_PATH - 1", sender)
         listener = source("mpi/DistributedCode.cpp")
         self.assertIn("firstLength >= DAGONFS_MAX_REQUEST_PATH", listener)
-        self.assertIn("sizeof(PeerRequest) + firstLength + secondLength != static_cast<size_t>(count)", listener)
+        self.assertIn("sizeof(PeerRequest) + firstLength + secondLength + valueLength != static_cast<size_t>(count)", listener)
 
     def test_listener_receives_each_request_as_one_probed_message(self):
         text = source("mpi/DistributedCode.cpp")
@@ -139,14 +139,26 @@ class FuseSourceContractTests(unittest.TestCase):
 
     def test_replays_are_identified_per_request_and_never_block_the_listener(self):
         text = source("ramfs/FileSystem.cpp")
-        self.assertEqual(text.count("const bool replay = IsReplay(req, "), 6)
+        self.assertEqual(text.count("const bool replay = IsReplay(req, "), 10)
         self.assertIn("fuse_req_ctx(req)->pid", text)
         listener = source("mpi/DistributedCode.cpp")
         start = listener.index("void DistributedCode::start()")
         body = listener[start:listener.index("\n}\n", start)]
-        for call in ("createFile(", "deleteFile(", "createDir(", "deleteDir(", "renameHandler(", "linkHandler("):
+        for call in ("createFile(", "deleteFile(", "createDir(", "deleteDir(", "renameHandler(", "linkHandler(",
+                     "symlinkHandler(", "setAttrHandler(", "setXAttrHandler(", "removeXAttrHandler("):
             with self.subTest(call=call):
                 self.assertNotIn(call, body, "the listener must queue replays, not perform them")
+
+    def test_peer_to_peer_replicates_metadata(self):
+        # Symbolic links, setattr and extended attributes are replayed on every
+        # peer, with bounded values and absolute (originator-resolved) times.
+        text = source("ramfs/FileSystem.cpp")
+        for call in ("sendSymlinkRequest(", "sendSetAttrRequest(", "sendSetXAttrRequest(", "sendRemoveXAttrRequest("):
+            with self.subTest(call=call):
+                self.assertIn(call, text)
+        listener = source("mpi/DistributedCode.cpp")
+        self.assertIn("valueLength > DAGONFS_MAX_REQUEST_VALUE", listener)
+        self.assertIn("DAGONFS_MAX_REQUEST_VALUE = 65536", source("mpi/mpi_data.hpp"))
 
     def test_data_plane_uses_no_collectives_on_the_shared_communicator(self):
         # Peers originate transfers concurrently; concurrent collectives on one

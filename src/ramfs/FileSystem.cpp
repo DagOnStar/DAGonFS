@@ -64,6 +64,10 @@ std::atomic<bool> FileSystem::createDirFromThread{false};
 std::atomic<bool> FileSystem::deleteDirFromThread{false};
 std::atomic<bool> FileSystem::renameFromThread{false};
 std::atomic<bool> FileSystem::linkFromThread{false};
+std::atomic<bool> FileSystem::symlinkFromThread{false};
+std::atomic<bool> FileSystem::setAttrFromThread{false};
+std::atomic<bool> FileSystem::setXAttrFromThread{false};
+std::atomic<bool> FileSystem::removeXAttrFromThread{false};
 std::atomic<uint64_t> FileSystem::pendingGlobalId{0};
 std::mutex FileSystem::globalIndexMutex;
 std::map<uint64_t, File *> FileSystem::globalIndex;
@@ -682,6 +686,7 @@ void FileSystem::FuseForgetMulti(fuse_req_t req, size_t count, struct fuse_forge
 
 void FileSystem::FuseSetAttr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set, struct fuse_file_info* fi) {
     (void) fi;
+    const bool replay = IsReplay(req, setAttrFromThread);
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Setting -> FuseRamFs::FuseSetAttr()");
 
     INode *inode = GetINode(ino);
@@ -760,7 +765,37 @@ void FileSystem::FuseSetAttr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, 
         setTimeNow(current, false, false, true);
     }
 
+    // Peer-to-peer: replicate metadata changes. The size travels with the data
+    // plane; times are sent as applied here, so every peer stores the same value.
+    MetadataPacket meta{};
+    if (peerToPeer && !replay) {
+        if (to_set & FUSE_SET_ATTR_MODE) meta.mask |= DAGONFS_ATTR_MODE;
+        if (to_set & FUSE_SET_ATTR_UID) meta.mask |= DAGONFS_ATTR_UID;
+        if (to_set & FUSE_SET_ATTR_GID) meta.mask |= DAGONFS_ATTR_GID;
+        if (to_set & (FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_ATIME_NOW)) meta.mask |= DAGONFS_ATTR_ATIME;
+        if (to_set & (FUSE_SET_ATTR_MTIME | FUSE_SET_ATTR_MTIME_NOW)) meta.mask |= DAGONFS_ATTR_MTIME;
+        meta.mode = static_cast<uint32_t>(current.st_mode & 07777);
+        meta.uid = static_cast<uint32_t>(current.st_uid);
+        meta.gid = static_cast<uint32_t>(current.st_gid);
+#ifdef __APPLE__
+        meta.atimeSeconds = current.st_atimespec.tv_sec;
+        meta.atimeNanoseconds = current.st_atimespec.tv_nsec;
+        meta.mtimeSeconds = current.st_mtimespec.tv_sec;
+        meta.mtimeNanoseconds = current.st_mtimespec.tv_nsec;
+#else
+        meta.atimeSeconds = current.st_atim.tv_sec;
+        meta.atimeNanoseconds = current.st_atim.tv_nsec;
+        meta.mtimeSeconds = current.st_mtim.tv_sec;
+        meta.mtimeNanoseconds = current.st_mtim.tv_nsec;
+#endif
+    }
     fuse_reply_attr(req, &current, Nodes::cacheTimeout);
+    if (peerToPeer && meta.mask != 0) {
+        const string path = ReplicatedPath(ino);
+        if (!path.empty() && path.size() < kMaxPathLength) {
+            RequestSender::sendSetAttrRequest(path, meta, mpiRank, mpiWorldSize);
+        }
+    }
 }
 
 void FileSystem::FuseReadLink(fuse_req_t req, fuse_ino_t ino) {
@@ -974,6 +1009,7 @@ void FileSystem::FuseRmdir(fuse_req_t req, fuse_ino_t parent, const char *name) 
 }
 
 void FileSystem::FuseSymlink(fuse_req_t req, const char* link, fuse_ino_t parent, const char* name) {
+    const bool replay = IsReplay(req, symlinkFromThread);
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Creating symbolic link -> FuseRamFs::FuseSymlink");
     INode *parent_p = GetINode(parent);
     if (parent_p == nullptr) {
@@ -998,6 +1034,11 @@ void FileSystem::FuseSymlink(fuse_req_t req, const char* link, fuse_ino_t parent
         fuse_reply_err(req, EEXIST);
         return;
     }
+    const string linkName = dir->getDirName() + name;
+    if (peerToPeer && !replay && linkName.size() >= kMaxPathLength) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
 
     const struct fuse_ctx* ctx_p = fuse_req_ctx(req);
 
@@ -1011,6 +1052,13 @@ void FileSystem::FuseSymlink(fuse_req_t req, const char* link, fuse_ino_t parent
 
     symLink->Lookup();
     fuse_reply_entry(req, &(symLink->m_fuseEntryParam));
+    if (peerToPeer && !replay) {
+        RequestSender::sendSymlinkRequest(string(link), linkName, mpiRank, mpiWorldSize);
+    }
+}
+
+string FileSystem::ReplicatedPath(fuse_ino_t ino) {
+    return ino == FUSE_ROOT_ID ? string("/") : FindPath(ino);
 }
 
 string FileSystem::FindPath(fuse_ino_t target) {
@@ -1435,6 +1483,7 @@ void FileSystem::FuseSetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 void FileSystem::FuseSetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value, size_t size, int flags)
 #endif
 {
+    const bool replay = IsReplay(req, setXAttrFromThread);
     INode *inode_p = GetINode(ino);
     if (inode_p == nullptr) {
         fuse_reply_err(req, ENOENT);
@@ -1443,11 +1492,24 @@ void FileSystem::FuseSetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 #ifndef __APPLE__
     const uint32_t position = 0;
 #endif
-    const int ret_val = inode_p->SetXAttr(string(name), value, size, flags, position);
-    if (ret_val == 0) {
-        Touch(inode_p, false);
+    string path;
+    if (peerToPeer && !replay) {
+        if (size > DAGONFS_MAX_REQUEST_VALUE || position != 0) {
+            fuse_reply_err(req, size > DAGONFS_MAX_REQUEST_VALUE ? E2BIG : ENOTSUP);
+            return;
+        }
+        path = ReplicatedPath(ino);
     }
-    fuse_reply_err(req, ret_val);
+    const int ret_val = inode_p->SetXAttr(string(name), value, size, flags, position);
+    if (ret_val != 0) {
+        fuse_reply_err(req, ret_val);
+        return;
+    }
+    Touch(inode_p, false);
+    fuse_reply_err(req, 0);
+    if (peerToPeer && !path.empty() && path.size() < kMaxPathLength) {
+        RequestSender::sendSetXAttrRequest(path, string(name), string(value, size), flags, mpiRank, mpiWorldSize);
+    }
 }
 
 #ifdef __APPLE__
@@ -1528,16 +1590,25 @@ void FileSystem::FuseListXAttr(fuse_req_t req, fuse_ino_t ino, size_t size) {
 }
 
 void FileSystem::FuseRemoveXAttr(fuse_req_t req, fuse_ino_t ino, const char* name) {
+    const bool replay = IsReplay(req, removeXAttrFromThread);
     INode *inode_p = GetINode(ino);
     if (inode_p == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
     const int ret_val = inode_p->RemoveXAttr(string(name));
-    if (ret_val == 0) {
-        Touch(inode_p, false);
+    if (ret_val != 0) {
+        fuse_reply_err(req, ret_val);
+        return;
     }
-    fuse_reply_err(req, ret_val);
+    Touch(inode_p, false);
+    fuse_reply_err(req, 0);
+    if (peerToPeer && !replay) {
+        const string path = ReplicatedPath(ino);
+        if (!path.empty() && path.size() < kMaxPathLength) {
+            RequestSender::sendRemoveXAttrRequest(path, string(name), mpiRank, mpiWorldSize);
+        }
+    }
 }
 
 void FileSystem::FuseAccess(fuse_req_t req, fuse_ino_t ino, int mask) {

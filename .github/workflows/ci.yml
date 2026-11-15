@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Byte-compile test helpers
-        run: python3 -m py_compile tests/mount.py tests/usage.py tests/test_python_posix.py tests/test_source_contract.py python/dagonfs/__init__.py python/dagonfs/volume.py
+        run: python3 -m py_compile tests/mount.py tests/usage.py tests/test_python_posix.py tests/test_source_contract.py python/dagonfs/__init__.py python/dagonfs/volume.py bench/fsbench.py bench/workflow.py bench/run.py bench/plot.py
       - name: Architectural invariants
         run: python3 tests/test_source_contract.py -v
       - name: Whitespace errors introduced by the change

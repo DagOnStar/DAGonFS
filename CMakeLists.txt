@@ -37,7 +37,7 @@ elseif(UNIX) # Linux, BSD etc
 endif()
 
 
-add_subdirectory(doc)
+add_subdirectory(docs)
 
 #install(DIRECTORY sample_data DESTINATION "${SHAREDIR}")
 

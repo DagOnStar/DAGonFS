@@ -72,6 +72,9 @@ void Nodes::InitializeINode(INode *inode, fuse_ino_t ino, mode_t mode, nlink_t n
     inode->inodeNumber = ino;
 
     inode->m_fuseEntryParam.ino = ino;
+    // stat(2) reports attr.st_ino: tools such as cat, cp, tar and find
+    // identify files by (st_dev, st_ino), so it must be the inode number.
+    inode->m_fuseEntryParam.attr.st_ino = ino;
     inode->m_fuseEntryParam.attr_timeout = cacheTimeout;
     inode->m_fuseEntryParam.entry_timeout = cacheTimeout;
     inode->m_fuseEntryParam.attr.st_mode = mode;

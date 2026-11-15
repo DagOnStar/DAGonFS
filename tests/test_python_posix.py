@@ -13,6 +13,7 @@ import errno
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import stat
 import tempfile
 import time
@@ -230,6 +231,25 @@ class PythonPosixIntegrationTests(unittest.TestCase):
         self.assertFalse(directory.exists())
 
     # ----------------------------------------------------------------- xattrs
+    def test_inode_numbers_identify_files(self):
+        # D41: every file reported st_ino 0, so tools that compare (st_dev,
+        # st_ino) - cat, cp, tar, find - took distinct files for the same one.
+        first, second, alias = self.workdir / "first", self.workdir / "second", self.workdir / "alias"
+        first.write_bytes(b"one")
+        second.write_bytes(b"two")
+        os.link(first, alias)
+        self.assertNotEqual(first.stat().st_ino, 0)
+        self.assertNotEqual(first.stat().st_ino, second.stat().st_ino)
+        self.assertNotEqual(self.workdir.stat().st_ino, first.stat().st_ino)
+        self.assertEqual(first.stat().st_ino, alias.stat().st_ino)
+        self.assertTrue(os.path.samefile(first, alias))
+        self.assertFalse(os.path.samefile(first, second))
+        # The shell idiom that exposed the defect.
+        result = subprocess.run(["sh", "-c", "cat first first > doubled"], cwd=str(self.workdir),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.workdir / "doubled").read_bytes(), b"oneone")
+
     def test_exclusive_create_and_xattrs(self):
         path = self.workdir / "exclusive"
         path.touch(exist_ok=False)

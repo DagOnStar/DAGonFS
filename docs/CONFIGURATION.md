@@ -18,7 +18,7 @@ ctest --test-dir build --output-on-failure
 cmake --install build --prefix "$HOME/opt/dagonfs"   # optional
 ```
 
-The build produces one executable for both deployment models, `dagonfs`, plus `DAGonFS_Launcher`. `DAGonFS_CS.exe` and `DAGonFS_P2P.exe` are created as symbolic links to `dagonfs` for backward compatibility; each alias defaults to its model. The volume API is installed as `include/dagonfs/{Options,Volume}.hpp` with the static libraries `libdagonfs_core.a` and `libdagonfs_options.a`. The log4cplus shared library is installed under `lib/` with a relative RPATH, so the installed tree can be relocated or staged to compute nodes as a unit.
+The build produces one executable for both deployment models, `dagonfs`, plus `DAGonFS_Launcher`. `DAGonFS_CS.exe` and `DAGonFS_P2P.exe` are created as symbolic links to `dagonfs` for backward compatibility; each alias defaults to its model. The volume API is installed as `include/dagonfs/{Options,Volume}.hpp` with the static libraries `libdagonfs_core.a` and `libdagonfs_options.a`. The log4cplus shared library is installed under `lib/` with a relative RPATH, so the installed tree can be relocated or staged to compute nodes as a unit. The manual page, `docs/man/dagonfs.1`, is installed as `share/man/man1/dagonfs.1` (with `DAGonFS_Launcher.1` as a link to it), and the Markdown documentation goes to `share/doc/DAGonFS`. Read the page without installing it with `man docs/man/dagonfs.1`.
 
 ## 3. Creating a volume
 

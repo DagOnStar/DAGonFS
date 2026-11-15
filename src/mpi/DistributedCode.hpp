@@ -55,9 +55,9 @@ public:
 	 */
 	static void configure(int rank, int worldSize, const std::string &replayMountPoint);
 	static void start();
-	/** Collective rooted at @p sourceRank: replace the stored copy of @p inode. */
+	/** Transfer originated by @p sourceRank: replace the stored copy of @p inode. */
 	static void DAGonFS_Write(int sourceRank, void *buffer, fuse_ino_t inode, size_t fileSize);
-	/** Collective rooted at @p sourceRank: reassemble @p fileSize bytes of @p inode. */
+	/** Transfer originated by @p sourceRank: reassemble @p fileSize bytes of @p inode. */
 	static void* DAGonFS_Read(int sourceRank, fuse_ino_t inode, size_t fileSize, size_t reqSize, off_t offset);
 	static void createFile(const PeerRequest &request, const std::string &first, const std::string &second);
 	static void deleteFile(const PeerRequest &request, const std::string &first, const std::string &second);
@@ -65,6 +65,11 @@ public:
 	static void deleteDir(const PeerRequest &request, const std::string &first, const std::string &second);
 	static void renameHandler(const PeerRequest &request, const std::string &first, const std::string &second);
 	static void linkHandler(const PeerRequest &request, const std::string &first, const std::string &second);
+	static void symlinkHandler(const std::string &target, const std::string &newName);
+	static void setAttrHandler(const PeerRequest &request, const std::string &name);
+	static void setXAttrHandler(const PeerRequest &request, const std::string &name, const std::string &attribute,
+	                            const std::string &value);
+	static void removeXAttrHandler(const std::string &name, const std::string &attribute);
 	static void unmountFileSystem();
 	double getDAGonFSWriteSGElapsedTime() { return DAGonFSWriteSGElapsedTime; };
 	double getDAGonFSReadSGElapsedTime() { return DAGonFSReadSGElapsedTime; };

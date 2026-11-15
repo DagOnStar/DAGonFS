@@ -6,7 +6,7 @@ Requests are plain C structures transmitted as `MPI_BYTE`. Every rank runs the s
 
 Both deployment models use the same messages. They differ only in who originates them:
 
-* **Client-server:** rank 0 is the only originator. Namespace operations are not replicated, because no other rank mounts the volume.
+* **Client-server:** rank 0 is the only originator. Namespace and metadata operations are not replicated, because no other rank mounts the volume.
 * **Peer-to-peer:** every peer originates the operations performed on its own mount.
 
 ## 1. Tags
@@ -22,29 +22,39 @@ Listeners receive only tags 0 and 1. A front end's FUSE thread receives only tag
 
 ## 2. Request message
 
-Every request is **one** message per destination: a fixed header followed by the bytes of at most two paths, with no terminators.
+Every request is **one** message per destination: a fixed header followed by the bytes of at most two paths and of an optional value, with no terminators.
 
 ```c
-typedef enum { WRITE, READ, CREATE_FILE, DELETE_FILE, CREATE_DIR,
-               DELETE_DIR, RENAME, TERMINATE, LINK, DELETE } RequestType;
+typedef enum { WRITE, READ, CREATE_FILE, DELETE_FILE, CREATE_DIR, DELETE_DIR, RENAME,
+               TERMINATE, LINK, DELETE, SYMLINK, SET_ATTR, SET_XATTR, REMOVE_XATTR } RequestType;
 
-constexpr size_t DAGONFS_MAX_REQUEST_PATH = 4096;   /* incl. the NUL of the C string */
+constexpr size_t DAGONFS_MAX_REQUEST_PATH  = 4096;   /* incl. the NUL of the C string */
+constexpr size_t DAGONFS_MAX_REQUEST_VALUE = 65536;  /* Linux XATTR_SIZE_MAX          */
 
 typedef struct { fuse_ino_t inode; size_t fileSize; size_t reqSize; off_t offset; } IORequestPacket;
 
+typedef struct {                       /* SET_ATTR / SET_XATTR                          */
+    uint32_t mask;                     /* DAGONFS_ATTR_{MODE,UID,GID,ATIME,MTIME}       */
+    uint32_t mode, uid, gid;
+    int64_t  atimeSeconds, atimeNanoseconds, mtimeSeconds, mtimeNanoseconds;
+    int32_t  xattrFlags;               /* XATTR_CREATE / XATTR_REPLACE                  */
+} MetadataPacket;
+
 typedef struct {
     RequestType     type;
-    uint32_t        firstPathLength;   /* target / new object, < DAGONFS_MAX_REQUEST_PATH */
-    uint32_t        secondPathLength;  /* RENAME / LINK destination, otherwise 0          */
-    uint64_t        globalId;          /* CREATE_FILE                                      */
-    IORequestPacket io;                /* WRITE / READ: file id and size; DELETE: file id  */
+    uint32_t        firstPathLength;   /* target / new object, < DAGONFS_MAX_REQUEST_PATH    */
+    uint32_t        secondPathLength;  /* RENAME/LINK/SYMLINK destination or xattr name      */
+    uint32_t        valueLength;       /* SET_XATTR value, <= DAGONFS_MAX_REQUEST_VALUE      */
+    uint64_t        globalId;          /* CREATE_FILE                                        */
+    IORequestPacket io;                /* WRITE / READ: file id and size; DELETE: file id    */
+    MetadataPacket  meta;              /* SET_ATTR / SET_XATTR                               */
 } PeerRequest;
-/* wire image: PeerRequest | first path bytes | second path bytes */
+/* wire image: PeerRequest | first path bytes | second path bytes | value bytes */
 ```
 
 The listener waits with `MPI_Iprobe` and a bounded back-off of at most 0.5 ms, rather than with a blocking `MPI_Probe`. A blocking probe holds the MPI library's progress lock while it waits. Under `MPI_THREAD_MULTIPLE` this starved the FUSE thread's own MPI calls: each replicated operation took about 400 ms across nodes (see [TESTING.md](TESTING.md) §4.1).
 
-The listener sizes its buffer with `MPI_Get_count` and receives the message from the probed source. It rejects any message whose declared lengths exceed the bound or do not add up exactly to the received byte count, so a malformed message can never cause an out-of-bounds read. Paths are relative to the mount point and start with `/`. An operation whose path would not fit fails locally with `ENAMETOOLONG` before anything is sent.
+The listener sizes its buffer with `MPI_Get_count` and receives the message from the probed source. It rejects any message whose declared lengths exceed their bounds or do not add up exactly to the received byte count, so a malformed message can never cause an out-of-bounds read. Paths are relative to the mount point and start with `/`. An operation whose path would not fit fails locally with `ENAMETOOLONG` before anything is sent.
 
 ## 3. Requests
 
@@ -59,6 +69,10 @@ The listener sizes its buffer with `MPI_Get_count` and receives the message from
 | `DELETE_DIR` | peer-to-peer | path | Replayer: `rmdir` |
 | `RENAME` | peer-to-peer | old path, new path | Replayer: `rename` |
 | `LINK` | peer-to-peer | existing path, new path | Replayer: `link` |
+| `SYMLINK` | peer-to-peer | link target, new path | Replayer: `symlink` |
+| `SET_ATTR` | peer-to-peer | path, `meta` (mode, uid, gid, atime, mtime as applied by the originator) | Replayer: `chmod`, `lchown`, `utimensat(AT_SYMLINK_NOFOLLOW)` for the attributes in `meta.mask` |
+| `SET_XATTR` | peer-to-peer | path, attribute name, value, `meta.xattrFlags` | Replayer: `lsetxattr` |
+| `REMOVE_XATTR` | peer-to-peer | path, attribute name | Replayer: `lremovexattr` |
 | `TERMINATE` | both | — | Listener: leave the loop; P2P: drain the replayer, then unmount the local mount point with `fusermount3 -u` |
 
 ### 3.1 Data transfers
@@ -96,4 +110,4 @@ No order is defined between operations originated by different peers.
 
 ## 5. History
 
-The original client-server control plane broadcast a request header and then ran `MPI_Scatterv`/`MPI_Gatherv`. The peer-to-peer control plane sent a header plus fixed 4 KiB path buffers in two messages, and ran collectives rooted at the originating peer. Both models now share the protocol above. The defects that motivated each change (D33–D39) are described in [DEFECT-ANALYSIS.md](DEFECT-ANALYSIS.md).
+The original client-server control plane broadcast a request header and then ran `MPI_Scatterv`/`MPI_Gatherv`. The peer-to-peer control plane sent a header plus fixed 4 KiB path buffers in two messages, and ran collectives rooted at the originating peer. Both models now share the protocol above. The defects that motivated each change (D33–D40) are described in [DEFECT-ANALYSIS.md](DEFECT-ANALYSIS.md).
