@@ -185,22 +185,22 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for every option and for clus
 | DAGonStar workflow with Python script tasks | `python3 tests/dagonstar/run_workflow.py --model peer-to-peer --ranks 4 -- --oversubscribe` |
 | Multi-node | `sbatch -N 2 --ntasks-per-node=2 tests/slurm/multinode.sbatch build` |
 
-The November 2026 assessment found and fixed 47 defects. They include cross-address-space `free()`, double FUSE replies, peer inode desynchronisation, concurrent collectives, unreplicated metadata, inode numbers that were all 0, locks, FIFOs and space operations that were missing, and a shutdown that Open MPI's HCOLL library could deadlock. Before the fixes the client-server model crashed during the suite, and a peer-to-peer operation across nodes took about 400 ms. Afterwards both models pass on one node and across two Slurm nodes, including concurrent writers on two peers and parallel MPI-IO (OMPIO and ROMIO), and cross-node operations take 0.03–0.43 ms. See [docs/DEFECT-ANALYSIS.md](docs/DEFECT-ANALYSIS.md) and [docs/TESTING.md](docs/TESTING.md).
+The November 2026 assessment found and fixed 47 defects. They include cross-address-space `free()`, double FUSE replies, peer inode desynchronisation, concurrent collectives, unreplicated metadata, inode numbers that were all 0, locks, FIFOs and space operations that were missing, and a shutdown that hung in Open MPI's HCOLL library. Before the fixes the client-server model crashed during the suite, and a peer-to-peer operation across nodes took about 400 ms. Afterwards both models pass on one node and across two Slurm nodes, including concurrent writers on two peers and parallel MPI-IO (OMPIO and ROMIO), and cross-node operations take 0.03–0.43 ms. See [docs/DEFECT-ANALYSIS.md](docs/DEFECT-ANALYSIS.md) and [docs/TESTING.md](docs/TESTING.md).
 
 ## Performance
 
-We compared DAGonFS with the cluster's NFS home directory as the scratch space of **real DAGonStar workflows** (Slurm jobs 19453 and 19454, partition `low-wn`, 4 ranks on one node and on two nodes, November 2026). On one node DAGonFS ran a large-file dataflow (8 × 128 MiB) **2.1× faster** than NFS, the same dataflow with **Python tasks** reading and writing the volume **2.0× faster**, and a small-file dataflow (2000 files of 8 KiB staged by 8 tasks) **11.8× faster**. Spread over two nodes it stays 1.8–11.2× faster.
+We compared DAGonFS with the cluster's NFS home directory as the scratch space of **real DAGonStar workflows** (Slurm jobs 19513 and 19514, partition `low-wn`, 4 ranks on one node and on two nodes, November 2026). On one node DAGonFS ran a large-file dataflow (8 × 128 MiB) **1.9× faster** than NFS, the same dataflow with **Python tasks** reading and writing the volume **2.0× faster**, and a small-file dataflow (2000 files of 8 KiB staged by 8 tasks) **10.4× faster**. Spread over two nodes it stays 1.9–10.3× faster. An earlier run of the same benchmark gave 1.8–2.1× and 8.9–11.8×; differences between runs are discussed in [docs/PERFORMANCE.md](docs/PERFORMANCE.md) §4.5.
 
 ![DAGonStar workflows on NFS, tmpfs and DAGonFS](figures/bench-workflow.png)
 
 | Workload (median, one node) | NFS | DAGonFS client-server | DAGonFS peer-to-peer | tmpfs (node-local bound) |
 | --- | ---: | ---: | ---: | ---: |
-| File creation (ops/s) | 230 | 40,172 | 13,525 | 274,889 |
-| 4 KiB files written (files/s) | 184 | 5,969 | 4,470 | 121,827 |
-| 512 MiB write / read (MiB/s) | 484 / 303 | 809 / 1,467 | 790 / 1,411 | 3,174 / 5,036 |
-| DAGonStar, 8 × 128 MiB, shell tasks (s) | 61.8 | 28.8 | 29.2 | 14.9 |
-| DAGonStar, 8 × 128 MiB, Python tasks (s) | 55.5 | 28.2 | 30.1 | 15.4 |
-| DAGonStar, 2000 × 8 KiB (s) | 270.4 | 22.9 | 26.2 | 14.5 |
+| File creation (ops/s) | 67 | 25,532 | 26,943 | 272,010 |
+| 4 KiB files written (files/s) | 96 | 5,923 | 7,946 | 119,477 |
+| 512 MiB write / read (MiB/s) | 283 / 117 | 647 / 1,186 | 841 / 1,387 | 3,371 / 5,521 |
+| DAGonStar, 8 × 128 MiB, shell tasks (s) | 64.4 | 33.9 | 34.8 | 15.6 |
+| DAGonStar, 8 × 128 MiB, Python tasks (s) | 62.1 | 31.3 | 39.4 | 16.2 |
+| DAGonStar, 2000 × 8 KiB (s) | 257.6 | 24.7 | 28.2 | 15.0 |
 
 Unlike tmpfs, DAGonFS presents one namespace to tasks on different nodes, and its capacity is the memory of the whole allocation. Charts for every micro-benchmark, a discussion and memory-sizing advice are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md) §4. The benchmark itself is in [bench/](bench).
 

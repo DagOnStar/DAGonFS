@@ -101,12 +101,13 @@ python3 tests/dagonstar/run_workflow.py --build-dir build --model peer-to-peer  
 | Scenario | MPI-IO calls | What it exercises in DAGonFS |
 | --- | --- | --- |
 | Independent I/O | `MPI_File_write_at`, `read_at`, `sync`, `get_size`; blocks of 300 000 bytes interleaved by rank; each rank reads another rank's blocks | concurrent writers on one shared buffer; write-back on `fsync`; sizes that are not multiples of the block size |
-| Collective I/O | strided vector file view, `MPI_File_write_all`, `read_all` | two-phase aggregation: few large writes from aggregator ranks |
-| Data sieving | independent non-contiguous `MPI_File_write` of 1000-byte pieces with holes, by all ranks at once | ROMIO's read-modify-write under `F_SETLKW` byte-range locks: a piece is lost if locking or read-after-write is incoherent |
-| Atomic mode | `MPI_File_set_atomicity`, `write_at`, `read_at` | locked I/O |
-| Shared file pointer and resizing | `MPI_File_write_ordered`, `set_size` (shrink, grow), `get_size`, `delete` | the shared-pointer side files and their locks; `ftruncate` |
+| Collective I/O | strided vector file view, `MPI_File_write_all`, `read_all` | the collective I/O paths of the MPI-IO layer on a FUSE file system |
+| Data sieving | independent non-contiguous `MPI_File_write` of 1000-byte pieces with holes, by all ranks at once | ROMIO's read-modify-write under `F_SETLKW` byte-range locks, which reach the lock table (verified with `strace`): a piece is lost if locking or read-after-write is incoherent |
+| Atomic mode | `MPI_File_set_atomicity`, `write_at`, `read_at` | the atomic-mode paths of the MPI-IO layer |
+| Shared file pointer and resizing | `MPI_File_write_ordered`, `set_size` (shrink, grow), `get_size`, `delete` | the MPI-IO layer's shared-pointer implementation; `ftruncate` and its reported size |
+| One file per process (`peers`) | each rank opens its own file and its neighbour's before any data exist; `write_at`, `MPI_File_sync`, barrier, `MPI_File_sync`, `read_at`; then an overwrite read through the descriptor kept open | the sync-barrier-sync visibility rule. In the peer-to-peer model, neighbouring ranks use different peers' mount points, so every read crosses peers and needs the reload of an already open buffer (D46) |
 
-In the peer-to-peer model, a second job of two ranks then reads the independent-I/O file through another peer's mount (`verify`), after the writers have closed it. The check exits 0 only if every scenario passed. It needs no DAGonFS: `mpirun -np 4 build/dagonfs_mpiio_check run <directory>` works on any file system.
+The harness runs the first five scenarios in one job (`run`). In the peer-to-peer model, a second job of two ranks then reads the independent-I/O file through another peer's mount (`verify`), after the writers have closed it. A last job runs `peers`, with rank 0's mount and, in the peer-to-peer model, the other local peer's. Every job exits 0 only if all its scenarios passed. The MPI-IO processes always run on the harness's host; MPI-IO processes on several nodes are not tested. It needs no DAGonFS: `mpirun -np 4 build/dagonfs_mpiio_check run <directory>` works on any file system.
 
 ## 3. Multi-node validation with Slurm
 
@@ -121,6 +122,24 @@ For each model the script runs the mounted suite (`tests/mount.py`, with the pee
 Every allocated node needs `/dev/fuse` and the libfuse3 runtime. The script sources `tests/slurm/fuse-env.sh`, which accepts either helper: when a node has only the FUSE 2 `fusermount` (as the `low-wn` nodes had until 15 November 2026, §4.0a), it creates a `fusermount3` link to it in a directory of the submission directory, which every node sees, and puts it first on `PATH`. On clusters where only some node classes provide FUSE, select them with a partition or `--constraint`.
 
 ## 4. Recorded results
+
+### 4.0c MPI-IO across peers, and a second benchmark run (15 November 2026)
+
+The validation was repeated after the D47 fix and the addition of the MPI-IO `peers` scenario (one file per process, opened through two mount points in peer-to-peer mode; §2.3).
+
+**Table 0c — complete validation, Open MPI 4.1.4, libfuse 3.3.0, kernel 4.18.**
+
+| Check | Where | Model | Ranks | Result |
+| --- | --- | --- | --- | --- |
+| `ctest` | login node | — | — | 4/4 pass |
+| `tests/mount.py` with the MPI-IO check | login node | client-server, peer-to-peer | 1, 2, 3, 4 | 30/30 pass at every rank count; MPI-IO passes with OMPIO and ROMIO (12 results per client-server run, 14 per peer-to-peer run with two or more ranks, the `peers` scenario using two mount points); clean shutdown |
+| `tests/dagonstar/run_workflow.py`, widths 6 and 16 | login node | client-server, peer-to-peer | 4 | 8/8 and 18/18 tasks, consistent result (7.6–8.3 s) |
+| `tests/slurm/multinode.sbatch`, job 19515 | wn04 | client-server, peer-to-peer | 4 | 30/30 pass; peer-to-peer checks pass; MPI-IO 26/26 results; workflow 10/10 tasks, consistent result (13.0–14.2 s); every job exits 0 |
+| same, job 19516 | wn02–wn03 | client-server, peer-to-peer | 2 + 2 | same results |
+| Benchmark, jobs 19513 and 19514 | wn01; wn02–wn03 | client-server, peer-to-peer | 4; 2 + 2 | every micro-benchmark and 36 DAGonStar workflows completed per job; the Python-task reducer verified every byte ([PERFORMANCE.md](PERFORMANCE.md) §4) |
+| A/B of the D47 fix, job 19521 | wn01 | client-server | 4 | two benchmark rounds with HCOLL disabled, two with it enabled; no systematic difference ([PERFORMANCE.md](PERFORMANCE.md) §4.5) |
+
+No defect was found.
 
 ### 4.0b Full re-run with parallel MPI-IO, and D47 (15 November 2026)
 
@@ -138,7 +157,7 @@ The complete validation was repeated after the `fuse3` package (`fusermount3` 3.
 | same, job 19508 | wn01–wn02 | client-server, peer-to-peer | 2 + 2 | same results |
 | Concurrent shutdown stress, job 19509: three two-node client-server workflows at a time, 8 rounds | wn01–wn02 | client-server | 2 + 2, ×3 | 24/24 workflows consistent, 24/24 DAGonFS jobs exit 0 within 8 s of unmount |
 
-*D47.* Before its fix, the first runs of this round (jobs 19496 and 19501) passed every test, but the two-node client-server workflow job exited with status 1. A wrapper that logged each rank's exit status showed that no rank had returned. The harness had waited 30 s after a clean unmount, then terminated `mpirun`. The failure could not be reproduced in 14 sequential two-node runs. It hit 1 of 24 runs when three volumes shared the nodes (job 19505), and stack traces taken 8 s after unmount showed every rank inside `MPI_Finalize`, one in HCOLL's teardown ([DEFECT-ANALYSIS.md](DEFECT-ANALYSIS.md) D47). After the fix, the same stress (job 19509) completed 24 of 24 runs.
+*D47.* Before its fix, the first runs of this round (jobs 19496 and 19501) passed every test, but three of their four two-node client-server DAGonFS jobs exited with status 1. In both runs a one-node test job shared node wn01. A wrapper that logged each rank's exit status showed that no rank had returned: the harness had waited 30 s after a clean unmount, then terminated `mpirun`. Nineteen two-node client-server runs without other jobs on the nodes (jobs 19497, 19498 and 19503) shut down cleanly. The hang hit 1 of 24 runs when three volumes shared the nodes (job 19505), and stack traces taken 8 s after the unmount showed every rank inside `MPI_Finalize`, one of them in HCOLL's teardown ([DEFECT-ANALYSIS.md](DEFECT-ANALYSIS.md) D47). After the fix, the same stress (job 19509) completed 24 runs out of 24.
 
 *MPI-IO.* The MPI-IO check found no defect in DAGonFS. Three failures during its development were errors in the check itself, confirmed by running it on the node's local XFS and on `/dev/shm`:
 
@@ -155,7 +174,7 @@ The complete validation was repeated after the `fuse3` package (`fusermount3` 3.
 | 19446 | wn01 | 4 | 30/30 pass in both models | pass | 10/10 tasks, consistent result, both models (13.1 / 13.2 s) |
 | 19447 | wn01–wn02 | 2 + 2 | 30/30 pass in both models | pass | 10/10 tasks, consistent result, both models (13.7 / 16.8 s) |
 
-Every job shut down cleanly. The benchmark of [PERFORMANCE.md](PERFORMANCE.md) §4 (jobs 19453 and 19454) then ran nine DAGonStar workflows per volume, including the Python-task workflow, whose reducer verifies every byte; all completed with the expected output. The run fixed one test defect: the lock scenarios left the helper processes' pipes open (`ResourceWarning`), and they are now closed by `finish()`.
+Every job shut down cleanly. The first run of the benchmark of [PERFORMANCE.md](PERFORMANCE.md) §4 (jobs 19453 and 19454, §4.5 there) then ran nine DAGonStar workflows per volume, including the Python-task workflow, whose reducer verifies every byte; all completed with the expected output. The run fixed one test defect: the lock scenarios left the helper processes' pipes open (`ResourceWarning`), and they are now closed by `finish()`.
 
 ### 4.0 Full POSIX operation coverage (15 November 2026)
 

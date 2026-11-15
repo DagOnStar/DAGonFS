@@ -60,15 +60,25 @@ A lock therefore also orders data: unlocking, downgrading or closing first write
 
 ### MPI-IO
 
-Parallel programs can use MPI-IO on a mounted volume through either Open MPI implementation, OMPIO or ROMIO (driver `ufs`). `tests/mpiio_check.c` (run by `tests/mount.py`, [TESTING.md](TESTING.md) §2.3) validates:
+Programs can use MPI-IO on a mounted volume. It was tested with Open MPI 4.1.4 on the cluster and with Ubuntu 24.04's Open MPI in CI, each with both of its MPI-IO implementations, OMPIO and ROMIO. `tests/mpiio_check.c` ([TESTING.md](TESTING.md) §2.3) covers:
 
-* independent and collective I/O on shared files, including strided file views;
-* concurrent non-contiguous writes, which ROMIO serves by data sieving: read-modify-write under byte-range locks;
+* independent and collective I/O on a shared file, including strided file views;
+* concurrent non-contiguous independent writes. ROMIO performs them by data sieving: it locks the covering byte range with `F_SETLKW`, reads it, merges the new pieces and writes it back. A system-call trace confirmed that these locks reach DAGonFS's lock table;
 * atomic mode;
 * the shared file pointer (`MPI_File_write_ordered`);
-* `MPI_File_set_size`, `MPI_File_get_size`, `MPI_File_sync` and `MPI_File_delete`.
+* `MPI_File_set_size`, `MPI_File_get_size`, `MPI_File_sync` and `MPI_File_delete`;
+* one file per process, written through one peer's mount point and read through another's (peer-to-peer model).
 
-The usual MPI rules apply. Data written by one process are visible to another after `MPI_File_sync`, a barrier and another `MPI_File_sync`, or after a `close` and reopen. Bytes never written have undefined content: ROMIO's data sieving may write back arbitrary bytes into holes, also on local file systems. Collective calls such as `MPI_File_set_size` do not synchronise the ranks, so a rank may apply the change before the others have entered the call. In the peer-to-peer model, all ranks that write one shared file should use the same peer's mount, because concurrent writers on different peers are not serialised (see below). A file closed on one peer can be read on any other.
+Rules and limits:
+
+* **Where the processes run.** An MPI-IO process needs a mount point on its node.
+  * In the client-server model, only rank 0's node has one, so an MPI-IO job runs on that node.
+  * In the peer-to-peer model, every node has one, but all writers of one shared file must use the same peer. Writes to one file through different peers are not serialised, and the last write-back replaces the whole file (see the consistency model below). A shared file can therefore be written by the processes of one node only.
+  * One file per process can be written through different peers. This was tested with two peers on the same node.
+  * In every test, the MPI-IO processes ran on one node, while the volume's data were spread over two nodes in the two-node jobs. MPI-IO processes on several nodes have not been tested.
+* **Visibility.** As MPI requires, data written by one process are guaranteed to be seen by another after `MPI_File_sync` by the writer, a barrier, and `MPI_File_sync` by the reader, or after the writer closes the file and the reader opens it. This was tested within one mount point and, for one file per process, across two peers.
+* **Collective calls are not barriers.** With OMPIO, rank 0 resized a file in `MPI_File_set_size` while other ranks were still checking its size before the call. Separate such steps with `MPI_Barrier`.
+* **Holes.** Do not expect zeros in byte ranges that were never written. ROMIO's data sieving wrote non-zero bytes into the holes between written pieces, on local XFS and tmpfs as well as on DAGonFS.
 
 ## Consistency model
 

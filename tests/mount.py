@@ -14,7 +14,8 @@ After the suite, the harness runs the parallel MPI-IO check
 (``dagonfs_mpiio_check``, built from ``tests/mpiio_check.c``) as an MPI job of
 its own on this host, once per MPI-IO implementation that Open MPI provides
 (OMPIO and ROMIO). In peer-to-peer mode another peer then verifies the shared
-file that the MPI-IO ranks wrote through rank 0's mount point.
+file that the MPI-IO ranks wrote through rank 0's mount point, and a last job
+exchanges one file per process between ranks that use different peers.
 """
 
 import argparse
@@ -278,6 +279,14 @@ def mpiio_checks(args, volume, peer_rank):
                 str(binary), "verify", str(other), str(args.mpiio_ranks)]
             if subprocess.run(command, timeout=600).returncode != 0:
                 return 1
+        # One file per process, written and read through every local mount point:
+        # in the peer-to-peer model, each rank reads a file written through another peer.
+        views = [directory] + ([Path(volume.mountpoint(peer_rank)) / directory.name]
+                               if args.model == "peer-to-peer" and peer_rank > 0 else [])
+        command = [args.mpirun, "-np", str(args.mpiio_ranks)] + launch + mca + [
+            str(binary), "peers"] + [str(view) for view in views]
+        if subprocess.run(command, timeout=600).returncode != 0:
+            return 1
         shutil.rmtree(directory)
     print("MPI-IO checks: OK")
     return 0

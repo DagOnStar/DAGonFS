@@ -125,7 +125,7 @@ In client-server mode rank 0 then sends `TERMINATE` to the storage ranks. In pee
 * Do not place an active mount inside a directory managed by a cleanup job; external removal of the mount point is a failure, not a shutdown protocol.
 * DAGonFS keeps all data in memory. The aggregate capacity is the sum of the ranks' free memory; contents are lost when the job ends.
 * `mpirun` must be on `PATH` when a job is submitted: `sbatch` passes the submitting environment, so load the MPI module first.
-* DAGonFS uses no MPI collectives. With Open MPI it disables the Mellanox HCOLL component, whose teardown could deadlock `MPI_Finalize` (D47); set `OMPI_MCA_coll_hcoll_enable=1` to override.
-* Applications may access a volume with MPI-IO. The MPI-IO job is separate from the DAGonFS job, and its ranks must run where a mount point is: in client-server mode on rank 0's node; in peer-to-peer mode on any node with a peer.
+* DAGonFS uses no MPI collectives. With Open MPI it disables the Mellanox HCOLL component, whose teardown was observed to hang in `MPI_Finalize` (D47); set `OMPI_MCA_coll_hcoll_enable=1` to override.
+* Applications may access a volume with MPI-IO, in a job separate from the DAGonFS job. Its processes need a mount point on their node: in client-server mode they run on rank 0's node; in peer-to-peer mode, the writers of one shared file must use the same peer. See [POSIX-COMPATIBILITY.md](POSIX-COMPATIBILITY.md), MPI-IO.
 
 See [TESTING.md](TESTING.md) for the Slurm script used to validate multi-node deployments.

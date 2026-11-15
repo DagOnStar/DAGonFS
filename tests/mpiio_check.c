@@ -2,7 +2,8 @@
  * Parallel MPI-IO on a mounted DAGonFS volume.
  *
  *   mpirun -np N dagonfs_mpiio_check run    <directory> [blocks] [block-bytes]
- *   mpirun -np 1 dagonfs_mpiio_check verify <directory> <writers> [blocks] [block-bytes]
+ *   mpirun -np M dagonfs_mpiio_check verify <directory> <writers> [blocks] [block-bytes]
+ *   mpirun -np N dagonfs_mpiio_check peers  <directory> [<directory>...]
  *
  * "run" is started as an MPI job of its own, separate from the DAGonFS job;
  * all its ranks open files in <directory>, a directory of a DAGonFS mount
@@ -22,12 +23,22 @@
  * Every byte read is compared with the expected pattern. "run" keeps
  * <directory>/independent.dat, which "verify" checks from another mount point
  * (in peer-to-peer mode, another peer) after the writers closed it.
+ *
+ * "peers" checks the sync-barrier-sync rule with one file per process: rank r
+ * works in the r-th directory (modulo their number), so that, given the same
+ * directory as seen through two peers' mount points, neighbouring ranks use
+ * different peers. Each rank opens its own file and, before any data exist,
+ * its neighbour's; it writes, calls MPI_File_sync, meets the others at a
+ * barrier, calls MPI_File_sync on the neighbour's file and reads it. It then
+ * overwrites its file and the neighbour reads the new content through the
+ * descriptor it kept open.
  * Exit status 0 means every check passed; a failure aborts the job.
  */
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int rank, size;
 
@@ -255,27 +266,82 @@ static int verify(const char *directory, int writers, long blocks, long bs, unsi
     return 0;
 }
 
+/* Opens `name` on MPI_COMM_SELF, waiting up to 10 s for a name created on another peer to appear. */
+static void open_self(const char *name, int mode, MPI_File *file) {
+    const struct timespec pause = {0, 100 * 1000 * 1000};
+    int code = MPI_SUCCESS;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        code = MPI_File_open(MPI_COMM_SELF, name, mode, MPI_INFO_NULL, file);
+        if (code == MPI_SUCCESS) return;
+        nanosleep(&pause, NULL);
+    }
+    fail(name, code);
+}
+
+static void peers(int directories, char **directory, long blocks, long bs, unsigned char *buffer) {
+    const int other = (rank + 1) % size;
+    char mine[4096], theirs[4096], leaf[64];
+    snprintf(leaf, sizeof leaf, "peer%d.dat", rank);
+    path(mine, sizeof mine, directory[rank % directories], leaf);
+    snprintf(leaf, sizeof leaf, "peer%d.dat", other);
+    path(theirs, sizeof theirs, directory[rank % directories], leaf);
+
+    MPI_File own, neighbour;
+    open_self(mine, MPI_MODE_CREATE | MPI_MODE_RDWR, &own);
+    MPI_Barrier(MPI_COMM_WORLD);
+    /* Opened before the neighbour writes: the content must not stay the empty snapshot. */
+    open_self(theirs, MPI_MODE_RDWR, &neighbour);
+    MPI_Barrier(MPI_COMM_WORLD);
+    for (int round = 0; round < 2; round++) {
+        /* Round 1 overwrites every block with different content (block numbers shifted). */
+        for (long j = 0; j < blocks; j++) {
+            fill(buffer, rank, j + round * blocks, bs);
+            CHECK(MPI_File_write_at(own, j * bs, buffer, (int) bs, MPI_BYTE, MPI_STATUS_IGNORE));
+        }
+        CHECK(MPI_File_sync(own));
+        MPI_Barrier(MPI_COMM_WORLD);
+        CHECK(MPI_File_sync(neighbour));
+        expect_size(neighbour, (MPI_Offset) blocks * bs, "peers");
+        for (long j = 0; j < blocks; j++) {
+            CHECK(MPI_File_read_at(neighbour, j * bs, buffer, (int) bs, MPI_BYTE, MPI_STATUS_IGNORE));
+            expect(buffer, other, j + round * blocks, bs, round == 0 ? "peers, first write" : "peers, overwrite");
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+    CHECK(MPI_File_close(&neighbour));
+    CHECK(MPI_File_close(&own));
+    MPI_Barrier(MPI_COMM_WORLD);
+    CHECK(MPI_File_delete(mine, MPI_INFO_NULL));
+    char what[128];
+    snprintf(what, sizeof what, "file per process through %d mount point(s), sync-barrier-sync", directories);
+    done(what);
+}
+
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     const int isVerify = argc >= 4 && strcmp(argv[1], "verify") == 0;
-    if (!(argc >= 3 && strcmp(argv[1], "run") == 0) && !isVerify) {
+    const int isPeers = argc >= 3 && strcmp(argv[1], "peers") == 0;
+    if (!(argc >= 3 && strcmp(argv[1], "run") == 0) && !isVerify && !isPeers) {
         if (rank == 0) {
             fprintf(stderr, "usage: %s run <directory> [blocks] [block-bytes]\n"
-                            "       %s verify <directory> <writers> [blocks] [block-bytes]\n", argv[0], argv[0]);
+                            "       %s verify <directory> <writers> [blocks] [block-bytes]\n"
+                            "       %s peers <directory> [<directory>...]\n", argv[0], argv[0], argv[0]);
         }
         MPI_Finalize();
         return 2;
     }
-    const int first = isVerify ? 4 : 3;
+    const int first = isPeers ? argc : isVerify ? 4 : 3;
     const long blocks = argc > first ? atol(argv[first]) : 16;
     const long bs = argc > first + 1 ? atol(argv[first + 1]) : 300000; /* not a multiple of the 128 KiB block */
     if (blocks < 1 || bs < 1000 || blocks * bs > (1L << 30)) fail("invalid blocks or block-bytes", MPI_SUCCESS);
     unsigned char *buffer = malloc((size_t) (blocks * bs));
     if (buffer == NULL) fail("malloc", MPI_SUCCESS);
 
-    if (isVerify) {
+    if (isPeers) {
+        peers(argc - 2, argv + 2, blocks, bs, buffer);
+    } else if (isVerify) {
         const int writers = atoi(argv[3]);
         if (writers < 1) fail("invalid writers", MPI_SUCCESS);
         verify(argv[2], writers, blocks, bs, buffer);

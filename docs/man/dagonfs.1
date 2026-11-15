@@ -192,12 +192,14 @@ All ranks must run the same binary on the same architecture.
 uses point-to-point MPI messages only. With Open MPI it disables the HCOLL
 collective component (it sets
 .B OMPI_MCA_coll_hcoll_enable=0
-unless the environment sets it), whose teardown could deadlock
+unless the environment sets it), whose teardown was observed to hang in
 .BR MPI_Finalize .
 .PP
 Applications may use MPI-IO on a mounted volume: both Open MPI implementations
 (OMPIO and ROMIO) are tested, including collective I/O, data sieving under
-byte-range locks, atomic mode and the shared file pointer.
+byte-range locks, atomic mode and the shared file pointer. An MPI-IO process
+needs a mount point on its node, and in peer-to-peer mode all writers of one
+shared file must use the same peer.
 .SH EXIT STATUS
 0 when the volume was unmounted normally; non-zero when it could not be mounted.
 Startup errors are reported on standard error with the rank number.
