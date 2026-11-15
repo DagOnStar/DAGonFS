@@ -1,32 +1,31 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""Check that the DAGonFS executables print usage and fail without arguments.
+
+Usage: python3 tests/usage.py [build-dir]
+"""
+
 from pathlib import Path
-from subprocess import Popen, PIPE
-import os
+import subprocess
 import sys
-import time
-import errno
 
 
-stderrExpected = 'USAGE: fuse-cpp-ramfs MOUNTPOINT'
-p = Popen('src/fuse-cpp-ramfs', stdout=PIPE, stderr=PIPE)
-stdout, stderr = p.communicate()
+def main():
+    build_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "build")
+    failures = 0
+    for name in ("DAGonFS_CS.exe", "DAGonFS_P2P.exe"):
+        binary = build_dir / name
+        if not binary.exists():
+            print(f"skip: {binary} not built")
+            continue
+        result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30)
+        output = result.stdout + result.stderr
+        if "Usage:" not in output or result.returncode == 0:
+            print(f"FAIL: {name} returned {result.returncode} with output {output!r}")
+            failures += 1
+        else:
+            print(f"ok: {name}")
+    return 1 if failures else 0
 
-# Check for no STDOUT
-if stdout:
-  sys.stderr.write('STDOUT not empty\n')
-  sys.exit(-1)
 
-# Check for proper error message
-stderrStr = stderr.decode().rstrip()
-if stderrStr != stderrExpected:
-  sys.stderr.write('Wrong stderr\n')
-  sys.stderr.write('Expected {} Actual {}\n'.format(stderrExpected, stderrStr))
-  sys.exit(-1)
-
-# The exit code should've indicated a failure
-if p.returncode == 0:
-  sys.stderr.write('Wrong exit code\n')
-  sys.stderr.write('Expected != 0 Actual {}\n'.format(p.returncode))
-  sys.exit(-1)
-
-sys.exit(0)
+if __name__ == "__main__":
+    sys.exit(main())

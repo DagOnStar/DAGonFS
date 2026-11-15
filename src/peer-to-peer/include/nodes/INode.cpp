@@ -46,14 +46,18 @@ void INode::Forget(unsigned long nlookup) {
  * After decrementing, if the number of hard links reaches 0, the inode is considered as deleted.
  */
 void INode::RemoveHardLink() {
-    m_fuseEntryParam.attr.st_nlink--;
+    // nlink_t is unsigned: never wrap around below zero.
+    if (m_fuseEntryParam.attr.st_nlink > 0) {
+        m_fuseEntryParam.attr.st_nlink--;
+    }
     if (m_fuseEntryParam.attr.st_nlink <= 0) {
         markForDeletion();
     }
 }
 
 int INode::SetXAttr(const string& name, const void* value, size_t size, int flags, uint32_t position) {
-    LOG4CPLUS_TRACE(INodeLogger, INodeLogger.getName() << "\tSetting " << name << "attribute with value " << value <<" -> FuseRamFs::FuseSetXAttr");
+    // The value is binary and not NUL-terminated: never stream it as a string.
+    LOG4CPLUS_TRACE(INodeLogger, INodeLogger.getName() << "\tSetting " << name << " attribute (" << size << " bytes)");
     const auto attribute = m_xattr.find(name);
     if (attribute == m_xattr.end()) {
         if (flags & XATTR_REPLACE) {
@@ -90,7 +94,7 @@ int INode::SetXAttr(const string& name, const void* value, size_t size, int flag
     // Copy the data.
     memcpy((char *) m_xattr[name].first + position, value, size);
 
-    LOG4CPLUS_TRACE(INodeLogger, INodeLogger.getName() << "\tSetting " << name << "attribute with value " << value <<" -> FuseRamFs::FuseSetXAttr completed!");
+    LOG4CPLUS_TRACE(INodeLogger, INodeLogger.getName() << "\tSetting " << name << " attribute completed");
 
     return 0;
 }

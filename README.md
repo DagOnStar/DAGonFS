@@ -1,112 +1,214 @@
-# DAGonFileSystem
-DAGonFileSystem (DAGonFS) is an in-memory, MPI-distributed FUSE filesystem written in C++ for improving I/O performance in DAGonStar workflows. It provides client-server and peer-to-peer deployment models and is designed for temporary workflow data rather than durable storage.
+# DAGonFileSystem (DAGonFS)
 
-## Documentation
+[![CI](https://github.com/DagOnStar/DAGonFS/actions/workflows/ci.yml/badge.svg)](https://github.com/DagOnStar/DAGonFS/actions/workflows/ci.yml)
 
-- [Architecture](docs/ARCHITECTURE.md)
-- [Configuration and operation](docs/CONFIGURATION.md)
-- [POSIX/FUSE compatibility](docs/POSIX-COMPATIBILITY.md)
-- [Performance methodology and tuning](docs/PERFORMANCE.md)
-- [DAGonStar integration guide](docs/DAGONSTAR-INTEGRATION.md)
-- [Contributor guide](AGENTS.md)
+DAGonFS is an **ad-hoc, in-memory, MPI-distributed file system** exposed through FUSE. It turns a directory into a POSIX namespace whose file contents are spread across the RAM of a set of MPI processes, and is designed for the *scratch data* of scientific workflows run with [DAGonStar](https://github.com/DagOnStar/dagonstar). It does not provide durable storage.
 
-# Abstract
-The following repository presents the development and implementation of DAGonFileSystem (DAGonFS), an ad-hoc file system that transforms a directory into a distributed user-space and in-RAM storage system. The results obtained from file copy operations were excellent, as it was possible to obtain an improvement in execution time up to 47% compared to the execution time of the same operations on a Shared Network File System (NFS).
+Two deployment models share a single file-system implementation:
 
-# Motivation
-The DAGonStar workflow engine supports two types of workflows: taskflow and dataflow. The focus is on dataflow because DAGonStar implements a specific independence model called the workflow:// schema. This component evaluates all task dependencies and manages data transfer between tasks when these dependencies involve data. According to this paradigm, outputs are produced as files (or directories), with the scratch directory as the root. DAGonStar's design treats a workflow:// schema as the root of the current workflow, acting as a virtual file system. In this context, workflow://<unique_task_name>/ represents the root of the scratch directory created by the DAGonStar Runtime. In a high-performance computing environment, it is crucial to reduce execution time caused by I/O operations on persistent storage (such as file and directory creation). Developing a file system that uses RAM as a temporary storage device would help reduce execution time and improve DAGonStar's performance.
-![Motivation](/figures/MotivationDAGonFS.png)
+| Model | Executable | Mount points | Who serves requests |
+| --- | --- | --- | --- |
+| Client-server | `DAGonFS_CS.exe` | one, on rank 0 | rank 0 holds the namespace; ranks 1…P−1 store blocks |
+| Peer-to-peer | `DAGonFS_P2P.exe` | one per rank, `<root>/<rank>` | every peer serves its mount and replicates namespace changes to the others |
 
-# Architecture
-DAGonFileSystem has been implemented in two versions, following two distinct models: Client-Server and Peer-to-Peer.
+## Contents
 
-## Client-Server model
-The Client-Server model involves the execution of two types of processes: a client process, also called the master process, which originates the requests for file system operations, and one or more server processes that will remain waiting for a request from the master process. Once a server process receives a request, it is served. The following image shows the modules, their interactions, and the data structures that are part of DAGonFS Client-Server.
-![Client-Server model](/figures/CSArchitecture.jpg)
+- [Motivation](#motivation)
+- [Architecture](#architecture)
+- [Data flow](#data-flow)
+- [Schemas](#schemas)
+- [Getting started](#getting-started)
+- [Validation](#validation)
+- [Performance](#performance)
+- [Documentation](#documentation)
+- [References and acknowledgments](#references)
 
-The actual data of the file in DAGonFS are stored in the DataBlock data strucutre.
+## Motivation
 
-## Peer-to-Peer model
-The Peer-to-Peer model involves the execution of a generic peer process on all computational nodes where DAGonFS is running. In this model, unlike the previous one, all peers share the same responsibility, which is to wait for an operation originated by any of the peers. Once a request is received, all other peers respond to that request.
-The following figure shows the DAGonFS Peer-to-Peer modules, their interactions, and the data structures.
-![Peer-to-Peer model](/figures/P2PArchitecture.jpg)
+DAGonStar's dataflow model addresses the output of a task with the `workflow://<task>/` schema, rooted at that task's scratch directory. Downstream tasks read those files, and once the workflow completes they are discarded. On HPC systems, placing this scratch space on a shared persistent file system (NFS, Lustre) makes many small metadata operations and short-lived transfers pay the cost of durable storage. DAGonFS keeps the scratch space in the aggregate memory of the allocation.
 
-The actual data of the file in DAGonFS are stored in the DataBlock data strucutre.
+![Motivation](figures/MotivationDAGonFS.png)
 
-# Features
-* Trasparency with client proccesses
-* Two type of executable versions:
-  * Client-Server, for execution on a single computational node
-  * Peer-to-Peer, for execution on multiple computational node on hpc clusters
-* Possibility to save the file system state to persistent storage
+## Architecture
 
-# Acknowledgments
-DAGonFileSystem is part of the research project funded through a competitive procedure under the PNRR cascade call, issued by the National Center for High-Performance Computing, Spoke 1: "Directed Acyclic Graph on Cross-Application Programmable I/O" (DAGonCAPIO, https://dagoncapio.uniparthenope.it, CUP J33C22001170001) PNRR M4C2 I1.4 National Champion ICSC – Cascade call SPOKE 1 – “Future HPC and Big Data”.
-Thematic Area: 3 – Development and testing of methodologies, middleware, and tools for distributed computing for cloud-HPC, AI-HPC, AI-cloud-HPC convergence, and their use in interdisciplinary applications.
+```mermaid
+flowchart TB
+    App["Workflow tasks<br/>(POSIX, Python, shell)"] --> VFS["Linux VFS + FUSE kernel module"]
+    VFS -- "/dev/fuse" --> FS["FileSystem<br/>FUSE low-level handlers"]
+    FS --> NS["Namespace<br/>Nodes · Directory · File · SymbolicLink"]
+    FS --> FB["Front-end file buffer<br/>(open → close)"]
+    FB -- "load on open · store on flush/close" --> DP["Data plane<br/>DataBlockManager"]
+    DP --> REG["Local block registry<br/>Blocks / DataBlock"]
+    DP <-- "MPI_Scatterv / MPI_Gatherv" --> R["Other ranks"]
+    FS --> CP["Control plane<br/>CS: MasterProcessCode ⇄ NodeProcessCode<br/>P2P: RequestSender ⇄ DistributedCode listener"]
+    CP <-- "MPI point-to-point / broadcast" --> R
+```
 
-# Performance
-The results obtained from file copy operations were excellent, as it was possible to obtain an improvement in execution time up to 47% compared to the execution time of the same operations on a Shared Network File System (NFS). Moreover, using DAGonFS during the execution of a dataflow with DAGonStar allows for a 37% improvement in execution time compared to NFS.
-The following plots show the execution time of the file copy operation execute on an NFS and with two model of DAGonFileSystem.
-![Execution time as the number of process varies](/figures/DAGonFS_P2P-processes.png)
-![Execution time as the data block size varies](/figures/DAGonFS_P2P-blocksize.png)
+| Client-server | Peer-to-peer |
+| --- | --- |
+| ![Client-Server model](figures/CSArchitecture.jpg) | ![Peer-to-Peer model](figures/P2PArchitecture.jpg) |
 
-Indeed, the following plots show the execution time of a dataflow with DAGonStar using DAGonFS.
-![DAGonStar execution as the number of process varies](/figures/DAGonFS_with_DAGonStar-processes.png)
-![DAGonStar execution as the data block size](/figures/DAGonFS_with_DAGonStar-blocksize.png)
+* **One implementation, two builds.** All shared sources (`FileSystem`, the namespace classes, the data plane) are byte-identical in `src/client-server` and `src/peer-to-peer`; model-specific behaviour is selected at compile time with `DAGONFS_P2P`.
+* **Client-server.** Rank 0 mounts the file system and is the only originator. Each operation is broadcast to the storage ranks, followed by the data-plane collective.
+* **Peer-to-peer.** Every peer runs a FUSE thread and a listener thread. Namespace operations are replayed on every peer through its own mount, so all peers present the same tree. Files are identified across the cluster by a global id assigned at creation.
 
-# References
-* De Vita Ciro Giuseppe, Caramiello Dario, Mellone Gennaro, Sánchez-Gallegos, Dante Domizzi, Mele Valeria, Cavallo Stefania, Di Luccio Diana.
-An ad-hoc file system accelerated workflow application for accidental fire fast response.
-In: Proceedings of the 2nd Workshop on Workflows in Distributed Environments. WiDE ’24. Athens, Greece: Association for Computing Machinery, 2024
-[link](https://dl.acm.org/doi/10.1145/3642978.3652836)
+Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-# Requirements
-DAGonFileSystem was implemented using the OpenMPI and libfuse libraries.
-The use of OpenMPI was crucial to making it a distributed system, enabling message exchanges between processes to distribute and collect data.
-Meanwhile, libfuse allowed for the interception of system calls to execute the file system functionalities implemented in DAGonFS. 
-Therefore, to be successfully compiled, the installation of OpenMPI 4.1.0 (or higher) and libfuse libfuse3-3.2 (or higher) is required.
-DAGonFileSystem requires CMake 3.20 or newer and a compiler with C++23 support.
+## Data flow
 
-# Installation
-Clone the repository and enter in the repository directory
+A file's content is held in a front-end buffer while it is open and distributed to all ranks when it is flushed or closed (close-to-open consistency).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application
+    participant K as Kernel (FUSE)
+    participant F as Front end (rank 0 / originating peer)
+    participant S as Other ranks
+    App->>K: open(path)
+    K->>F: FUSE_OPEN
+    alt file has stored content
+        F->>S: READ {file id, stored size}
+        S-->>F: MPI_Gatherv (each rank's blocks)
+    end
+    App->>K: write / read (any offset)
+    K->>F: FUSE_WRITE / FUSE_READ on the in-memory buffer
+    App->>K: close()
+    K->>F: FUSE_FLUSH / FUSE_RELEASE
+    F->>S: WRITE {file id, size}
+    F->>S: MPI_Scatterv (c_r blocks to rank r)
+    Note over S: each rank replaces its slice and frees the old blocks
+```
+
+The content is divided into blocks of 128 KiB and laid out **contiguously and deterministically** over the ranks, so a reader only needs the file size to locate every block. No memory address ever leaves the process that owns it.
+
+![Block distribution](figures/block-distribution.svg)
+
+Details: [docs/DATA-PLANE.md](docs/DATA-PLANE.md).
+
+## Schemas
+
+**Client-server control messages** (broadcast from rank 0):
+
+```c
+typedef enum { WRITE, READ, CHANGE_DIR, REDUCE_BLOCKS, TERMINATE, DELETE } RequestType;
+typedef struct { RequestType type; } RequestPacket;
+typedef struct { fuse_ino_t inode; size_t fileSize; size_t reqSize; off_t offset; } IORequestPacket;
+```
+
+**Peer-to-peer control messages.** Each operation is one message sent to every other peer: a header followed by up to two paths.
+
+```c
+typedef enum { WRITE, READ, CREATE_FILE, DELETE_FILE, CREATE_DIR,
+               DELETE_DIR, RENAME, TERMINATE, LINK } RequestType;
+typedef struct {
+    RequestType     type;
+    uint32_t        firstPathLength, secondPathLength;  /* bytes that follow the header */
+    uint64_t        globalId;                           /* CREATE_FILE                  */
+    IORequestPacket io;                                 /* WRITE / READ                 */
+} PeerRequest;
+```
+
+**Per-file state** on the front end:
+
+```mermaid
+classDiagram
+    class INode { +fuse_ino_t inodeNumber; +fuse_entry_param m_fuseEntryParam; +map m_xattr; +m_nlookup }
+    class Directory { +map~string, fuse_ino_t~ m_children; +dir_name; +parentDir }
+    class File { +void* m_buf; +size_t m_capacity; +size_t m_storedSize; +unsigned m_openCount; +uint64_t m_globalId; +isWaitingForDistributedWrite }
+    class SymbolicLink { +string m_link }
+    class DataBlock { +fuse_ino_t inode; +void* dataBlockAddress (131072 bytes, owned); +unsigned processRank; +unsigned progressiveNumber }
+    INode <|-- Directory
+    INode <|-- File
+    INode <|-- SymbolicLink
+    File ..> DataBlock : distributed as c_r blocks per rank
+```
+
+The complete wire specification and ordering guarantees are in [docs/PROTOCOL.md](docs/PROTOCOL.md).
+
+## Getting started
+
+Requirements: CMake ≥ 3.20, a C++23 compiler, MPI (Open MPI ≥ 4.1 tested; `MPI_THREAD_MULTIPLE` for peer-to-peer), libfuse ≥ 3.3 with `fusermount3`. The first configure downloads log4cplus.
+
 ```bash
 git clone https://github.com/DagOnStar/DAGonFS.git
 cd DAGonFS
-```
-Configure the building enviroment
-```bash
-cmake -S . -B build -DUSE_MPI=ON
-```
-Make DAGonFileSystem
-```bash
-cmake --build build
+cmake -S . -B build -DUSE_MPI=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 ```
 
-# Demo
-In both models, when DAGonFS is launched, the path of a directory must be provided, which will serve as the mountpoint directory for DAGonFS. Once running, operations on DAGonFS can be performed on the directory just like any other directory in a common file system.
-The difference between the two models lies in where the operations on the mountpoint directory are executed: in the Client-Server model, operations can only be executed on the computational node where the master process is running, as it is the only one intercepting the system calls. In the Peer-to-Peer model, each computational node has its own mountpoint directory, which is considered an entry point for DAGonFS, and operations on DAGonFS can be executed on any of the computational nodes.
-DAGonFileSystem uses a launcher that reads `DAGonFS.ini` and starts the selected model through MPI. Configure the file and copy it, the launcher, and both executables into the same execution directory. See [Configuration and operation](docs/CONFIGURATION.md) for the configuration reference and shutdown procedure.
+Run either model directly:
 
-To run DAGonFileSystem, you need to assign values to the configuration variables within a "DAGonFS.ini" file.
-Once assigned, it is recommended to create your own folder inside which you should copy the newly configured "DAGonFS.ini" file.
 ```bash
-mkdir dagonfs_exec
-cp DAGonFS/src/DAGonFS.ini dagonfs_exec
+mpirun -np 4 build/DAGonFS_CS.exe  -f /tmp/dagonfs        # mounted at /tmp/dagonfs
+mpirun -np 4 build/DAGonFS_P2P.exe -f /tmp/dagonfs        # mounted at /tmp/dagonfs/0 … /3
 ```
-Next, you need to copy the 3 executables found in the output folder of the DAGonFS installation into the newly created folder.
-```bash
-cp DAGonFS/build/DAGonFS_CS.exe dagonfs_exec
-cp DAGonFS/build/DAGonFS_P2P.exe dagonfs_exec
-cp DAGonFS/build/DAGonFS_Launcher dagonfs_exec
-```
-Finally, change the directory to the created one and run the DAGonFS launcher.
-```bash
-cd dagonfs_exec
-./DAGonFS_Launcher
-```
-To terminate the execution of DAGonFS it's necessary to unmount it, an example may be the ```fusermount3``` command with ```-u``` option followed by the given path for the mountpoint.
 
-# Open-Source external projects
-* [in-RAM file system](https://github.com/watkipet/fuse-cpp-ramfs) an open source project that implement an in-RAM file system
-* [libFUSE3](https://github.com/libfuse/libfuse) an interface for userspace programs to export a filesystem to the Linux kernel
-* [log4cplus](https://github.com/log4cplus/log4cplus) a simple to use C++23 logging API providing thread--safe, flexible, and arbitrarily granular control over log management and configuration
+Or use the launcher with a configuration file:
+
+```bash
+cd build && cp ../src/DAGonFS.ini . && ./DAGonFS_Launcher --dry-run && ./DAGonFS_Launcher
+```
+
+To stop the service, unmount the front end (any one peer in peer-to-peer mode); the other ranks shut down by themselves:
+
+```bash
+fusermount3 -u /tmp/dagonfs
+```
+
+See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for every option and for cluster deployment.
+
+## Validation
+
+| Level | Command |
+| --- | --- |
+| Source contract (architectural invariants, no FUSE needed) | `python3 tests/test_source_contract.py` |
+| Build and smoke | `ctest --test-dir build` |
+| Mounted POSIX suite (15 scenarios) + replication checks | `python3 tests/mount.py --model peer-to-peer --ranks 4 -- --oversubscribe` |
+| Multi-node | `sbatch -N 2 --ntasks-per-node=2 tests/slurm/multinode.sbatch build` |
+
+The November 2026 assessment found and fixed 33 defects, including cross-address-space `free()`, double FUSE replies and peer inode desynchronisation. Before the fixes the client-server model crashed during the suite; afterwards both models pass on one node and across two Slurm nodes. See [docs/DEFECT-ANALYSIS.md](docs/DEFECT-ANALYSIS.md) and [docs/TESTING.md](docs/TESTING.md).
+
+## Performance
+
+In file-copy experiments, DAGonFS cut execution time by up to 47% compared with NFS. A DAGonStar dataflow using DAGonFS ran 37% faster than on NFS.
+
+| File copy vs. number of processes | File copy vs. block size |
+| --- | --- |
+| ![Execution time as the number of process varies](figures/DAGonFS_P2P-processes.png) | ![Execution time as the data block size varies](figures/DAGonFS_P2P-blocksize.png) |
+
+| DAGonStar dataflow vs. number of processes | DAGonStar dataflow vs. block size |
+| --- | --- |
+| ![DAGonStar execution as the number of process varies](figures/DAGonFS_with_DAGonStar-processes.png) | ![DAGonStar execution as the data block size](figures/DAGonFS_with_DAGonStar-blocksize.png) |
+
+Methodology and tuning: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+## Documentation
+
+| Document | Content |
+| --- | --- |
+| [Architecture](docs/ARCHITECTURE.md) | Layers, models, request paths, consistency and failure models |
+| [Data plane](docs/DATA-PLANE.md) | Block layout, collectives, ownership invariants, cost model |
+| [Protocol](docs/PROTOCOL.md) | MPI message formats and ordering |
+| [POSIX compatibility](docs/POSIX-COMPATIBILITY.md) | Supported operations and semantics |
+| [Configuration](docs/CONFIGURATION.md) | Build, command line, launcher, shutdown |
+| [Performance](docs/PERFORMANCE.md) | Methodology and tuning |
+| [DAGonStar integration](docs/DAGONSTAR-INTEGRATION.md) | Using DAGonFS as workflow scratch |
+| [Testing](docs/TESTING.md) | Harness and recorded results |
+| [Defect analysis](docs/DEFECT-ANALYSIS.md) | Assessment, defects and remedies |
+| [Contributor guide](AGENTS.md) | Rules for changing the code |
+
+## References
+
+* C. G. De Vita, D. Caramiello, G. Mellone, D. D. Sánchez-Gallegos, V. Mele, S. Cavallo, D. Di Luccio. *An ad-hoc file system accelerated workflow application for accidental fire fast response.* In: Proceedings of the 2nd Workshop on Workflows in Distributed Environments (WiDE ’24), Athens, Greece. ACM, 2024. [doi:10.1145/3642978.3652836](https://dl.acm.org/doi/10.1145/3642978.3652836)
+
+### Built on
+
+* [fuse-cpp-ramfs](https://github.com/watkipet/fuse-cpp-ramfs): the in-RAM FUSE file system DAGonFS started from.
+* [libfuse](https://github.com/libfuse/libfuse): the user-space FUSE interface.
+* [log4cplus](https://github.com/log4cplus/log4cplus): logging.
+
+### Acknowledgments
+
+DAGonFileSystem is part of the research project *Directed Acyclic Graph on Cross-Application Programmable I/O* (DAGonCAPIO, https://dagoncapio.uniparthenope.it, CUP J33C22001170001). It is funded through a competitive procedure under the PNRR cascade call issued by the National Center for High-Performance Computing, Spoke 1 (PNRR M4C2 I1.4 National Champion ICSC – Cascade call SPOKE 1 – “Future HPC and Big Data”). Thematic Area 3: development and testing of methodologies, middleware and tools for distributed computing for cloud-HPC, AI-HPC and AI-cloud-HPC convergence, and their use in interdisciplinary applications.

@@ -4,23 +4,25 @@
 
 #ifndef NODEPROCESSCODE_HPP
 #define NODEPROCESSCODE_HPP
-#include <map>
 
 #include "DataBlockManager.hpp"
 #include "DistributedWrite.hpp"
 #include "DistributedRead.hpp"
 #include "../utils/log_level.hpp"
 
+/**
+ * @brief Storage rank of the client-server model (ranks 1..P-1).
+ *
+ * The worker loops on broadcast requests from the master and executes its
+ * side of the data-plane collectives against its local block registry.
+ */
 class NodeProcessCode: public DistributedWrite, public DistributedRead {
 private:
-	//Singleton implementation
 	static NodeProcessCode* instance;
 	NodeProcessCode(int rank, int mpi_world_size);
 
 	int rank;
 	int mpi_world_size;
-
-	map<fuse_ino_t, vector<DataBlock *> > dataBlockPointers;
 
 	DataBlockManager *dataBlockManager;
 	log4cplus::Logger NodeProcessLogger;
@@ -32,13 +34,7 @@ public:
 	void DAGonFS_Write(void* buffer, fuse_ino_t inode, size_t fileSize) override;
 	void* DAGonFS_Read(fuse_ino_t inode, size_t fileSize, size_t reqSize, off_t offset) override;
 
-	void createEmptyBlockListForInode(fuse_ino_t inode);
-	vector<DataBlock *> &getDataBlockPointers(fuse_ino_t inode);
-
 	void start();
-	void createFileDump();
 };
-
-
 
 #endif //NODEPROCESSCODE_HPP

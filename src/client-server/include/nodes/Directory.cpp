@@ -8,8 +8,11 @@
 using namespace std;
 
 Directory::Directory() {
+    dir_name = "";
+    parentDir = nullptr;
     m_children = map<string, fuse_ino_t>();
 }
+
 
 /**
  Returns a child inode number given the name of the child.

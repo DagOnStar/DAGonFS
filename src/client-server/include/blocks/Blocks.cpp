@@ -4,6 +4,8 @@
 
 #include "Blocks.hpp"
 
+#include <cstring>
+
 #include "data_blocks_info.hpp"
 
 Blocks *Blocks::instance = nullptr;
@@ -16,68 +18,77 @@ Blocks *Blocks::getInstance() {
 	return instance;
 }
 
-Blocks::Blocks() {
-	FileSystemDataBlocks = map<fuse_ino_t, vector<DataBlock *> >();
-}
+Blocks::Blocks() = default;
 
 Blocks::~Blocks() {
 	for (auto& [inode, blocks] : FileSystemDataBlocks) {
-		for (DataBlock* block : blocks) {
-			delete block;
+		deleteBlocks(blocks);
+	}
+}
+
+void Blocks::deleteBlocks(vector<DataBlock *> &blocks) {
+	for (DataBlock* block : blocks) {
+		delete block;
+	}
+	blocks.clear();
+}
+
+void Blocks::replaceLocalBlocks(fuse_ino_t inode, vector<DataBlock *> &&blocks) {
+	vector<DataBlock *> previous;
+	{
+		std::lock_guard<std::mutex> lock(registryMutex);
+		if (blocks.empty()) {
+			const auto existing = FileSystemDataBlocks.find(inode);
+			if (existing != FileSystemDataBlocks.end()) {
+				previous.swap(existing->second);
+				FileSystemDataBlocks.erase(existing);
+			}
+		} else {
+			previous.swap(FileSystemDataBlocks[inode]);
+			FileSystemDataBlocks[inode] = std::move(blocks);
 		}
 	}
+	deleteBlocks(previous);
 }
 
-void Blocks::createEmptyBlockListForInode(fuse_ino_t inode) {
-	//if (!FileSystemDataBlocks.contains(inode)) {
-	if (FileSystemDataBlocks.find(inode) == FileSystemDataBlocks.end()) {
-		FileSystemDataBlocks[inode] = vector<DataBlock *>();
+void Blocks::releaseLocalBlocks(fuse_ino_t inode) {
+	replaceLocalBlocks(inode, vector<DataBlock *>());
+}
+
+vector<void *> Blocks::localBlockAddresses(fuse_ino_t inode, size_t expectedBlocks, unsigned int rank, unsigned int firstIndex) {
+	std::lock_guard<std::mutex> lock(registryMutex);
+	vector<void *> addresses;
+	addresses.reserve(expectedBlocks);
+	if (expectedBlocks == 0) {
+		return addresses;
 	}
+	vector<DataBlock *> &slice = FileSystemDataBlocks[inode];
+	while (slice.size() < expectedBlocks) {
+		DataBlock *padding = new DataBlock(inode, rank, firstIndex + slice.size());
+		memset(padding->getData(), 0, FILE_SYSTEM_SINGLE_BLOCK_SIZE);
+		slice.push_back(padding);
+	}
+	for (size_t index = 0; index < expectedBlocks; ++index) {
+		addresses.push_back(slice[index]->getData());
+	}
+	return addresses;
 }
 
-void Blocks::setBlockListForInode(fuse_ino_t inode, vector<DataBlock*> &blockList) {
-	FileSystemDataBlocks[inode] = blockList;
-}
-
-bool Blocks::blockListExistForInode(fuse_ino_t inode) {
+bool Blocks::blockListExistForInode(fuse_ino_t inode) const {
+	std::lock_guard<std::mutex> lock(registryMutex);
 	return FileSystemDataBlocks.find(inode) != FileSystemDataBlocks.end();
 }
 
-
-vector<DataBlock*>& Blocks::getDataBlockListOfInode(fuse_ino_t inode) {
-	return FileSystemDataBlocks[inode];
-}
-
-DataBlock* Blocks::addDataBlockToInode(fuse_ino_t inode) {
-	DataBlock *newBlock = new DataBlock(inode);
-
-	if (!FileSystemDataBlocks[inode].empty()) {
-		DataBlock *lastBlock = FileSystemDataBlocks[inode].back();
-		unsigned int newAbsBytes = lastBlock->getAbsoluteBytes() + FILE_SYSTEM_SINGLE_BLOCK_SIZE;
-		newBlock->setAbsoluteBytes(newAbsBytes);
-	}
-
-	FileSystemDataBlocks[inode].push_back(newBlock);
-	return newBlock;
-}
-
-
-void Blocks::addDataBlockToInode(fuse_ino_t inode, DataBlock* dataBlock) {
-	FileSystemDataBlocks[inode].push_back(dataBlock);
-}
-
-unsigned int Blocks::getNumberOfUsedBlocksOfInode(fuse_ino_t inode) {
+unsigned int Blocks::getNumberOfUsedBlocksOfInode(fuse_ino_t inode) const {
+	std::lock_guard<std::mutex> lock(registryMutex);
 	const auto blocks = FileSystemDataBlocks.find(inode);
 	return blocks == FileSystemDataBlocks.end() ? 0 : blocks->second.size();
 }
 
-unsigned int Blocks::getTotalBlockBytesOfInode(fuse_ino_t inode) {
-	unsigned int totalBytes = getNumberOfUsedBlocksOfInode(inode);
-	return totalBytes * FILE_SYSTEM_SINGLE_BLOCK_SIZE;
+size_t Blocks::getTotalBlockBytesOfInode(fuse_ino_t inode) const {
+	return static_cast<size_t>(getNumberOfUsedBlocksOfInode(inode)) * FILE_SYSTEM_SINGLE_BLOCK_SIZE;
 }
 
-bool Blocks::hasNoBlocks(fuse_ino_t inode) {
-	const auto blocks = FileSystemDataBlocks.find(inode);
-	return blocks == FileSystemDataBlocks.end() || blocks->second.empty();
+bool Blocks::hasNoBlocks(fuse_ino_t inode) const {
+	return getNumberOfUsedBlocksOfInode(inode) == 0;
 }
-

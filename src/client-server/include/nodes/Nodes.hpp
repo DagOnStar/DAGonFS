@@ -79,14 +79,14 @@ public:
      *
      * @return The number of inode in the file system.
      */
-    int getNumberOfINodes(){return INodes.size();}
+    size_t getNumberOfINodes(){return INodes.size();}
 
     /**
      * @brief Get the number of deleted inodes.
      *
      * @return The number of deleted inodes.
      */
-    int getNumberOfDeletedINodes(){ return DeletedINodes.size();};
+    size_t getNumberOfDeletedINodes(){ return DeletedINodes.size();};
 
     /**
      * @brief Set a new inode object to a previously used (and then deleted) inode number.

@@ -18,9 +18,23 @@ Every registered request handler must reply exactly once. Error paths reply with
 
 ## Semantics relevant to applications
 
-`create`, `mknod`, `mkdir`, `symlink`, and `link` return `EEXIST` when the destination name already exists. `setattr` is the FUSE entry point used by common POSIX metadata operations such as `chmod`, `chown`, `utime`, and `truncate`. Directory enumeration is implemented through `readdir`; callers should not depend on a stable enumeration order across concurrent namespace changes.
+`create`, `mknod`, `mkdir`, `symlink`, and `link` return `EEXIST` when the destination name already exists. `rename` follows POSIX: renaming a name onto itself is a no-op, an existing target is replaced atomically, a directory may replace only an empty directory (`ENOTEMPTY`, `EISDIR`, `ENOTDIR`), a directory cannot be moved below itself (`EINVAL`), and `RENAME_NOREPLACE` is honoured. `unlink` of a directory fails with `EISDIR`; `rmdir` of a non-empty directory with `ENOTEMPTY`. `getxattr`/`listxattr` with a zero size return the required size, and `ERANGE` only when the supplied buffer is too small. `setattr` is the FUSE entry point used by common POSIX metadata operations such as `chmod`, `chown`, `utime`, and `truncate`. Directory enumeration is implemented through `readdir`; callers should not depend on a stable enumeration order across concurrent namespace changes.
 
 Byte-range locks are local-kernel behavior only. `getlk` reports an unlocked range and DAGonFS does not distribute or persist locks among ranks. Python programs that need inter-process mutual exclusion across nodes should use an MPI synchronization primitive or a separate distributed lock service rather than `fcntl.lockf`.
+
+## Consistency model
+
+DAGonFS provides **close-to-open consistency**, the model of NFS and of most workflow scratch file systems.
+
+* While a file is open on a front end, reads and writes operate on an in-memory whole-file buffer held by that front end; several descriptors on the same file share it.
+* The content is distributed to the storage ranks (write-back) on `fsync`, `flush` of a dirty file, and when the last descriptor is released. `truncate` on a closed file is applied and written back immediately.
+* An `open` that follows a completed `close` (on any peer, in the peer-to-peer model) observes the closed content. Concurrent writers of the same file on different peers are not serialised: the last write-back wins.
+* `O_TRUNC` truncates; `O_APPEND` appends; `O_WRONLY` alone preserves existing content.
+* `st_blocks` is reported in 512-byte units as POSIX specifies; `statfs` reports a writable file system.
+
+## Peer-to-peer specifics
+
+Namespace operations (`create`, `mknod`, `mkdir`, `unlink`, `rmdir`, `rename`, `link`) are replicated to every peer in origination order. Symbolic links, `setattr` changes other than size, and extended attributes are **local to the peer** on which they were made. Paths longer than 4095 bytes fail with `ENAMETOOLONG` on the originating peer. See [PROTOCOL.md](PROTOCOL.md).
 
 ## Python example
 

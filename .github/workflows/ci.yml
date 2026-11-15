@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [master, development]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-contract:
+    name: Source contract
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Byte-compile test helpers
+        run: python3 -m py_compile tests/mount.py tests/usage.py tests/test_python_posix.py tests/test_source_contract.py
+      - name: Architectural invariants
+        run: python3 tests/test_source_contract.py -v
+      - name: Whitespace errors introduced by the change
+        if: github.event_name == 'pull_request'
+        run: git diff --check "origin/${{ github.base_ref }}...HEAD"
+
+  build:
+    name: Build and smoke (${{ matrix.compiler }}, ${{ matrix.build_type }})
+    runs-on: ubuntu-24.04
+    needs: source-contract
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+    env:
+      CC: ${{ matrix.compiler == 'gcc' && 'gcc-14' || 'clang-18' }}
+      CXX: ${{ matrix.compiler == 'gcc' && 'g++-14' || 'clang++-18' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config libfuse3-dev fuse3 libopenmpi-dev openmpi-bin
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DUSE_MPI=ON -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Smoke tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Upload binaries
+        if: matrix.compiler == 'gcc' && matrix.build_type == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dagonfs-linux-x86_64
+          path: |
+            build/DAGonFS_CS.exe
+            build/DAGonFS_P2P.exe
+            build/DAGonFS_Launcher
+          retention-days: 7
+
+  mounted:
+    name: Mounted POSIX suite (${{ matrix.model }})
+    runs-on: ubuntu-24.04
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [client-server, peer-to-peer]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config libfuse3-dev fuse3 libopenmpi-dev openmpi-bin
+      - name: Check FUSE availability
+        id: fuse
+        run: |
+          if [ -c /dev/fuse ] && command -v fusermount3 >/dev/null; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::/dev/fuse is not available on this runner; skipping mounted tests"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build
+        if: steps.fuse.outputs.available == 'true'
+        run: |
+          cmake -S . -B build -G Ninja -DUSE_MPI=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+      - name: Mounted tests (2 and 4 ranks)
+        if: steps.fuse.outputs.available == 'true'
+        timeout-minutes: 10
+        run: |
+          for ranks in 2 4; do
+            python3 tests/mount.py --build-dir build --model ${{ matrix.model }} --ranks "$ranks" \
+              --root "$RUNNER_TEMP/dagonfs-$ranks" -- --oversubscribe
+          done
+      - name: Upload job logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mounted-logs-${{ matrix.model }}
+          path: ${{ runner.temp }}/dagonfs-*.log
+          if-no-files-found: ignore

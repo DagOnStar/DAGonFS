@@ -1,37 +1,37 @@
 //
-// Created by frank on 1/15/25.
+// Created by frank on 1/14/25.
 //
 
 #include "DistributedCode.hpp"
 
-#include <iostream>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
-#include <stdio.h>
-#include <unistd.h>
-#include <dirent.h>
-#include <fcntl.h>
-#include <mpi.h>
+#include <iostream>
 #include <vector>
 
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <mpi.h>
+
 #include "mpi_data.hpp"
+#include "RequestSender.hpp"
+#include "../blocks/Blocks.hpp"
 #include "../ramfs/FileSystem.hpp"
+
+extern char **environ;
 
 using namespace std;
 
 int DistributedCode::mpiRank = -1;
 int DistributedCode::mpiWorldSize = 0;
 string DistributedCode::fsPath = string();
-string DistributedCode::unmountScript = string();
-
 DistributedCode *DistributedCode::instance = nullptr;
 DataBlockManager *DistributedCode::dataBlockManager = nullptr;
-
-int *DistributedCode::scatterCounts = nullptr;
-int *DistributedCode::scatterDispls = nullptr;
-int DistributedCode::scatterOffset = 0;
-int *DistributedCode::gatherCounts = nullptr;
-int *DistributedCode::gatherDispls = nullptr;
-int DistributedCode::gatherOffset = 0;
 double DistributedCode::lastWriteTime = 0.0;
 double DistributedCode::lastReadTime = 0.0;
 double DistributedCode::DAGonFSWriteSGElapsedTime = 0.0;
@@ -41,7 +41,6 @@ DistributedCode *DistributedCode::getInstance(int rank, int worldSize, const cha
 	if (instance == nullptr) {
 		instance = new DistributedCode(rank, worldSize, mountpointPath);
 	}
-
 	return instance;
 }
 
@@ -49,92 +48,81 @@ DistributedCode::DistributedCode(int rank, int worldSize, const char* mountpoint
 	mpiRank = rank;
 	mpiWorldSize = worldSize;
 	fsPath = mountpointPath;
-	fsPath += "/"+to_string(mpiRank);
-	unmountScript = mountpointPath;
-	unmountScript += "/unmount.sh " + fsPath;
+	fsPath += "/" + to_string(mpiRank);
 	dataBlockManager = DataBlockManager::getInstance(mpiWorldSize);
-
-	scatterCounts = new int[mpiWorldSize];
-	scatterDispls = new int[mpiWorldSize];
-	scatterOffset = 0;
-	gatherCounts = new int[mpiWorldSize];
-	gatherDispls = new int[mpiWorldSize];
-	gatherOffset = 0;
-
-	lastWriteTime = 0.0;
-	lastReadTime = 0.0;
-	DAGonFSWriteSGElapsedTime = 0.0;
-	DAGonFSReadSGElapsedTime = 0.0;
 }
 
-
 void DistributedCode::setup() {
+}
 
+string DistributedCode::localPath(const string &relativePath) {
+	return fsPath + relativePath;
 }
 
 void DistributedCode::start() {
+	vector<char> message;
 	bool running = true;
 	while (running) {
-		//cout << "Process " << mpiRank << " - Waiting for a request" <<endl;
-		RequestPacket request;
+		// One self-describing message per request: probe for its size first.
 		MPI_Status status;
-		MPI_Recv(&request,sizeof(RequestPacket), MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
+		MPI_Probe(MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
+		int count = 0;
+		MPI_Get_count(&status, MPI_BYTE, &count);
+		const int source = status.MPI_SOURCE;
+		message.resize(static_cast<size_t>(count));
+		MPI_Recv(message.data(), count, MPI_BYTE, source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+		PeerRequest request{};
+		if (static_cast<size_t>(count) < sizeof(PeerRequest)) {
+			cerr << "Process " << mpiRank << " - ignoring malformed request from " << source << endl;
+			continue;
+		}
+		memcpy(&request, message.data(), sizeof(PeerRequest));
+		const size_t firstLength = request.firstPathLength;
+		const size_t secondLength = request.secondPathLength;
+		if (firstLength >= DAGONFS_MAX_REQUEST_PATH || secondLength >= DAGONFS_MAX_REQUEST_PATH ||
+		    sizeof(PeerRequest) + firstLength + secondLength != static_cast<size_t>(count)) {
+			cerr << "Process " << mpiRank << " - ignoring malformed request from " << source << endl;
+			continue;
+		}
+		const string first(message.data() + sizeof(PeerRequest), firstLength);
+		const string second(message.data() + sizeof(PeerRequest) + firstLength, secondLength);
+
+		if (source == mpiRank) {
+			// Only termination is ever addressed to the sending peer itself.
+			if (request.type == TERMINATE) {
+				running = false;
+			}
+			continue;
+		}
 		switch (request.type) {
 		case WRITE:
-			if (mpiRank != status.MPI_SOURCE) {
-				//cout << "Process " << mpiRank << " - Invoking DAGonFS_Write()" <<endl;
-				IORequestPacket ioRequest;
-				MPI_Status status;
-				MPI_Recv(&ioRequest, sizeof(IORequestPacket), MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
-				//cout << "Process " << mpiRank << " - Received WRITE from P"<<status.MPI_SOURCE<<": ioRequest.inode="<<ioRequest.inode<<", ioRequest.fileSize="<<ioRequest.fileSize<< endl;
-				DAGonFS_Write(status.MPI_SOURCE, MPI_IN_PLACE, ioRequest.inode, ioRequest.fileSize);
-			}
+			DAGonFS_Write(source, nullptr, request.io.inode, request.io.fileSize);
 			break;
 		case READ:
-			if (mpiRank != status.MPI_SOURCE) {
-				//cout << "Process " << mpiRank << " - Invoking DAGonFS_Read()" <<endl;
-				IORequestPacket ioRequest;
-				MPI_Status status;
-				MPI_Recv(&ioRequest, sizeof(IORequestPacket), MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
-				//cout << "Process " << mpiRank << " - Received READ from P"<<status.MPI_SOURCE<<":"<< endl;
-				//cout << "\tioRequest.inode="<<ioRequest.inode<<endl;
-				//cout << "\tioRequest.fileSize="<<ioRequest.fileSize<<endl;
-				//cout << "\tioRequest.reqSize="<<ioRequest.reqSize<<endl;
-				//cout << "\tioRequest.offset="<<ioRequest.offset<<endl;
-				DAGonFS_Read(status.MPI_SOURCE, ioRequest.inode, ioRequest.fileSize, ioRequest.reqSize, ioRequest.offset);
-			}
+			DAGonFS_Read(source, request.io.inode, request.io.fileSize, request.io.reqSize, request.io.offset);
 			break;
 		case CREATE_FILE:
-			if (mpiRank != status.MPI_SOURCE) {
-				createFile();
-			}
+			createFile(request, first, second);
 			break;
 		case DELETE_FILE:
-			if (mpiRank != status.MPI_SOURCE) {
-				deleteFile();
-			}
+			deleteFile(request, first, second);
 			break;
 		case CREATE_DIR:
-			if (mpiRank != status.MPI_SOURCE) {
-				createDir();
-			}
+			createDir(request, first, second);
 			break;
 		case DELETE_DIR:
-			if (mpiRank != status.MPI_SOURCE) {
-				deleteDir();
-			}
+			deleteDir(request, first, second);
 			break;
 		case RENAME:
-			if (mpiRank != status.MPI_SOURCE) {
-				renameHandler();
-			}
+			renameHandler(request, first, second);
+			break;
+		case LINK:
+			linkHandler(request, first, second);
 			break;
 		case TERMINATE:
-			//cout << "Process " << mpiRank << " - Received termination request" <<endl;
 			running = false;
-			if (mpiRank != status.MPI_SOURCE) {
-				unmountFileSystem();
-			}
+			unmountFileSystem();
 			break;
 		default:
 			break;
@@ -144,264 +132,116 @@ void DistributedCode::start() {
 
 void DistributedCode::unmountFileSystem() {
 	FileSystem::unmountFromThread = true;
-	system(unmountScript.c_str());
+#ifdef __APPLE__
+	const char *tool = "umount";
+	char *const argv[] = {const_cast<char *>("umount"), const_cast<char *>(fsPath.c_str()), nullptr};
+#else
+	const char *tool = "fusermount3";
+	char *const argv[] = {const_cast<char *>("fusermount3"), const_cast<char *>("-u"), const_cast<char *>(fsPath.c_str()), nullptr};
+#endif
+	pid_t child;
+	if (posix_spawnp(&child, tool, nullptr, nullptr, argv, environ) == 0) {
+		int status = 0;
+		waitpid(child, &status, 0);
+	} else {
+		cerr << "Process " << mpiRank << " - cannot run " << tool << " to unmount " << fsPath << endl;
+	}
 }
 
 void DistributedCode::DAGonFS_Write(int sourceRank, void *buffer, fuse_ino_t inode, size_t fileSize) {
-	if (mpiRank == sourceRank) {
-		IORequestPacket ioRequest;
-		ioRequest.inode = inode;
-		ioRequest.fileSize = fileSize;
-		//cout << "Process " << mpiRank << " - Notify all other process for writing operation: ioRequest.inode="<<ioRequest.inode<<", ioRequest.fileSize="<<ioRequest.fileSize<< endl;
-		for (int i=0; i<mpiWorldSize; i++) {
-			if (i != mpiRank) {
-				MPI_Send(&ioRequest,sizeof(IORequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-			}
-		}
-	}
-
 	double startWrite = MPI_Wtime();
-
-	size_t numberOfBlocksForRequest = fileSize / FILE_SYSTEM_SINGLE_BLOCK_SIZE + (fileSize % FILE_SYSTEM_SINGLE_BLOCK_SIZE > 0);
-	size_t blockPerProcess = numberOfBlocksForRequest / mpiWorldSize;
-	size_t remainingBlocks = numberOfBlocksForRequest % mpiWorldSize;
-	size_t effectiveBlocks = blockPerProcess + (mpiRank < remainingBlocks);
-
-	//Scatter dei dati
-	void *localScatBuf = malloc(effectiveBlocks*FILE_SYSTEM_SINGLE_BLOCK_SIZE);
-	scatterOffset = 0;
-	for (int i=0; i<mpiWorldSize; i++) {
-		//Calculating elements
-		scatterCounts[i] = ( blockPerProcess + (i < remainingBlocks) ) * FILE_SYSTEM_SINGLE_BLOCK_SIZE;
-
-		//Calculating displacements
-		scatterDispls[i] = scatterOffset;
-		scatterOffset += scatterCounts[i];
-	}
-
-	//Gather dei puntatori
-	PointerPacket *localGathBuf = new PointerPacket[effectiveBlocks];
-	gatherOffset = 0;
-	for (int i=0; i<mpiWorldSize; i++) {
-		//Calculating elements
-		gatherCounts[i] = ( blockPerProcess + (i < remainingBlocks) ) * sizeof(PointerPacket);
-
-		//Calculating displacements
-		gatherDispls[i] = gatherOffset;
-		gatherOffset += gatherCounts[i];
-	}
-
-	double startScatter = MPI_Wtime();
 	if (mpiRank == sourceRank) {
-		//cout << "Process " << mpiRank << "=="<<sourceRank<<" - Sending Scatterv" << endl;
-		MPI_Scatterv(buffer, scatterCounts, scatterDispls, MPI_BYTE, localScatBuf, scatterCounts[mpiRank], MPI_BYTE, sourceRank, MPI_COMM_WORLD);
-	}
-	else {
-		//cout << "Process " << mpiRank << "!="<<sourceRank<<" - Receiving Scatterv" << endl;
-		MPI_Scatterv(MPI_IN_PLACE, scatterCounts, scatterDispls, MPI_BYTE, localScatBuf, scatterCounts[mpiRank], MPI_BYTE, sourceRank, MPI_COMM_WORLD);
-	}
-	double endScatter = MPI_Wtime();
-
-	for (int i=0; i<effectiveBlocks; i++) {
-		void *data_p = malloc(FILE_SYSTEM_SINGLE_BLOCK_SIZE);
-		memcpy(data_p, localScatBuf+i*FILE_SYSTEM_SINGLE_BLOCK_SIZE, FILE_SYSTEM_SINGLE_BLOCK_SIZE);
-		localGathBuf[i].address = data_p;
+		PeerRequest request{};
+		request.type = WRITE;
+		request.io.inode = inode;
+		request.io.fileSize = fileSize;
+		request.io.reqSize = fileSize;
+		RequestSender::send(request, string(), string(), mpiRank, mpiWorldSize);
 	}
 
-	PointerPacket *addresses = new PointerPacket[numberOfBlocksForRequest];
-	double startAllGather = MPI_Wtime();
-	MPI_Allgatherv(localGathBuf, gatherCounts[mpiRank], MPI_BYTE, addresses, gatherCounts, gatherDispls, MPI_BYTE, MPI_COMM_WORLD);
-	double endAllGather = MPI_Wtime();
-
-	DAGonFSWriteSGElapsedTime = (endScatter - startScatter) + (endAllGather - startAllGather);
-
-	Blocks *blocksManager = Blocks::getInstance();
-	vector<DataBlock *> &dataBlockList = blocksManager->getDataBlockListOfInode(inode);
-	int additionBlocks = numberOfBlocksForRequest - dataBlockList.size();
-	if (additionBlocks > 0) {
-		dataBlockManager->addDataBlocksTo(dataBlockList, additionBlocks, inode, sourceRank);
-	}
-	for (int i=0; i < numberOfBlocksForRequest; i++) {
-		DataBlock *dataBlock = dataBlockList[i];
-		dataBlock->setData(addresses[i].address);
-	}
-
-	double endWrite = MPI_Wtime();
-	lastWriteTime = endWrite - startWrite;
+	const double elapsed = dataBlockManager->scatterStore(buffer, inode, fileSize, mpiRank, sourceRank);
 
 	if (mpiRank != sourceRank) {
-		Nodes *INodeManager = Nodes::getInstance();
-		INode *inode_p = INodeManager->getINodeByINodeNumber(inode);
-		inode_p->m_fuseEntryParam.attr.st_size = fileSize;
-		inode_p->m_fuseEntryParam.attr.st_blocks = dataBlockList.size();
+		// Mirror the new size in the local replica of the file.
+		File *file = FileSystem::FileForGlobalId(inode);
+		if (file != nullptr) {
+			file->m_fuseEntryParam.attr.st_size = static_cast<off_t>(fileSize);
+			file->m_fuseEntryParam.attr.st_blocks = static_cast<blkcnt_t>((fileSize + 511) / 512);
+			file->m_storedSize = fileSize;
+			FileSystem::InvalidateINode(file->inodeNumber);
+		}
+	} else {
+		DAGonFSWriteSGElapsedTime = elapsed;
+		lastWriteTime = MPI_Wtime() - startWrite;
 	}
-
 }
 
 void* DistributedCode::DAGonFS_Read(int sourceRank, fuse_ino_t inode, size_t fileSize, size_t reqSize, off_t offset) {
-	if (mpiRank == sourceRank) {
-		IORequestPacket ioRequest;
-		ioRequest.inode = inode;
-		ioRequest.fileSize = fileSize;
-		ioRequest.reqSize = reqSize;
-		ioRequest.offset = offset;
-		//cout << "Process " << mpiRank << " - Notify all other process for reading operation" << endl;
-		//cout << "\tioRequest.inode="<<ioRequest.inode<<endl;
-		//cout << "\tioRequest.fileSize="<<ioRequest.fileSize<<endl;
-		//cout << "\tioRequest.reqSize="<<ioRequest.reqSize<<endl;
-		//cout << "\tioRequest.offset="<<ioRequest.offset<<endl;
-		for (int i=0; i<mpiWorldSize; i++) {
-			if (i != mpiRank) {
-				MPI_Send(&ioRequest,sizeof(IORequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-			}
-		}
-	}
-
-	if (fileSize == 0)
-		return nullptr;
-
 	double startRead = MPI_Wtime();
-
-	size_t numberOfBlocksForRequest;
-	if (reqSize > fileSize)
-		numberOfBlocksForRequest = fileSize / FILE_SYSTEM_SINGLE_BLOCK_SIZE + (fileSize % FILE_SYSTEM_SINGLE_BLOCK_SIZE > 0);
-	else
-		numberOfBlocksForRequest = reqSize / FILE_SYSTEM_SINGLE_BLOCK_SIZE + (reqSize % FILE_SYSTEM_SINGLE_BLOCK_SIZE > 0);
-
-	void *readBuff = nullptr;
 	if (mpiRank == sourceRank) {
-		readBuff = malloc(numberOfBlocksForRequest * FILE_SYSTEM_SINGLE_BLOCK_SIZE);
-		if (readBuff == nullptr) {
-			abort();
-		}
+		PeerRequest request{};
+		request.type = READ;
+		request.io.inode = inode;
+		request.io.fileSize = fileSize;
+		request.io.reqSize = reqSize;
+		request.io.offset = offset;
+		RequestSender::send(request, string(), string(), mpiRank, mpiWorldSize);
 	}
 
-	size_t blockPerProcess = numberOfBlocksForRequest / mpiWorldSize;
-	size_t remainingBlocks = numberOfBlocksForRequest % mpiWorldSize;
-	size_t effectiveBlocks = blockPerProcess + (mpiRank < remainingBlocks);
-
-	//Scatter dei puntatori
-	PointerPacket *addressesToScat = nullptr;
+	double elapsed = 0.0;
+	void *buffer = dataBlockManager->gatherLoad(inode, fileSize, mpiRank, sourceRank, &elapsed);
 	if (mpiRank == sourceRank) {
-		addressesToScat = new PointerPacket[numberOfBlocksForRequest];
-		Blocks *blocksManager = Blocks::getInstance();
-		vector<DataBlock *> &dataBlockList = blocksManager->getDataBlockListOfInode(inode);
-		for (int i=0; i<numberOfBlocksForRequest; i++) {
-			addressesToScat[i].address = dataBlockList[i]->getData();
-		}
+		DAGonFSReadSGElapsedTime = elapsed;
+		lastReadTime = MPI_Wtime() - startRead;
 	}
-
-	PointerPacket *localScatBuf = new PointerPacket[effectiveBlocks];
-	scatterOffset = 0;
-	for (int i=0; i<mpiWorldSize; i++) {
-		//Calculating elements
-		scatterCounts[i] = ( blockPerProcess + (i < remainingBlocks) ) * sizeof(PointerPacket);
-
-		//Calculating displacements
-		scatterDispls[i] = scatterOffset;
-		scatterOffset += scatterCounts[i];
-	}
-
-	//Gather dei dati
-	void *localGathBuf = malloc(effectiveBlocks*FILE_SYSTEM_SINGLE_BLOCK_SIZE);
-	gatherOffset = 0;
-	for (int i=0; i<mpiWorldSize; i++) {
-		//Calculating elements
-		gatherCounts[i] = ( blockPerProcess + (i < remainingBlocks) ) * FILE_SYSTEM_SINGLE_BLOCK_SIZE;
-
-		//Calculating displacements
-		gatherDispls[i] = gatherOffset;
-		gatherOffset += gatherCounts[i];
-	}
-
-	double startScatter = MPI_Wtime();
-	if (mpiRank == sourceRank) {
-		MPI_Scatterv(addressesToScat, scatterCounts, scatterDispls, MPI_BYTE, localScatBuf, scatterCounts[mpiRank], MPI_BYTE, sourceRank, MPI_COMM_WORLD);
-	}
-	else {
-		MPI_Scatterv(MPI_IN_PLACE, scatterCounts, scatterDispls, MPI_BYTE, localScatBuf, scatterCounts[mpiRank], MPI_BYTE, sourceRank, MPI_COMM_WORLD);
-	}
-	double endScatter = MPI_Wtime();
-
-	for (int i=0; i<effectiveBlocks; i++) {
-		memcpy(localGathBuf + i*FILE_SYSTEM_SINGLE_BLOCK_SIZE, localScatBuf[i].address, FILE_SYSTEM_SINGLE_BLOCK_SIZE);
-	}
-
-	double startGather = MPI_Wtime();
-	MPI_Gatherv(localGathBuf, gatherCounts[mpiRank], MPI_BYTE, mpiRank == sourceRank ? readBuff : MPI_IN_PLACE, gatherCounts, gatherDispls, MPI_BYTE, sourceRank, MPI_COMM_WORLD);
-	double endGather = MPI_Wtime();
-	DAGonFSReadSGElapsedTime = (endGather - startGather) + (endScatter - startScatter);
-	double endRead = MPI_Wtime();
-	lastReadTime = endRead - startRead;
-	
-	return readBuff;
+	return buffer;
 }
 
-void DistributedCode::createFile() {
+void DistributedCode::createFile(const PeerRequest &request, const string &first, const string &) {
+	FileSystem::pendingGlobalId = request.globalId;
 	FileSystem::createFileFromThread = true;
-	FileCreationRequest fileCreationRequest;
-
-	MPI_Status status;
-	MPI_Recv(&fileCreationRequest,sizeof(FileCreationRequest), MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
-
-	string absPath = fsPath + fileCreationRequest.name;
-	//cout << "Process " << mpiRank << " - Creating file '" << absPath << "'" << endl;
-
-	FILE *file = fopen(absPath.c_str(), "w");
-	fclose(file);
+	const string absPath = localPath(first);
+	int fd = open(absPath.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0666);
+	if (fd >= 0) {
+		close(fd);
+	} else {
+		FileSystem::createFileFromThread = false;
+		FileSystem::pendingGlobalId = 0;
+		cerr << "Process " << mpiRank << " - replicated create of " << absPath << " failed: " << strerror(errno) << endl;
+	}
 }
 
-void DistributedCode::deleteFile() {
+void DistributedCode::deleteFile(const PeerRequest &, const string &first, const string &) {
 	FileSystem::deleteFileFromThread = true;
-	FileDeletionRequest fileDeleteRequest;
-
-	MPI_Status status;
-	MPI_Recv(&fileDeleteRequest,sizeof(FileDeletionRequest), MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
-
-	string absPath = fsPath + fileDeleteRequest.name;
-	//cout << "Process " << mpiRank << " - Deleting file '" << absPath << "'" << endl;
-
-	unlink(absPath.c_str());
+	if (unlink(localPath(first).c_str()) != 0) {
+		FileSystem::deleteFileFromThread = false;
+	}
 }
 
-void DistributedCode::createDir() {
+void DistributedCode::createDir(const PeerRequest &, const string &first, const string &) {
 	FileSystem::createDirFromThread = true;
-	DirectoryCreationRequest dirCreateRequest;
-
-	MPI_Status status;
-	MPI_Recv(&dirCreateRequest, sizeof(DirectoryCreationRequest), MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
-
-	string absPath = fsPath + dirCreateRequest.absolutePath;
-	//cout << "Process " << mpiRank << " - Creating directory '" << absPath << "'" << endl;
-
-	mkdir(absPath.c_str(), 0777);
+	if (mkdir(localPath(first).c_str(), 0777) != 0) {
+		FileSystem::createDirFromThread = false;
+	}
 }
 
-void DistributedCode::deleteDir() {
+void DistributedCode::deleteDir(const PeerRequest &, const string &first, const string &) {
 	FileSystem::deleteDirFromThread = true;
-	DirectoryDeletionRequest dirDeleteRequest;
-
-	MPI_Status status;
-	MPI_Recv(&dirDeleteRequest, sizeof(DirectoryDeletionRequest), MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
-
-	string absPath = fsPath + dirDeleteRequest.absolutePath;
-	//cout << "Process " << mpiRank << " - Deleting directory '" << absPath << "'" << endl;
-
-	rmdir(absPath.c_str());
+	if (rmdir(localPath(first).c_str()) != 0) {
+		FileSystem::deleteDirFromThread = false;
+	}
 }
 
-void DistributedCode::renameHandler() {
+void DistributedCode::renameHandler(const PeerRequest &, const string &first, const string &second) {
 	FileSystem::renameFromThread = true;
-	RenameRequest renameRequest;
-
-	MPI_Status status;
-	MPI_Recv(&renameRequest, sizeof(RenameRequest), MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
-
-	string absOldPath = fsPath + renameRequest.oldName;
-	string absNewPath = fsPath + renameRequest.newName;
-
-	rename(absOldPath.c_str(), absNewPath.c_str());
-
-	cout << "Process " << mpiRank << " - old name: '" << absOldPath << "' new name: '" << absNewPath << "'" << endl;
+	if (rename(localPath(first).c_str(), localPath(second).c_str()) != 0) {
+		FileSystem::renameFromThread = false;
+	}
 }
 
+void DistributedCode::linkHandler(const PeerRequest &, const string &first, const string &second) {
+	FileSystem::linkFromThread = true;
+	if (link(localPath(first).c_str(), localPath(second).c_str()) != 0) {
+		FileSystem::linkFromThread = false;
+	}
+}

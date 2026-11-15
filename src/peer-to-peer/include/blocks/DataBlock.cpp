@@ -4,50 +4,21 @@
 
 #include "DataBlock.hpp"
 
-DataBlock::DataBlock() {
-	inode = 0;
-	dataBlockAddress = nullptr;
-	usedBytes = 0;
-	absoluteBytes = 0;
-	processRank = 0;
-	progressiveNumber = 0;
-}
+#include <cstdio>
+#include <cstdlib>
 
-DataBlock::DataBlock(fuse_ino_t inode) {
-	this->inode = inode;
-	dataBlockAddress = nullptr;
-	usedBytes = 0;
-	absoluteBytes = 0;
-	processRank = 0;
-	progressiveNumber = 0;
-}
-
-DataBlock::DataBlock(fuse_ino_t inode, void *dataBlockAddress, unsigned int absoluteBytes) {
-	this->inode = inode;
-	this->dataBlockAddress = dataBlockAddress;
-	usedBytes = 0;
-	this->absoluteBytes = absoluteBytes;
-	processRank = 0;
-	progressiveNumber = 0;
+DataBlock::DataBlock(fuse_ino_t inode, unsigned int rank, unsigned int progressiveNumber)
+	: inode(inode), dataBlockAddress(malloc(FILE_SYSTEM_SINGLE_BLOCK_SIZE)),
+	  processRank(rank), progressiveNumber(progressiveNumber) {
+	if (dataBlockAddress == nullptr) {
+		// A storage rank cannot leave an MPI collective half-way through, so an
+		// allocation failure here is unrecoverable.
+		fprintf(stderr, "DAGonFS: rank %u cannot allocate a %d-byte data block\n",
+		        rank, FILE_SYSTEM_SINGLE_BLOCK_SIZE);
+		abort();
+	}
 }
 
 DataBlock::~DataBlock() {
-	if (dataBlockAddress) free(dataBlockAddress);
-}
-
-void DataBlock::setData(void* address) {
-	if (dataBlockAddress != address) {
-		free(dataBlockAddress);
-	}
-	dataBlockAddress = address;
-}
-
-void* DataBlock::allocateBlock() {
-	dataBlockAddress = calloc(FILE_SYSTEM_SINGLE_BLOCK_SIZE,1);
-	return dataBlockAddress;
-}
-
-void DataBlock::freeBlock() {
 	free(dataBlockAddress);
-	dataBlockAddress = nullptr;
 }

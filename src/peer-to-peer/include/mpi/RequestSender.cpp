@@ -6,111 +6,75 @@
 
 #include <cstring>
 #include <iostream>
+#include <vector>
 #include <mpi.h>
 
-#include "DistributedCode.hpp"
 #include "mpi_data.hpp"
 
 using namespace std;
 
 namespace {
-template <size_t N>
-void copyRequestPath(char (&destination)[N], const string& source) {
-    strncpy(destination, source.c_str(), N - 1);
-    destination[N - 1] = '\0';
-}
+
+PeerRequest makeRequest(RequestType type) {
+	PeerRequest request{};
+	request.type = type;
+	return request;
 }
 
-void RequestSender::sendWriteRequest(int sourceRank, int mpiWorldSize) {
-	RequestPacket loopRequest;
-	loopRequest.type = WRITE;
-	for (int i=0; i<mpiWorldSize; i++) {
-		if (i != sourceRank) {
-			MPI_Send(&loopRequest, sizeof(RequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
+uint32_t boundedLength(const string &path) {
+	// Callers reject longer paths with ENAMETOOLONG before sending; this is a
+	// last line of defence that keeps the message well-formed.
+	return static_cast<uint32_t>(min(path.size(), DAGONFS_MAX_REQUEST_PATH - 1));
+}
+
+} // namespace
+
+void RequestSender::send(const PeerRequest &request, const string &first, const string &second,
+                         int sourceRank, int mpiWorldSize, bool includeSelf) {
+	PeerRequest header = request;
+	header.firstPathLength = boundedLength(first);
+	header.secondPathLength = boundedLength(second);
+
+	vector<char> message(sizeof(PeerRequest) + header.firstPathLength + header.secondPathLength);
+	memcpy(message.data(), &header, sizeof(PeerRequest));
+	memcpy(message.data() + sizeof(PeerRequest), first.data(), header.firstPathLength);
+	memcpy(message.data() + sizeof(PeerRequest) + header.firstPathLength, second.data(), header.secondPathLength);
+
+	for (int i = 0; i < mpiWorldSize; i++) {
+		if (i != sourceRank || includeSelf) {
+			MPI_Send(message.data(), static_cast<int>(message.size()), MPI_BYTE, i, 0, MPI_COMM_WORLD);
 		}
 	}
 }
 
-void RequestSender::sendReadRequest(int sourceRank, int mpiWorldSize) {
-	RequestPacket loopRequest;
-	loopRequest.type = READ;
-	for (int i=0; i<mpiWorldSize; i++) {
-		if (i != sourceRank) {
-			MPI_Send(&loopRequest, sizeof(RequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-		}
-	}
-}
-
-void RequestSender::sendCreateFileRequest(string name, int sourceRank, int mpiWorldSize) {
-	RequestPacket loopRequest;
-	loopRequest.type = CREATE_FILE;
-	FileCreationRequest fileCreateRequest;
-	copyRequestPath(fileCreateRequest.name, name);
-	for (int i=0 ; i<mpiWorldSize ; i++) {
-		MPI_Send(&loopRequest, sizeof(RequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-		if (i != sourceRank) {
-			MPI_Send(&fileCreateRequest, sizeof(FileCreationRequest), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-		}
-	}
+void RequestSender::sendCreateFileRequest(string name, uint64_t globalId, int sourceRank, int mpiWorldSize) {
+	PeerRequest request = makeRequest(CREATE_FILE);
+	request.globalId = globalId;
+	send(request, name, string(), sourceRank, mpiWorldSize);
 }
 
 void RequestSender::sendDeleteFileRequest(string name, int sourceRank, int mpiWorldSize) {
-	RequestPacket loopRequest;
-	loopRequest.type = DELETE_FILE;
-	FileDeletionRequest fileDeleteRequest;
-	copyRequestPath(fileDeleteRequest.name, name);
-	for (int i=0 ; i<mpiWorldSize ; i++) {
-		MPI_Send(&loopRequest, sizeof(RequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-		if (i != sourceRank) {
-			MPI_Send(&fileDeleteRequest, sizeof(FileDeletionRequest), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-		}
-	}
+	send(makeRequest(DELETE_FILE), name, string(), sourceRank, mpiWorldSize);
 }
 
 void RequestSender::sendCreateDirectoryRequest(string dirAbsPath, int sourceRank, int mpiWorldSize) {
-	RequestPacket loopRequest;
-	loopRequest.type = CREATE_DIR;
-	DirectoryCreationRequest dirCreateRequest;
-	copyRequestPath(dirCreateRequest.absolutePath, dirAbsPath);
-	for (int i=0; i< mpiWorldSize; i++) {
-		MPI_Send(&loopRequest, sizeof(RequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-		if (i != sourceRank)
-			MPI_Send(&dirCreateRequest, sizeof(DirectoryCreationRequest), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-	}
+	send(makeRequest(CREATE_DIR), dirAbsPath, string(), sourceRank, mpiWorldSize);
 }
 
 void RequestSender::sendDeleteDirectoryRequest(string dirAbsPath, int sourceRank, int mpiWorldSize) {
-	RequestPacket loopRequest;
-	loopRequest.type = DELETE_DIR;
-	DirectoryDeletionRequest dirDeleteRequest;
-	copyRequestPath(dirDeleteRequest.absolutePath, dirAbsPath);
-	for (int i=0; i< mpiWorldSize; i++) {
-		MPI_Send(&loopRequest, sizeof(RequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-		if (i != sourceRank)
-			MPI_Send(&dirDeleteRequest, sizeof(DirectoryDeletionRequest), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-	}
+	send(makeRequest(DELETE_DIR), dirAbsPath, string(), sourceRank, mpiWorldSize);
 }
 
-void RequestSender::sendRenameRequest(std::string oldName, std::string newName, int sourceRank, int mpiWorldSize) {
-	RequestPacket loopRequest;
-	loopRequest.type = RENAME;
-	RenameRequest renameRequest;
-	copyRequestPath(renameRequest.oldName, oldName);
-	copyRequestPath(renameRequest.newName, newName);
-	for (int i=0; i< mpiWorldSize; i++) {
-		MPI_Send(&loopRequest, sizeof(RequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-		if (i != sourceRank)
-			MPI_Send(&renameRequest, sizeof(RenameRequest), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-	}
+void RequestSender::sendRenameRequest(string oldName, string newName, int sourceRank, int mpiWorldSize) {
+	send(makeRequest(RENAME), oldName, newName, sourceRank, mpiWorldSize);
 }
 
+void RequestSender::sendLinkRequest(string targetName, string newName, int sourceRank, int mpiWorldSize) {
+	send(makeRequest(LINK), targetName, newName, sourceRank, mpiWorldSize);
+}
 
 void RequestSender::sendTerminationRequest(int sourceRank, int mpiWorldSize) {
 	cout << "Process " << sourceRank << " - Sending termination request" << endl;
-	RequestPacket termationRequest;
-	termationRequest.type = TERMINATE;
-	for (int i=0; i<mpiWorldSize; i++) {
-          MPI_Send(&termationRequest, sizeof(RequestPacket), MPI_BYTE, i, 0, MPI_COMM_WORLD);
-	}
-
+	// Also addressed to the sender, whose own listener thread must stop.
+	send(makeRequest(TERMINATE), string(), string(), sourceRank, mpiWorldSize, true);
 }

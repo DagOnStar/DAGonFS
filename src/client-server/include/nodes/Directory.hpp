@@ -19,6 +19,8 @@ using namespace std;
  */
 class Directory final: public INode {
 private:
+    string dir_name;
+    Directory *parentDir;
     /**
      * @brief Children list.
      */
@@ -27,6 +29,11 @@ private:
 public:
     Directory();
     ~Directory() override = default;
+
+    void setDirName(const char *name) { dir_name = string(name); }
+    string getDirName() { return dir_name; }
+    void setParent(Directory *parent) { parentDir = parent; }
+    Directory *getParent() { return parentDir; }
 
     /**
      * @brief Get the children of this directory.

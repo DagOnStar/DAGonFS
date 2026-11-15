@@ -5,26 +5,42 @@
 //
 // Created by frank on 11/29/24.
 //
+// This file is shared verbatim by the client-server and peer-to-peer trees
+// (tests/test_source_contract.py enforces it). Behaviour that is intrinsic to
+// the distribution model is guarded by DAGONFS_P2P.
+//
+// Every FUSE request handler replies exactly once: each fuse_reply_* call is
+// either the last statement of the handler or immediately followed by return.
+//
 
 #include "FileSystem.hpp"
 #include "../utils/ArgumentParser.hpp"
 
-#include <iostream>
+#include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
-#include <unistd.h>
-#include <string>
 #include <cstring>
-#include <cassert>
-#include <thread>
+#include <iostream>
+#include <iterator>
+#include <string>
+#include <vector>
 
-//For logging
 #include <dirent.h>
+#include <fcntl.h>
 #include <mpi.h>
-#include <sys/mount.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#ifdef DAGONFS_P2P
 #include "../mpi/RequestSender.hpp"
+#endif
+
 #include "../utils/log_level.hpp"
+
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1 << 0)
+#endif
 
 using namespace std;
 
@@ -40,25 +56,62 @@ Nodes *FileSystem::INodeManager = nullptr;
 
 Blocks *FileSystem::BlocksManager = nullptr;
 
+#ifdef DAGONFS_P2P
+DistributedCode *FileSystem::distributedProcessCode = nullptr;
+std::atomic<bool> FileSystem::createFileFromThread{false};
+std::atomic<bool> FileSystem::deleteFileFromThread{false};
+std::atomic<bool> FileSystem::createDirFromThread{false};
+std::atomic<bool> FileSystem::deleteDirFromThread{false};
+std::atomic<bool> FileSystem::renameFromThread{false};
+std::atomic<bool> FileSystem::linkFromThread{false};
+std::atomic<uint64_t> FileSystem::pendingGlobalId{0};
+std::mutex FileSystem::globalIndexMutex;
+std::map<uint64_t, fuse_ino_t> FileSystem::globalIndex;
+std::atomic<bool> FileSystem::unmountFromThread{false};
+#else
+MasterProcessCode *FileSystem::MasterProcess = nullptr;
+#endif
+
 Logger FileSystem::FSLogger = Logger::getInstance("FuseFileSystem.logger - ");
 
-int FileSystem::mpiRank = -1;
-
+int FileSystem::mpiRank = 0;
 int FileSystem::mpiWorldSize = 0;
+std::atomic<fuse_session *> FileSystem::activeSession{nullptr};
 
 FILE *FileSystem::timeFile = nullptr;
 double FileSystem::startWriteTime = 0.0;
 double FileSystem::endWriteTime = 0.0;
 double FileSystem::startReadTime = 0.0;
 double FileSystem::endReadTime = 0.0;
-bool FileSystem::unmountFromThread = false;
-bool FileSystem::createFileFromThread = false;
-bool FileSystem::deleteFileFromThread = false;
-bool FileSystem::createDirFromThread = false;
-bool FileSystem::deleteDirFromThread = false;
-bool FileSystem::renameFromThread = false;
 
-DistributedCode *FileSystem::distributedProcessCode = nullptr;
+namespace {
+
+bool isDirectory(INode *inode) {
+    return dynamic_cast<Directory *>(inode) != nullptr;
+}
+
+#ifdef DAGONFS_P2P
+/** Consume a "replayed by the listener thread" flag. */
+bool consume(std::atomic<bool> &flag) {
+    return flag.exchange(false);
+}
+#endif
+
+void setTimeNow(struct stat &attr, bool access, bool modification, bool change) {
+    timespec now{};
+    clock_gettime(CLOCK_REALTIME, &now);
+#ifdef __APPLE__
+    if (access) attr.st_atimespec = now;
+    if (modification) attr.st_mtimespec = now;
+    if (change) attr.st_ctimespec = now;
+#else
+    if (access) attr.st_atim = now;
+    if (modification) attr.st_mtim = now;
+    if (change) attr.st_ctim = now;
+#endif
+}
+
+} // namespace
 
 /**
  * Constructor of our file system in RAM. It initializes all fuse operation to its methods.
@@ -107,220 +160,214 @@ FileSystem::FileSystem(int rank, int mpi_world_size) {
     m_stbuf.f_ffree   = kTotalInodes;          // Free inodes
     m_stbuf.f_favail  = kTotalInodes;          // Free inodes for non-root
     m_stbuf.f_fsid    = kFilesystemId;         // Filesystem ID
-    m_stbuf.f_flag    = 0777;                  // Bit mask of values
+    m_stbuf.f_flag    = 0;                     // Mount flags (ST_RDONLY, ST_NOSUID, ...)
     m_stbuf.f_namemax = kMaxFilenameLength;    // Max file name length
-
-    INodeManager = Nodes::getInstance();
-    BlocksManager = Blocks::getInstance();
 
     mpiRank = rank;
     mpiWorldSize = mpi_world_size;
-    distributedProcessCode = DistributedCode::getInstance(mpiRank,mpiWorldSize,"");
+    INodeManager = Nodes::getInstance();
+    BlocksManager = Blocks::getInstance();
+#ifdef DAGONFS_P2P
+    distributedProcessCode = DistributedCode::getInstance(mpiRank, mpiWorldSize, "");
+    FSLogger = Logger::getInstance("FuseFileSystem.logger Process " + to_string(mpiRank) + " - ");
+#else
+    MasterProcess = MasterProcessCode::getInstance(rank, mpi_world_size);
+#endif
 
     LogLevel ll = DAGONFS_LOG_LEVEL;
-    FSLogger = Logger::getInstance("FuseFileSystem.logger Process " + to_string(mpiRank) + " - ");
     FSLogger.setLogLevel(ll);
 }
 
 FileSystem::~FileSystem() {
     if (timeFile != nullptr) {
         fclose(timeFile);
+        timeFile = nullptr;
     }
 }
+
+namespace {
+
+/** Create @p path and any missing parent (like mkdir -p); returns 0 or errno. */
+int ensureDirectory(const string &path) {
+    if (path.empty()) {
+        return ENOENT;
+    }
+    for (size_t slash = path.find('/', 1); ; slash = path.find('/', slash + 1)) {
+        const string prefix = path.substr(0, slash);
+        if (!prefix.empty() && mkdir(prefix.c_str(), 0777) != 0 && errno != EEXIST) {
+            return errno;
+        }
+        if (slash == string::npos) {
+            break;
+        }
+    }
+    struct stat st{};
+    if (stat(path.c_str(), &st) != 0) {
+        return errno;
+    }
+    return S_ISDIR(st.st_mode) ? 0 : ENOTDIR;
+}
+
+} // namespace
 
 /**
  * Initialize the FUSE API connection and start the loop for the API calls. The parameters
  * are the same that are passed to main program by command line.
  */
-int FileSystem::start(int argc,char *argv[]) {
-    int ret = 0;
+int FileSystem::start(int argc, char *argv[]) {
+    const int ret = mountAndServe(argc, argv);
+
+    // Always release the other ranks, also when mounting failed: they are
+    // blocked waiting for requests and would otherwise never terminate.
+    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "--> tell other MPI processes that the file system has been unmounted");
+#ifdef DAGONFS_P2P
+    if (!unmountFromThread.load()) {
+        RequestSender::sendTerminationRequest(mpiRank, mpiWorldSize);
+    }
+#else
+    MasterProcess->sendTermination();
+#endif
+    return ret;
+}
+
+int FileSystem::mountAndServe(int argc, char *argv[]) {
+    if (argc < 3) {
+        show_usage(argv[0]);
+        return EINVAL;
+    }
 
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "--> Step 0: Creating mountpoint directory");
     string fsPath = argv[2];
-    DIR *mountpoint = opendir(fsPath.c_str());
-    if (!mountpoint) {
-        if (mkdir(argv[2],0777) < 0) {
-            LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() <<  "failed to create mountpoint parent directory");
-            return errno;
-        }
+    int err = ensureDirectory(fsPath);
+    if (err != 0) {
+        cerr << "DAGonFS rank " << mpiRank << ": cannot create mountpoint " << fsPath << ": " << strerror(err) << endl;
+        return err;
     }
-    else {
-        closedir(mountpoint);
+#ifdef DAGONFS_P2P
+    // Every peer mounts its own entry point below the shared root.
+    fsPath += "/" + to_string(mpiRank);
+    err = ensureDirectory(fsPath);
+    if (err != 0) {
+        cerr << "DAGonFS rank " << mpiRank << ": cannot create mountpoint " << fsPath << ": " << strerror(err) << endl;
+        return err;
     }
-    fsPath += "/"+to_string(mpiRank);
-    mountpoint = opendir(fsPath.c_str());
-    if (!mountpoint) {
-        if (mkdir(fsPath.c_str(),0777) < 0) {
-            LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() <<  "failed to create mountpoint directory");
-            return errno;
-        }
-    }
-    else closedir(mountpoint);
+#endif
 
-    string timesDirName = "/tmp/DAGonFS_times/";
-    DIR *timeDir = opendir(timesDirName.c_str());
-    if (!timeDir) {
-        if (mkdir(timesDirName.c_str(),0777) < 0) {
-            LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() <<  "failed to create times directory");
-            return errno;
-        }
+    // Timing instrumentation is optional: failing to create it never prevents mounting.
+    const string timesDirName = "/tmp/DAGonFS_times/";
+    if (ensureDirectory(timesDirName) == 0) {
+        const string timesFileName = timesDirName + "copy_times_rank" + to_string(mpiRank) + ".txt";
+        timeFile = fopen(timesFileName.c_str(), "w");
     }
-    else closedir(timeDir);
-    string timesFileName = timesDirName + "copy_times.txt";
-    timeFile = fopen(timesFileName.c_str(), "w");
-    if (!timeFile) {
-        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() <<  "failed to create times file");
-        return errno;
+    if (timeFile == nullptr) {
+        LOG4CPLUS_WARN(FSLogger, FSLogger.getName() << "timing file unavailable; continuing without it");
     }
 
     //LIBFUSE
-    //Argument copying for fuse args
-    //This operation is a prevention: the program also uses MPI, for this
-    //  reason it's better keep the original args untouched
-    ArgumentParser parser = ArgumentParser();
+    //Argument copying for fuse args: FUSE must never modify the caller's argv
+    //(which MPI may also inspect).
+    ArgumentParser parser;
     parser.copy_args(argc, argv);
+    parser.replace_arg(2, fsPath.c_str());
     char **copied_argv_for_fuse = parser.getCopiedArgs();
-    delete[] copied_argv_for_fuse[2];
-    copied_argv_for_fuse[2] = new char[fsPath.size() + 1];
-    strcpy(copied_argv_for_fuse[2], fsPath.c_str());
+
     fuse_args args_for_fuse = FUSE_ARGS_INIT(argc, copied_argv_for_fuse);
-    fuse_cmdline_opts fuse_options;
+    fuse_cmdline_opts fuse_options{};
 
     //LIBFUSE
     //CLI arguments parsing to fill the options
-    if(fuse_parse_cmdline(&args_for_fuse,&fuse_options) != 0){
+    if (fuse_parse_cmdline(&args_for_fuse, &fuse_options) != 0) {
         show_usage(argv[0]);
+        fuse_opt_free_args(&args_for_fuse);
+        return EINVAL;
     }
 
-    //LIBFUSE
-    //Options control
-    if(fuse_options.show_help){
+    int ret = 0;
+    if (fuse_options.show_help) {
         cout << "***** Command Line Help fuse fuse_cmdline_help() *****" << endl;
         fuse_cmdline_help();
         cout << "***** Low Level Help fuse_lowlevel_help() *****" << endl;
         fuse_lowlevel_help();
-        return ret;
-    }
-    else{
-        if(fuse_options.show_version){
-            cout << "FUSE library version: " << fuse_pkgversion() << endl;
-            return ret;
-        }
-    }
-
-    //LIBFUSE
-    //Check if the mountpoint is not null, without it the application must not start
-    if(fuse_options.mountpoint == nullptr){
-        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() <<  "options.mountpoint is NULL : " << fuse_options.mountpoint);
+    } else if (fuse_options.show_version) {
+        cout << "FUSE library version: " << fuse_pkgversion() << endl;
+    } else if (fuse_options.mountpoint == nullptr) {
+        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() << "no mountpoint given");
         ret = 2;
-        return ret;
-    }
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "--> Step 1: options.mountpoint is not NULL: " << fuse_options.mountpoint);
+    } else {
+        LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "--> Step 1: mountpoint " << fuse_options.mountpoint);
 
-    //LIBFUSE
-    //Inizialize the session for low lvel API
-    fuse_session *session = fuse_session_new(&args_for_fuse, &(FuseOperations),sizeof(FuseOperations),nullptr);
-    if(session == nullptr) {
-        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() <<  "fuse_session_new() failed");
-        ret = -1;
-        return ret;
-    }
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<"--> Step 2: fuse_Session_new() Success, fuse_session: " << session);
-
-    //LIBFUSE
-    //Setting signal handlers
-    if(fuse_set_signal_handlers(session) == 0) {
-        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() <<  "--> Step 3: fuse_signal_handlers() OK");
-
-        //LIBFUSE
-        //Mounting our file system
-        if(fuse_session_mount(session,fuse_options.mountpoint) == 0) {
-            LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "--> Step 4: fuse_session_mount() Success");
-
-            //LIBFUSE
-            //Entering a single-block-event loop
-            fuse_daemonize(fuse_options.foreground);
-            ret = fuse_session_loop(session);
-            LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "***** Loop terminated *****");
-
-
-
-
-            //LIBFUSE
-            //Unmuont our file system
-            fuse_session_unmount(session);
-            LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "--> Step 5: fuse_session_unmount() Success");
+        fuse_session *session = fuse_session_new(&args_for_fuse, &(FuseOperations), sizeof(FuseOperations), nullptr);
+        if (session == nullptr) {
+            cerr << "DAGonFS rank " << mpiRank << ": fuse_session_new() failed" << endl;
+            ret = -1;
+        } else {
+            if (fuse_set_signal_handlers(session) == 0) {
+                LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "--> Step 3: fuse_signal_handlers() OK");
+                if (fuse_session_mount(session, fuse_options.mountpoint) == 0) {
+                    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "--> Step 4: fuse_session_mount() Success");
+                    // MPI processes must stay in the foreground: daemonizing
+                    // would fork away from the MPI runtime.
+                    fuse_daemonize(1);
+                    activeSession = session;
+                    ret = fuse_session_loop(session);
+                    activeSession = nullptr;
+                    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "***** Loop terminated *****");
+                    fuse_session_unmount(session);
+                    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "--> Step 5: fuse_session_unmount() Success");
+                } else {
+                    cerr << "DAGonFS rank " << mpiRank << ": cannot mount " << fuse_options.mountpoint << endl;
+                    ret = -1;
+                }
+                fuse_remove_signal_handlers(session);
+            } else {
+                ret = -1;
+            }
+            fuse_session_destroy(session);
         }
-
-        //LIBFUSE
-        //Remove signal handlers previously setted
-        fuse_remove_signal_handlers(session);
-        LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "--> Step 6: fuse_remove_signal_handlers() Success");
+        // Only an empty mountpoint is removed; a non-empty directory is left untouched.
+        rmdir(fsPath.c_str());
     }
-
-    //LIBFUSE
-    //Destruction of the session and releasing of the mountpoint
-    fuse_session_exit(session);
-    fuse_session_destroy(session);
     free(fuse_options.mountpoint);
     fuse_opt_free_args(&args_for_fuse);
-    umount(argv[2]);
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "--> Step 7: fuse_session_destroy() Success");
 
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "--> Step 8: Removing mountpoint directory");
-    rmdir(argv[2]);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "--> Step 9: tell other MPI process that the file system has been unmounted");
-    if (!unmountFromThread) {
-        //Send termination
-        RequestSender::sendTerminationRequest(mpiRank,mpiWorldSize);
-    }
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Returning to caller...");
     return ret;
 }
 
 void FileSystem::show_usage(const char *progname){
-    printf("usage: %s [options] <mount point>\n\n",progname);
+    printf("Usage: mpirun -np <processes> [--hostfile <hostfile>] %s -f <mountpoint> [0|1]\n\n", progname);
     printf("options\n"
-            "       --version \tdisplay version information"
-            "       -V\n"
-            "       --help \t\tdisplay help information"
-            "       --ho"
-            "\n");
+           "       -f          run in the foreground (required under MPI)\n"
+           "       -d          enable FUSE debug output (implies -f)\n"
+           "       --help      display FUSE help\n"
+           "       --version   display FUSE version\n"
+           "       0|1         trailing flag enabling verbose logging\n");
 }
 
 /**
  * Initializes the filesystem. Creates the root directory. The UID and GID are those of the creating process.
  */
 void FileSystem::FuseInit(void *userdata, struct fuse_conn_info *conn) {
+    (void) userdata;
+    (void) conn;
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Starting FuseInit()...");
 
     FileSystem::m_reclaimingINodes = false;
 
-    m_stbuf.f_bfree  = m_stbuf.f_blocks;	//Free blocks
-    m_stbuf.f_bavail = m_stbuf.f_blocks;	//Blocks available to non-root
-    m_stbuf.f_ffree  = m_stbuf.f_files;     //Free inodes
-    m_stbuf.f_favail = m_stbuf.f_files;	    //Free inodes for non-root
-    m_stbuf.f_flag   = 0777;		        //Bit mask of values
+    m_stbuf.f_bfree  = m_stbuf.f_blocks;
+    m_stbuf.f_bavail = m_stbuf.f_blocks;
+    m_stbuf.f_ffree  = m_stbuf.f_files;
+    m_stbuf.f_favail = m_stbuf.f_files;
 
-    //For our root nodes, we'll set gid and uid to the ones the process is using.
-    uid_t gid = getgid();
-    //TODO: Should I be getting the effective UID instead?
-    uid_t uid = getuid();
+    const gid_t gid = getgid();
+    const uid_t uid = getuid();
 
-    //We start out with a special inode and a single directory (the root directory).
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Registering SpecialINode for deleting i-node...");
+    // Inode 0 is a placeholder so that the root directory gets FUSE_ROOT_ID (1).
     RegisterINode(SPECIAL_INODE_TYPE_NO_BLOCK, 0777, 0, gid, uid);
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "SpecialINode registered!");
 
-    //I think that the root directory should have a hardlink count of 3.
-    //This is what I believe I've surmised from reading around.
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Registering root directory");
+    // The root directory has links from ".", from ".." and from the mount point.
     fuse_ino_t rootIno = RegisterINode(DIRECTORY, S_IFDIR | 0777, 3, gid, uid);
     Directory *rootDir = dynamic_cast<Directory *>(INodeManager->getINodeByINodeNumber(rootIno));
     rootDir->setDirName("/");
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "root directory registered!");
 
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "FuseInit() completed!");
 }
@@ -342,17 +389,15 @@ fuse_ino_t FileSystem::RegisterINode(INodeType type, mode_t mode, nlink_t nlink,
 
     INode *inode_p = INodeManager->createEmptyINode(type);
 
-    //Either re-use a deleted inode or push one back depending on whether we're reclaiming inodes now or not
     fuse_ino_t ino;
     if (m_reclaimingINodes) {
         ino = INodeManager->reclaimINode();
         INode *del_p = INodeManager->getINodeByINodeNumber(ino);
-        FileSystem::UpdateUsedBlocks(-(del_p->UsedBlocks())); //Operazione della struttura dati Blocks
-        INodeManager->setINodeAt(ino,inode_p);
+        INodeManager->setINodeAt(ino, inode_p);
         delete del_p;
     } else {
         ino = INodeManager->AddINode(inode_p);
-        FileSystem::UpdateUsedINodes(1); //Operazione della struttura dati Blocks
+        FileSystem::UpdateUsedINodes(1);
     }
 
     INodeManager->InitializeINode(inode_p, ino, mode, nlink, gid, uid);
@@ -360,438 +405,606 @@ fuse_ino_t FileSystem::RegisterINode(INodeType type, mode_t mode, nlink_t nlink,
     return ino;
 }
 
+INode *FileSystem::GetINode(fuse_ino_t ino) {
+    if (ino == 0 || ino >= INodeManager->getNumberOfINodes()) {
+        return nullptr;
+    }
+    return INodeManager->getINodeByINodeNumber(ino);
+}
+
+Directory *FileSystem::GetDirectory(fuse_ino_t ino) {
+    return dynamic_cast<Directory *>(GetINode(ino));
+}
+
+int FileSystem::ValidateName(const char *name) {
+    if (name == nullptr || name[0] == '\0') {
+        return ENOENT;
+    }
+    if (strlen(name) > kMaxFilenameLength) {
+        return ENAMETOOLONG;
+    }
+    if (strchr(name, '/') != nullptr) {
+        return EINVAL;
+    }
+    return 0;
+}
+
+void FileSystem::SetSize(INode *inode, size_t size) {
+    inode->m_fuseEntryParam.attr.st_size = static_cast<off_t>(size);
+    // st_blocks is expressed in 512-byte units by POSIX.
+    inode->m_fuseEntryParam.attr.st_blocks = static_cast<blkcnt_t>((size + 511) / 512);
+}
+
+void FileSystem::Touch(INode *inode, bool modified) {
+    setTimeNow(inode->m_fuseEntryParam.attr, false, modified, true);
+}
+
+bool FileSystem::LoadFileContent(File *file, fuse_ino_t ino) {
+    if (file->m_buf != nullptr) {
+        return true;
+    }
+    const size_t size = static_cast<size_t>(file->m_fuseEntryParam.attr.st_size);
+    if (file->m_storedSize > 0) {
+        startReadTime = MPI_Wtime();
+#ifdef DAGONFS_P2P
+        void *buffer = distributedProcessCode->DAGonFS_Read(mpiRank, DataKey(file, ino), file->m_storedSize, file->m_storedSize, 0);
+#else
+        void *buffer = MasterProcess->DAGonFS_Read(DataKey(file, ino), file->m_storedSize, file->m_storedSize, 0);
+#endif
+        const size_t capacity = DataBlockManager::blocksFor(file->m_storedSize) * FILE_SYSTEM_SINGLE_BLOCK_SIZE;
+        // Bytes past the stored size are padding of the last block.
+        memset(static_cast<char *>(buffer) + file->m_storedSize, 0, capacity - file->m_storedSize);
+        file->adoptBuffer(buffer, capacity);
+        endReadTime = MPI_Wtime();
+        if (timeFile != nullptr) {
+            fprintf(timeFile, "read inode=%lu bytes=%zu total=%f collective=%f\n",
+                    static_cast<unsigned long>(ino), file->m_storedSize, endReadTime - startReadTime,
+#ifdef DAGONFS_P2P
+                    distributedProcessCode->getDAGonFSReadSGElapsedTime()
+#else
+                    MasterProcess->DAGonFSReadSGElapsedTime
+#endif
+            );
+            fflush(timeFile);
+        }
+    }
+    // The logical size may exceed the stored copy (ftruncate grew the file).
+    return file->ensureCapacity(size);
+}
+
+void FileSystem::StoreFileContent(File *file, fuse_ino_t ino) {
+    if (!file->isWaitingForWriting()) {
+        return;
+    }
+    if (file->HasNoLinks()) {
+        // Nobody can reach this content any more; do not resurrect its blocks.
+        file->removeWaiting();
+        return;
+    }
+    const size_t size = static_cast<size_t>(file->m_fuseEntryParam.attr.st_size);
+    if (size > 0 && !file->ensureCapacity(size)) {
+        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() << "cannot allocate the send buffer of inode " << ino);
+        return;
+    }
+    if (size > 0) {
+        // Zero the padding of the last block so that stored data is deterministic.
+        const size_t padded = DataBlockManager::blocksFor(size) * FILE_SYSTEM_SINGLE_BLOCK_SIZE;
+        memset(static_cast<char *>(file->m_buf) + size, 0, padded - size);
+    }
+    const double start = MPI_Wtime();
+#ifdef DAGONFS_P2P
+    distributedProcessCode->DAGonFS_Write(mpiRank, file->m_buf, DataKey(file, ino), size);
+#else
+    MasterProcess->DAGonFS_Write(file->m_buf, DataKey(file, ino), size);
+#endif
+    endWriteTime = MPI_Wtime();
+    file->m_storedSize = size;
+    file->removeWaiting();
+    if (timeFile != nullptr) {
+        fprintf(timeFile, "write inode=%lu bytes=%zu total=%f since-open=%f collective=%f\n",
+                static_cast<unsigned long>(ino), size, endWriteTime - start, endWriteTime - startWriteTime,
+#ifdef DAGONFS_P2P
+                distributedProcessCode->getDAGonFSWriteSGElapsedTime()
+#else
+                MasterProcess->DAGonFSWriteSGElapsedTime
+#endif
+        );
+        fflush(timeFile);
+    }
+}
+
+void FileSystem::DiscardFileContent(File *file, fuse_ino_t ino) {
+    file->releaseBuffer();
+    file->removeWaiting();
+#ifdef DAGONFS_P2P
+    {
+        std::lock_guard<std::mutex> lock(globalIndexMutex);
+        globalIndex.erase(file->m_globalId);
+    }
+#endif
+    const fuse_ino_t key = DataKey(file, ino);
+    if (file->m_storedSize == 0 && BlocksManager->hasNoBlocks(key)) {
+        return;
+    }
+#ifdef DAGONFS_P2P
+    // Every peer replays the unlink, so each one releases its own slice.
+    BlocksManager->releaseLocalBlocks(key);
+#else
+    MasterProcess->DAGonFS_Delete(key);
+#endif
+    file->m_storedSize = 0;
+}
+
+void FileSystem::DropLink(INode *inode, fuse_ino_t ino) {
+    inode->RemoveHardLink();
+    Touch(inode, false);
+    File *file = dynamic_cast<File *>(inode);
+    if (file != nullptr && file->HasNoLinks() && file->m_openCount == 0) {
+        DiscardFileContent(file, ino);
+    }
+}
+
+fuse_ino_t FileSystem::DataKey(File *file, fuse_ino_t ino) {
+#ifdef DAGONFS_P2P
+    // Peers number inodes independently: the data plane addresses a file by
+    // its cluster-wide identity instead.
+    (void) ino;
+    return file->m_globalId;
+#else
+    (void) file;
+    return ino;
+#endif
+}
+
+void FileSystem::InvalidateINode(fuse_ino_t ino) {
+    fuse_session *session = activeSession.load();
+    if (session != nullptr) {
+        // Drop the kernel's cached attributes and pages of an inode whose
+        // content was changed by another rank.
+        fuse_lowlevel_notify_inval_inode(session, ino, 0, 0);
+    }
+}
+
+#ifdef DAGONFS_P2P
+uint64_t FileSystem::AssignGlobalId(File *file, fuse_ino_t ino, bool replay) {
+    uint64_t id = replay ? pendingGlobalId.exchange(0) : 0;
+    if (id == 0) {
+        // (creator rank + 1) in the top 16 bits, creator inode in the rest.
+        id = (static_cast<uint64_t>(mpiRank + 1) << 48) | (static_cast<uint64_t>(ino) & ((1ULL << 48) - 1));
+    }
+    file->m_globalId = id;
+    std::lock_guard<std::mutex> lock(globalIndexMutex);
+    globalIndex[id] = ino;
+    return id;
+}
+
+File *FileSystem::FileForGlobalId(uint64_t id) {
+    std::lock_guard<std::mutex> lock(globalIndexMutex);
+    const auto entry = globalIndex.find(id);
+    if (entry == globalIndex.end()) {
+        return nullptr;
+    }
+    return dynamic_cast<File *>(GetINode(entry->second));
+}
+#endif
+
 void FileSystem::FuseGetAttr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi){
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Getting Attributes -> FuseRamFs::FuseGetAttr()");
-    //Fail if the inode hasn't been created yet
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    (void) fi;
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    //TODO: What do we do if the inode was deleted?
-    INode *inode = INodeManager->getINodeByINodeNumber(ino);
-
     fuse_reply_attr(req, &(inode->m_fuseEntryParam.attr), 1.0);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Getting Attributes -> FuseRamFs::FuseGetAttr() completed!");
 }
 
 void FileSystem::FuseLookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Lookup -> FuseRamFs::FuseLookup()");
 
-    if (parent >= INodeManager->getNumberOfINodes()) {
+    INode *parentInode = GetINode(parent);
+    if (parentInode == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *parentInode = INodeManager->getINodeByINodeNumber(parent);
     Directory *dir = dynamic_cast<Directory *>(parentInode);
     if (dir == nullptr) {
-        // The parent wasn't a directory. It can't have any children.
-        fuse_reply_err(req, ENOENT);
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+    if (name != nullptr && strlen(name) > kMaxFilenameLength) {
+        fuse_reply_err(req, ENAMETOOLONG);
         return;
     }
 
     fuse_ino_t ino = dir->ChildINodeNumberWithName(string(name));
-    if (ino == -1) {
+    INode *inode = ino == static_cast<fuse_ino_t>(-1) ? nullptr : GetINode(ino);
+    if (inode == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
 
-    // TODO: What do we do if the inode was deleted?
-    INode *inode = INodeManager->getINodeByINodeNumber(ino);
     INodeManager->LookupINode(ino);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tLookup for: " << ino << "-" << name << " nlookup++");
     fuse_reply_entry(req, &(inode->m_fuseEntryParam));
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Lookup -> FuseRamFs::FuseLookup() completed!");
 }
 
 /**
- * Check if the i-node is forgotten. If an i-node has no hard links, it's added to the deleted i-node list.
- * Check if the number of deleted i-node is greater than a threshold, the file system active reclaiming mode.
+ * Decrease the lookup count of an inode. An inode that is no longer known to
+ * the kernel and has no hard link is queued for reclamation.
  */
-void FileSystem::FuseForget(fuse_req_t req, fuse_ino_t ino, unsigned long nlookup) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Forgetting -> FuseRamFs::FuseForget()");
-    //TODO: What if the inode doesn't exist!?!?!?!
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\tforget per " << ino << ". nlookup -= " << nlookup);
-    inode_p->Forget(nlookup);
-
-    fuse_reply_none(req);
-
-    if (inode_p->Forgotten()){
-        LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\ti-node: " << inode_p << "forgotten");
-        if (inode_p->HasNoLinks()){
-            //Add the inode to the deleted list. Anything in this list may be reclaimed.
-            INodeManager->DeleteINode(ino);
-            if (INodeManager->getNumberOfDeletedINodes() > FileSystem::kINodeReclamationThreshold) {
-                m_reclaimingINodes = true;
-            }
-
-            //At this point, directory entries will still point to this inode. This is
-            //OK since we'll update those entries as soon as someone reads the directory.
-            LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\ti-node " << ino << " aggiunto alla delete list");
-        }
-        else{
-            // TODO: Verify that this only happens on unmount. It's OK on unmount but bad elsewhere.
-            LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\ti-node " << ino << " è stato forgotten ma non eliminato");
-        }
+void FileSystem::ForgetINode(fuse_ino_t ino, uint64_t nlookup) {
+    INode *inode_p = GetINode(ino);
+    if (inode_p == nullptr) {
+        return;
     }
+    inode_p->Forget(nlookup);
+    if (inode_p->Forgotten() && inode_p->HasNoLinks()) {
+        File *file = dynamic_cast<File *>(inode_p);
+        if (file != nullptr && file->m_openCount > 0) {
+            return;
+        }
+        if (file != nullptr) {
+            DiscardFileContent(file, ino);
+        }
+        inode_p->markForDeletion();
+#ifndef DAGONFS_P2P
+        // Inode numbers are reused only in the client-server model. Peers
+        // number their inodes independently and rely on every peer allocating
+        // the same numbers in the same order, which reclamation (driven by
+        // each kernel's local forget traffic) would break.
+        INodeManager->DeleteINode(ino);
+        if (INodeManager->getNumberOfDeletedINodes() > FileSystem::kINodeReclamationThreshold) {
+            m_reclaimingINodes = true;
+        }
+#endif
+    }
+}
 
-    //Note that there's no reply here. That was done in the steps above this check.
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Forgetting -> FuseRamFs::FuseForget() completed!");
+void FileSystem::FuseForget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup) {
+    ForgetINode(ino, nlookup);
+    fuse_reply_none(req);
 }
 
 void FileSystem::FuseForgetMulti(fuse_req_t req, size_t count, struct fuse_forget_data *forgets) {
     for (size_t index = 0; index < count; ++index) {
-        const fuse_ino_t ino = forgets[index].ino;
-        if (ino < INodeManager->getNumberOfINodes()) {
-            INodeManager->Forget(ino, forgets[index].nlookup);
-        }
+        ForgetINode(forgets[index].ino, forgets[index].nlookup);
     }
     fuse_reply_none(req);
 }
 
 void FileSystem::FuseSetAttr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set, struct fuse_file_info* fi) {
+    (void) fi;
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Setting -> FuseRamFs::FuseSetAttr()");
 
-    // Fail if the inode hasn't been created yet
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
+    struct stat &current = inode->m_fuseEntryParam.attr;
 
-    // TODO: What do we do if the inode was deleted?
-    INode *inode = INodeManager->getINodeByINodeNumber(ino);
+    if (to_set & FUSE_SET_ATTR_SIZE) {
+        File *file = dynamic_cast<File *>(inode);
+        if (file == nullptr) {
+            fuse_reply_err(req, isDirectory(inode) ? EISDIR : EINVAL);
+            return;
+        }
+        if (attr->st_size < 0) {
+            fuse_reply_err(req, EINVAL);
+            return;
+        }
+        const size_t newSize = static_cast<size_t>(attr->st_size);
+        const size_t oldSize = static_cast<size_t>(current.st_size);
+        if (newSize != oldSize || file->m_storedSize != newSize) {
+            const bool wasLoaded = file->m_buf != nullptr;
+            // Truncation to zero never needs the previous content.
+            if (newSize == 0) {
+                file->releaseBuffer();
+            } else if (!LoadFileContent(file, ino) || !file->ensureCapacity(newSize)) {
+                fuse_reply_err(req, ENOMEM);
+                return;
+            }
+            if (newSize < oldSize && file->m_buf != nullptr) {
+                // Bytes beyond the new end must read back as zeros if the file grows again.
+                memset(static_cast<char *>(file->m_buf) + newSize, 0, file->m_capacity - newSize);
+            }
+            SetSize(file, newSize);
+            file->setWaiting();
+            if (file->m_openCount == 0) {
+                // truncate(2) on a closed file: persist immediately.
+                StoreFileContent(file, ino);
+                file->releaseBuffer();
+            } else if (!wasLoaded && newSize == 0) {
+                file->releaseBuffer();
+            }
+            Touch(file, true);
+        }
+    }
+    if (to_set & FUSE_SET_ATTR_MODE) {
+        // Only permission bits can change; the file type is immutable.
+        current.st_mode = (current.st_mode & S_IFMT) | (attr->st_mode & 07777);
+    }
+    if (to_set & FUSE_SET_ATTR_UID) {
+        current.st_uid = attr->st_uid;
+    }
+    if (to_set & FUSE_SET_ATTR_GID) {
+        current.st_gid = attr->st_gid;
+    }
+#ifdef __APPLE__
+    if (to_set & FUSE_SET_ATTR_ATIME) current.st_atimespec = attr->st_atimespec;
+    if (to_set & FUSE_SET_ATTR_MTIME) current.st_mtimespec = attr->st_mtimespec;
+    if (to_set & FUSE_SET_ATTR_CHGTIME) current.st_ctimespec = attr->st_ctimespec;
+    if (to_set & FUSE_SET_ATTR_CRTIME) current.st_birthtimespec = attr->st_birthtimespec;
+    if (to_set & FUSE_SET_ATTR_FLAGS) current.st_flags = attr->st_flags;
+#else
+    if (to_set & FUSE_SET_ATTR_ATIME) current.st_atim = attr->st_atim;
+    if (to_set & FUSE_SET_ATTR_MTIME) current.st_mtim = attr->st_mtim;
+    if (to_set & FUSE_SET_ATTR_CTIME) current.st_ctim = attr->st_ctim;
+#endif
+    // utimensat(UTIME_NOW): the kernel sets the *_NOW flag and no timestamp.
+    setTimeNow(current, (to_set & FUSE_SET_ATTR_ATIME_NOW) != 0, (to_set & FUSE_SET_ATTR_MTIME_NOW) != 0, false);
+#ifdef __APPLE__
+    if (!(to_set & FUSE_SET_ATTR_CHGTIME))
+#else
+    if (!(to_set & FUSE_SET_ATTR_CTIME))
+#endif
+    {
+        setTimeNow(current, false, false, true);
+    }
 
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tsetattr per: " << ino);
-    INodeManager->SetINodeAttributes(inode, attr, to_set);
-    fuse_reply_attr(req, &(inode->m_fuseEntryParam.attr), 1.0);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Setting -> FuseRamFs::FuseSetAttr() completed!");
+    fuse_reply_attr(req, &current, 1.0);
 }
 
 void FileSystem::FuseReadLink(fuse_req_t req, fuse_ino_t ino) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Reading Link -> FuseRamFs::FuseReadLink()");
-
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    INode *inode_p = GetINode(ino);
+    if (inode_p == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
 
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-
-    // You can only readlink on a symlink
     SymbolicLink *link_p = dynamic_cast<SymbolicLink *>(inode_p);
     if (link_p == nullptr) {
-        fuse_reply_err(req, EPERM);
+        fuse_reply_err(req, EINVAL);
         return;
     }
 
-    // TODO: Handle permissions.
-    //    else if ((fi->flags & 3) != O_RDONLY)
-    //        fuse_reply_err(req, EACCES);
-
-    // TODO: Is reply_entry only for directories? What about files?
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\treadlink per: " << ino);
-
     fuse_reply_readlink(req, link_p->Link().c_str());
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Reading Link -> FuseRamFs::FuseReadLink() completed!");
 }
 
 void FileSystem::FuseMknod(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode, dev_t rdev) {
+    (void) rdev;
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Making node -> FuseRamFs::FuseMknod()");
 
-    if (parent >= INodeManager->getNumberOfINodes()) {
+    INode *parentInode = GetINode(parent);
+    if (parentInode == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *parentInode = INodeManager->getINodeByINodeNumber(parent);
-
-    // You can only make something inside a directory
     Directory *parentDir_p = dynamic_cast<Directory *>(parentInode);
     if (parentDir_p == nullptr) {
         fuse_reply_err(req, ENOTDIR);
         return;
     }
-
-    string tmp_string = string(name);
-    if (tmp_string.length() > kMaxFilenameLength) {
-        fuse_reply_err(req, ENAMETOOLONG);
+    const int nameError = ValidateName(name);
+    if (nameError != 0) {
+        fuse_reply_err(req, nameError);
         return;
     }
-    if (parentDir_p->ChildINodeNumberWithName(tmp_string) != static_cast<fuse_ino_t>(-1)) {
-        fuse_reply_err(req, EEXIST);
-        return;
-    }
-
-    // TODO: Handle permissions on dirs. You can't just create anything you please!:
-    //    else if ((fi->flags & 3) != O_RDONLY)
-    //        fuse_reply_err(req, EACCES);
-
-    const struct fuse_ctx* ctx_p = fuse_req_ctx(req);
-
-    INodeType inode_type;
-    nlink_t nlink = 0;
-    if (S_ISDIR(mode)) {
-        //inode_p = new Directory();
-        inode_type = DIRECTORY;
-        nlink = 2;
-        mode = S_IFDIR;
-
-        // Update the number of hardlinks in the parent dir
-        parentDir_p->AddHardLink();
-    } else if (S_ISREG(mode)) {
-        //inode_p = new File();
-        inode_type = REGULAR_FILE;
-        nlink = 1;
-        mode = S_IFREG;
-    } else {
-        // TODO: Handle
-        // S_ISBLK
-        // S_ISCHR
-        // S_ISDIR
-        // S_ISFIFO
-        // S_ISREG
-        // S_ISLNK
-        // S_ISSOCK
-        // ...instead of returning this error.
-        fuse_reply_err(req, ENOENT);
-        return;
-    }
-
-    fuse_ino_t ino = RegisterINode(inode_type, mode, nlink, ctx_p->uid, ctx_p->gid);
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-
-    // TODO: Handle: S_ISCHR S_ISBLK S_ISFIFO S_ISLNK S_ISSOCK S_TYPEISMQ S_TYPEISSEM S_TYPEISSHM
-    assert(inode_p != nullptr);
-
-    // Insert the inode into the directory. TODO: What if it already exists?
-    parentDir_p->UpdateChild(string(name), ino);
-
-    // TODO: Is reply_entry only for directories? What about files?
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tmknod for " << ino << ". nlookup++");
-    inode_p->Lookup();
-    fuse_reply_entry(req, &(inode_p->m_fuseEntryParam));
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Making node -> FuseRamFs::FuseMknod() completed!");
-}
-
-void FileSystem::FuseMkdir(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Making directory '" << name << "'-> FuseRamFs::FuseMkdir()");
-
-    if (parent >= INodeManager->getNumberOfINodes()) {
-        fuse_reply_err(req, ENOENT);
-        return;
-    }
-
-    INode *parentInode = INodeManager->getINodeByINodeNumber(parent);
-
-    // You can only make something inside a directory
-    Directory *parentDir_p = dynamic_cast<Directory *>(parentInode);
-    if (parentDir_p == nullptr) {
-        fuse_reply_err(req, ENOTDIR);
-        return;
-    }
-
     if (parentDir_p->ChildINodeNumberWithName(string(name)) != static_cast<fuse_ino_t>(-1)) {
         fuse_reply_err(req, EEXIST);
         return;
     }
-
-    // TODO: Handle permissions on dirs. You can't just create anything you please!:
-    //    else if ((fi->flags & 3) != O_RDONLY)
-    //        fuse_reply_err(req, EACCES);
-
-    const struct fuse_ctx* ctx_p = fuse_req_ctx(req);
-    fuse_ino_t ino = RegisterINode(DIRECTORY, S_IFDIR | (mode & 0777), 2, ctx_p->gid, ctx_p->uid);
-    Directory *dir_p = dynamic_cast<Directory *>(INodeManager->getINodeByINodeNumber(ino));
-
-    // Insert the inode into the directory. TODO: What if it already exists?
-    parentDir_p->UpdateChild(string(name), ino);
-
-    // Update the number of hardlinks in the parent dir
-    parentDir_p->AddHardLink();
-
-    // Set parent dir to new dir
-    dir_p->setParent(parentDir_p);
-
-    // Set dir name
-    string dirName = parentDir_p->getDirName() + name + "/";
-    dir_p->setDirName(dirName.c_str());
-    LOG4CPLUS_INFO(FSLogger, FSLogger.getName() << "Absolute path of new directory: '" << dir_p->getDirName() << "'");
-
-    // TODO: Is reply_entry only for directories? What about files?
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tmkdir for " << ino << ". nlookup++");
-    dir_p->Lookup();
-    fuse_reply_entry(req, &(dir_p->m_fuseEntryParam));
-
-    if (!createDirFromThread) {
-        RequestSender::sendCreateDirectoryRequest(dir_p->getDirName(), mpiRank, mpiWorldSize);
-    }
-    createDirFromThread = false;
-
-
-    /*
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tAll child of parentDir: " << parentDir_p);
-    for (auto child: parentDir_p->Children()) {
-        LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tname='"<<child.first<<"',ino="<< child.second);
-    }
-    */
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Making directory -> FuseRamFs::FuseMkdir() completed!");
-}
-
-/**
- * Unlink a given i-node. If the given i-node reaches 0 hard links, is marked as deleted i-node.
- * The reference in the parent directory it's eliminated anyways.
- */
-void FileSystem::FuseUnlink(fuse_req_t req, fuse_ino_t parent, const char* name) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Unlinking inode-> FuseRamFs::FuseUnlink()");
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tunlink per: " << name << " nella directory padre: " << parent);
-
-    // TODO: Node may also be deleted.
-    if (parent >= INodeManager->getNumberOfINodes()) {
-        fuse_reply_err(req, ENOENT);
-        return;
-    }
-
-    INode *parentInode = INodeManager->getINodeByINodeNumber(parent);
-
-    // You can only delete something inside a directory
-    Directory *parentDir_p = dynamic_cast<Directory *>(parentInode);
-    if (parentDir_p == nullptr) {
-        fuse_reply_err(req, EISDIR);
-        return;
-    }
-
-    // TODO: Handle permissions on dirs. You can't just delete anything you please!:
-    //    else if ((fi->flags & 3) != O_RDONLY)
-    //        fuse_reply_err(req, EACCES);
-
-    // Return an error if the child doesn't exist.
-    fuse_ino_t ino = parentDir_p->ChildINodeNumberWithName(string(name));
-    if (ino == -1) {
-        fuse_reply_err(req, ENOENT);
-        return;
-    }
-
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-    // TODO: Any way we can fail here? What if the inode doesn't exist? That probably indicates
-    // a problem that happened earlier.
-
-    // Update the number of hardlinks in the target
-    inode_p->RemoveHardLink();
-    parentDir_p->DeleteChild(string(name));
-
-    // Reply with no error. TODO: Where is ESUCCESS?
-    fuse_reply_err(req, 0);
-
-    string fileName = parentDir_p->getDirName() + name;
-    LOG4CPLUS_DEBUG(FSLogger, FSLogger.getName() << "File to delete '"<<fileName<<"'");
-    if (!deleteFileFromThread) {
-        RequestSender::sendDeleteFileRequest(fileName, mpiRank, mpiWorldSize);
-    }
-    deleteFileFromThread = false;
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Unlinking inode-> FuseRamFs::FuseUnlink() completed!");
-}
-
-/**
- * Decrease to 0 the inode hard links count and delete the directory form the children list of the parent directory.
- */
-void FileSystem::FuseRmdir(fuse_req_t req, fuse_ino_t parent, const char *name) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Removing directory -> FuseRamFs::FuseRmdir");
-
-    if (parent >= INodeManager->getNumberOfINodes()) {
-        LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tparent >= INodes.size()");
-        fuse_reply_err(req, ENOENT);
-        return;
-    }
-
-    INode *parentInode = INodeManager->getINodeByINodeNumber(parent);
-
-    // You can only delete something inside a directory
-    Directory *parentDir_p = dynamic_cast<Directory *>(parentInode);
-    if (parentDir_p == nullptr) {
-        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() << "\tparentDir_p == nullptr");
-        fuse_reply_err(req, EISDIR);
-        return;
-    }
-
-    // TODO: Handle permissions on dirs. You can't just delete anything you please!:
-    //    else if ((fi->flags & 3) != O_RDONLY)
-    //        fuse_reply_err(req, EACCES);
-
-    // Return an error if the child doesn't exist.
-    fuse_ino_t ino = parentDir_p->ChildINodeNumberWithName(string(name));
-    if (ino == -1) {
-        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() << "\tino == -1");
-        fuse_reply_err(req, ENOENT);
-        return;
-    }
-
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-    // TODO: Any way we can fail here? What if the inode doesn't exist? That probably indicates
-    // a problem that happened earlier.
-
-    Directory *dir_p = dynamic_cast<Directory *>(inode_p);
-    if (dir_p == nullptr) {
-        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() << "\tdir_p == nullptr");
-        // Someone tried to rmdir on something that wasn't a directory.
-        fuse_reply_err(req, EISDIR);
-        return;
-    }
-
-    // Remove the directory only if is empty
-    if (dir_p->hasChildren()) {
-        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() << "\tDirectory contains children");
+    // Only regular files are stored; devices, FIFOs and sockets are not supported.
+    if (!S_ISREG(mode)) {
         fuse_reply_err(req, EPERM);
         return;
     }
+#ifdef DAGONFS_P2P
+    // Peers replay a mknod as an exclusive create of the same path.
+    const string fileName = parentDir_p->getDirName() + name;
+    if (fileName.size() >= kMaxPathLength) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
+#endif
+    const struct fuse_ctx* ctx_p = fuse_req_ctx(req);
+    fuse_ino_t ino = RegisterINode(REGULAR_FILE, S_IFREG | (mode & 07777), 1, ctx_p->gid, ctx_p->uid);
+    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
 
-    // Update the number of hardlinks in the parent dir
+    parentDir_p->UpdateChild(string(name), ino);
+    Touch(parentDir_p, true);
+#ifdef DAGONFS_P2P
+    const uint64_t globalId = AssignGlobalId(dynamic_cast<File *>(inode_p), ino, false);
+#endif
+
+    inode_p->Lookup();
+    fuse_reply_entry(req, &(inode_p->m_fuseEntryParam));
+#ifdef DAGONFS_P2P
+    RequestSender::sendCreateFileRequest(fileName, globalId, mpiRank, mpiWorldSize);
+#endif
+}
+
+void FileSystem::FuseMkdir(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode) {
+#ifdef DAGONFS_P2P
+    // Consume the replay flag first so that an early error cannot leak it
+    // into the next, locally originated, operation.
+    const bool replay = consume(createDirFromThread);
+#endif
+    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Making directory '" << name << "' -> FuseRamFs::FuseMkdir()");
+
+    INode *parentInode = GetINode(parent);
+    if (parentInode == nullptr) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+    Directory *parentDir_p = dynamic_cast<Directory *>(parentInode);
+    if (parentDir_p == nullptr) {
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+    const int nameError = ValidateName(name);
+    if (nameError != 0) {
+        fuse_reply_err(req, nameError);
+        return;
+    }
+    if (parentDir_p->ChildINodeNumberWithName(string(name)) != static_cast<fuse_ino_t>(-1)) {
+        fuse_reply_err(req, EEXIST);
+        return;
+    }
+    const string dirName = parentDir_p->getDirName() + name + "/";
+#ifdef DAGONFS_P2P
+    if (!replay && dirName.size() >= kMaxPathLength) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
+#endif
+
+    const struct fuse_ctx* ctx_p = fuse_req_ctx(req);
+    fuse_ino_t ino = RegisterINode(DIRECTORY, S_IFDIR | (mode & 07777), 2, ctx_p->gid, ctx_p->uid);
+    Directory *dir_p = dynamic_cast<Directory *>(INodeManager->getINodeByINodeNumber(ino));
+    dir_p->setParent(parentDir_p);
+    dir_p->setDirName(dirName.c_str());
+
+    parentDir_p->UpdateChild(string(name), ino);
+    parentDir_p->AddHardLink();
+    Touch(parentDir_p, true);
+
+    dir_p->Lookup();
+    fuse_reply_entry(req, &(dir_p->m_fuseEntryParam));
+
+#ifdef DAGONFS_P2P
+    if (!replay) {
+        RequestSender::sendCreateDirectoryRequest(dirName, mpiRank, mpiWorldSize);
+    }
+#endif
+}
+
+/**
+ * Remove a name. The inode data are released once no hard link and no open
+ * descriptor refers to it.
+ */
+void FileSystem::FuseUnlink(fuse_req_t req, fuse_ino_t parent, const char* name) {
+#ifdef DAGONFS_P2P
+    // Consume the replay flag first so that an early error cannot leak it
+    // into the next, locally originated, operation.
+    const bool replay = consume(deleteFileFromThread);
+#endif
+    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tunlink " << name << " in " << parent);
+
+    INode *parentInode = GetINode(parent);
+    if (parentInode == nullptr) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+    Directory *parentDir_p = dynamic_cast<Directory *>(parentInode);
+    if (parentDir_p == nullptr) {
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+
+    fuse_ino_t ino = parentDir_p->ChildINodeNumberWithName(string(name));
+    INode *inode_p = ino == static_cast<fuse_ino_t>(-1) ? nullptr : GetINode(ino);
+    if (inode_p == nullptr) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+    if (isDirectory(inode_p)) {
+        fuse_reply_err(req, EISDIR);
+        return;
+    }
+#ifdef DAGONFS_P2P
+    const string fileName = parentDir_p->getDirName() + name;
+#endif
+
+    parentDir_p->DeleteChild(string(name));
+    Touch(parentDir_p, true);
+    DropLink(inode_p, ino);
+
+    fuse_reply_err(req, 0);
+
+#ifdef DAGONFS_P2P
+    if (!replay) {
+        RequestSender::sendDeleteFileRequest(fileName, mpiRank, mpiWorldSize);
+    }
+#endif
+}
+
+/**
+ * Remove an empty directory.
+ */
+void FileSystem::FuseRmdir(fuse_req_t req, fuse_ino_t parent, const char *name) {
+#ifdef DAGONFS_P2P
+    // Consume the replay flag first so that an early error cannot leak it
+    // into the next, locally originated, operation.
+    const bool replay = consume(deleteDirFromThread);
+#endif
+    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Removing directory -> FuseRamFs::FuseRmdir");
+
+    INode *parentInode = GetINode(parent);
+    if (parentInode == nullptr) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+    Directory *parentDir_p = dynamic_cast<Directory *>(parentInode);
+    if (parentDir_p == nullptr) {
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+
+    fuse_ino_t ino = parentDir_p->ChildINodeNumberWithName(string(name));
+    INode *inode_p = ino == static_cast<fuse_ino_t>(-1) ? nullptr : GetINode(ino);
+    if (inode_p == nullptr) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+    Directory *dir_p = dynamic_cast<Directory *>(inode_p);
+    if (dir_p == nullptr) {
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+    if (dir_p->hasChildren()) {
+        fuse_reply_err(req, ENOTEMPTY);
+        return;
+    }
+#ifdef DAGONFS_P2P
+    const string dirName = dir_p->getDirName();
+#endif
+
+    // The removed directory's ".." no longer links the parent.
     parentDir_p->RemoveHardLink();
-
-    // Remove the hard links to this dir so it can be cleaned up later
-    // TODO: What if there's a real hardlink to this dir? Hardlinks to dirs allowed?
     while (!dir_p->HasNoLinks()) {
         dir_p->RemoveHardLink();
     }
-
     parentDir_p->DeleteChild(string(name));
+    Touch(parentDir_p, true);
 
-    // Reply with no error. TODO: Where is ESUCCESS?
     fuse_reply_err(req, 0);
 
-    string dirName = dir_p->getDirName();
-    if (!deleteDirFromThread) {
+#ifdef DAGONFS_P2P
+    if (!replay) {
         RequestSender::sendDeleteDirectoryRequest(dirName, mpiRank, mpiWorldSize);
     }
-    deleteDirFromThread = false;
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Removing directory -> FuseRamFs::FuseRmdir completed!");
+#endif
 }
 
 void FileSystem::FuseSymlink(fuse_req_t req, const char* link, fuse_ino_t parent, const char* name) {
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Creating symbolic link -> FuseRamFs::FuseSymlink");
-    if (parent >= INodeManager->getNumberOfINodes()) {
+    INode *parent_p = GetINode(parent);
+    if (parent_p == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *parent_p = INodeManager->getINodeByINodeNumber(parent);
-
-    // You can only make something inside a directory
     Directory *dir = dynamic_cast<Directory *>(parent_p);
     if (dir == nullptr) {
         fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+    const int nameError = ValidateName(name);
+    if (nameError != 0) {
+        fuse_reply_err(req, nameError);
+        return;
+    }
+    if (link == nullptr || strlen(link) >= kMaxPathLength) {
+        fuse_reply_err(req, ENAMETOOLONG);
         return;
     }
     if (dir->ChildINodeNumberWithName(string(name)) != static_cast<fuse_ino_t>(-1)) {
@@ -799,534 +1012,451 @@ void FileSystem::FuseSymlink(fuse_req_t req, const char* link, fuse_ino_t parent
         return;
     }
 
-    // TODO: Handle permissions on dirs. You can't just make symlinks anywhere:
-    //    else if ((fi->flags & 3) != O_RDONLY)
-    //        fuse_reply_err(req, EACCES);
-
     const struct fuse_ctx* ctx_p = fuse_req_ctx(req);
 
-    fuse_ino_t ino = RegisterINode(SYMBOLIC_LINK, S_IFLNK | 0755, 1, ctx_p->gid, ctx_p->uid);
+    fuse_ino_t ino = RegisterINode(SYMBOLIC_LINK, S_IFLNK | 0777, 1, ctx_p->gid, ctx_p->uid);
     SymbolicLink *symLink = dynamic_cast<SymbolicLink *>(INodeManager->getINodeByINodeNumber(ino));
     symLink->setLink(link);
-    INode *inode_p = symLink;
+    SetSize(symLink, strlen(link));
 
-    // Insert the inode into the directory. TODO: What if it already exists?
     dir->UpdateChild(string(name), ino);
+    Touch(dir, true);
 
-    // TODO: Is reply_entry only for directories? What about files?
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\tsymlink for " << ino << ". nlookup++");
-    inode_p->Lookup();
-    fuse_reply_entry(req,&(inode_p->m_fuseEntryParam));
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Creating symbolic link -> FuseRamFs::FuseSymlink completed!");
+    symLink->Lookup();
+    fuse_reply_entry(req, &(symLink->m_fuseEntryParam));
 }
 
+#ifdef DAGONFS_P2P
+string FileSystem::FindPath(fuse_ino_t target) {
+    // Breadth-first search from the root for any name of the target inode.
+    vector<Directory *> pending;
+    Directory *root = GetDirectory(FUSE_ROOT_ID);
+    if (root != nullptr) pending.push_back(root);
+    for (size_t index = 0; index < pending.size(); ++index) {
+        Directory *dir = pending[index];
+        for (const auto &[childName, childIno] : dir->Children()) {
+            if (childIno == target) {
+                return dir->getDirName() + childName;
+            }
+            Directory *child = GetDirectory(childIno);
+            if (child != nullptr) pending.push_back(child);
+        }
+    }
+    return string();
+}
+
+void FileSystem::UpdateDirectoryPaths(Directory *dir, Directory *parent, const string &path) {
+    dir->setParent(parent);
+    dir->setDirName(path.c_str());
+    for (const auto &[childName, childIno] : dir->Children()) {
+        Directory *child = GetDirectory(childIno);
+        if (child != nullptr) {
+            UpdateDirectoryPaths(child, dir, path + childName + "/");
+        }
+    }
+}
+#endif
+
 void FileSystem::FuseRename(fuse_req_t req, fuse_ino_t parent, const char* name, fuse_ino_t newparent, const char* newname, unsigned int flags) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Renaming new inode -> FuseRamFs::FuseRename()");
-    // Make sure the parent still exists.
-    if (parent >= INodeManager->getNumberOfINodes()) {
-        fuse_reply_err(req, ENOENT);
+#ifdef DAGONFS_P2P
+    // Consume the replay flag first so that an early error cannot leak it
+    // into the next, locally originated, operation.
+    const bool replay = consume(renameFromThread);
+#endif
+    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Renaming -> FuseRamFs::FuseRename()");
+
+    // Only RENAME_NOREPLACE is supported; RENAME_EXCHANGE and whiteouts are not.
+    if (flags & ~static_cast<unsigned int>(RENAME_NOREPLACE)) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    Directory *parentDir = GetDirectory(parent);
+    Directory *newParentDir = GetDirectory(newparent);
+    if (parentDir == nullptr || newParentDir == nullptr) {
+        fuse_reply_err(req, GetINode(parent) == nullptr || GetINode(newparent) == nullptr ? ENOENT : ENOTDIR);
+        return;
+    }
+    const int nameError = ValidateName(newname);
+    if (nameError != 0) {
+        fuse_reply_err(req, nameError);
         return;
     }
 
-    INode *parentInode = INodeManager->getINodeByINodeNumber(parent);
-
-    // You can only rename something inside a directory
-    Directory *parentDir = dynamic_cast<Directory *>(parentInode);
-    if (parentDir == nullptr) {
-        fuse_reply_err(req, EISDIR);
-        return;
-    }
-
-    // TODO: Handle permissions on dirs. You can't just rename anything you please!:
-    //    else if ((fi->flags & 3) != O_RDONLY)
-    //        fuse_reply_err(req, EACCES);
-
-    // Return an error if the child doesn't exist.
     fuse_ino_t ino = parentDir->ChildINodeNumberWithName(string(name));
-    if (ino == -1) {
+    INode *inode_p = ino == static_cast<fuse_ino_t>(-1) ? nullptr : GetINode(ino);
+    if (inode_p == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
+    const bool sourceIsDir = isDirectory(inode_p);
 
-    // Make sure the new parent still exists.
-    if (newparent >= INodeManager->getNumberOfINodes()) {
-        fuse_reply_err(req, ENOENT);
-        return;
-    }
-
-    INode *newParentInode = INodeManager->getINodeByINodeNumber(newparent);
-
-    // The new parent must be a directory. TODO: Do we need this check? Will FUSE
-    // ever give us a parent that isn't a dir? Test this.
-    Directory *newParentDir = dynamic_cast<Directory *>(newParentInode);
-    if (newParentDir == nullptr) {
-        fuse_reply_err(req, EISDIR);
-        return;
-    }
-
-    // Look for an existing child with the same name in the new parent
-    // directory
     fuse_ino_t existingIno = newParentDir->ChildINodeNumberWithName(string(newname));
-    // Type is unsigned so we have to explicitly check for largest value. TODO: Refactor please.
-    if (existingIno != -1 && existingIno > 0) {
-        // There's already a child with that name. Replace it.
-        // TODO: What about directories with the same name?
-        INode *existingInode_p = dynamic_cast<Directory *>(INodeManager->getINodeByINodeNumber(existingIno));
-        if (existingInode_p != nullptr) {
-            parentDir->RemoveHardLink();
-            LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tRemoving hard link to " << existingIno);
-            newParentDir->AddHardLink();
-            LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tAdding hard link to " << existingIno);
+    INode *existing = existingIno == static_cast<fuse_ino_t>(-1) ? nullptr : GetINode(existingIno);
+    if (existing != nullptr && (flags & RENAME_NOREPLACE)) {
+        fuse_reply_err(req, EEXIST);
+        return;
+    }
+    if (existingIno == ino) {
+        // Both names refer to the same inode: POSIX requires a successful no-op.
+        fuse_reply_err(req, 0);
+        return;
+    }
+    if (sourceIsDir) {
+        // A directory cannot be moved below itself.
+        for (Directory *ancestor = newParentDir; ancestor != nullptr; ancestor = ancestor->getParent()) {
+            if (ancestor == inode_p) {
+                fuse_reply_err(req, EINVAL);
+                return;
+            }
+        }
+    }
+    if (existing != nullptr) {
+        const bool targetIsDir = isDirectory(existing);
+        if (sourceIsDir && !targetIsDir) {
+            fuse_reply_err(req, ENOTDIR);
+            return;
+        }
+        if (!sourceIsDir && targetIsDir) {
+            fuse_reply_err(req, EISDIR);
+            return;
+        }
+        if (targetIsDir && dynamic_cast<Directory *>(existing)->hasChildren()) {
+            fuse_reply_err(req, ENOTEMPTY);
+            return;
         }
     }
 
-    // Update (or create) the new name and point it to the inode.
-    newParentDir->UpdateChild(string(newname), ino);
+#ifdef DAGONFS_P2P
+    const string oldName = parentDir->getDirName() + name;
+    const string newName = newParentDir->getDirName() + newname;
+    if (!replay && newName.size() + 1 >= kMaxPathLength) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
+#endif
 
-    // Mark the old name as unused. TODO: Should we just delete the old name?
+    if (existing != nullptr) {
+        newParentDir->DeleteChild(string(newname));
+        if (isDirectory(existing)) {
+            newParentDir->RemoveHardLink();
+            while (!existing->HasNoLinks()) {
+                existing->RemoveHardLink();
+            }
+        } else {
+            DropLink(existing, existingIno);
+        }
+    }
+    if (sourceIsDir && parentDir != newParentDir) {
+        // The moved directory's ".." now links the new parent.
+        parentDir->RemoveHardLink();
+        newParentDir->AddHardLink();
+    }
+
     parentDir->DeleteChild(string(name));
+    newParentDir->UpdateChild(string(newname), ino);
+    Touch(parentDir, true);
+    Touch(newParentDir, true);
+    Touch(inode_p, false);
 
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tRename " << name << " in " << parent << " to " << newname << " in " << newparent);
+#ifdef DAGONFS_P2P
+    if (sourceIsDir) {
+        UpdateDirectoryPaths(dynamic_cast<Directory *>(inode_p), newParentDir, newName + "/");
+    }
+#endif
+
     fuse_reply_err(req, 0);
 
-    if (!renameFromThread) {
-        string oldName = parentDir->getDirName()+name;
-        string newName = newParentDir->getDirName()+newname;
-        cout << oldName << endl;
-        cout << newName << endl;
+#ifdef DAGONFS_P2P
+    if (!replay) {
         RequestSender::sendRenameRequest(oldName, newName, mpiRank, mpiWorldSize);
     }
-    else renameFromThread = false;
-
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Renaming new inode -> FuseRamFs::FuseRename() completed!");
+#endif
 }
 
 void FileSystem::FuseLink(fuse_req_t req, fuse_ino_t ino, fuse_ino_t newparent, const char* newname) {
+#ifdef DAGONFS_P2P
+    // Consume the replay flag first so that an early error cannot leak it
+    // into the next, locally originated, operation.
+    const bool replay = consume(linkFromThread);
+#endif
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Creating hard link -> FuseRamFs::FuseLink");
 
-    // Make sure the new parent still exists.
-    if (newparent >= INodeManager->getNumberOfINodes()) {
+    INode *parentInode = GetINode(newparent);
+    if (parentInode == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *inode_p = INodeManager->getINodeByINodeNumber(newparent);
-
-    // The new parent must be a directory. TODO: Do we need this check? Will FUSE
-    // ever give us a parent that isn't a dir? Test this.
-    Directory *newParentDir_p = dynamic_cast<Directory *>(inode_p);
+    Directory *newParentDir_p = dynamic_cast<Directory *>(parentInode);
     if (newParentDir_p == nullptr) {
         fuse_reply_err(req, ENOTDIR);
         return;
     }
-
-    // Make target still exists.
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    INode *inode_p = GetINode(ino);
+    if (inode_p == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    inode_p = INodeManager->getINodeByINodeNumber(ino);
-
-    // Look for an existing child with the same name in the new parent
-    // directory
-    fuse_ino_t existingIno = newParentDir_p->ChildINodeNumberWithName(string(newname));
-    // Type is unsigned so we have to explicitly check for largest value. TODO: Refactor please.
-    if (existingIno != -1 && existingIno > 0) {
-        // There's already a child with that name. Return an error.
+    if (isDirectory(inode_p)) {
+        fuse_reply_err(req, EPERM);
+        return;
+    }
+    const int nameError = ValidateName(newname);
+    if (nameError != 0) {
+        fuse_reply_err(req, nameError);
+        return;
+    }
+    if (newParentDir_p->ChildINodeNumberWithName(string(newname)) != static_cast<fuse_ino_t>(-1)) {
         fuse_reply_err(req, EEXIST);
         return;
     }
-
-    // Create the new name and point it to the inode.
+#ifdef DAGONFS_P2P
+    string targetName;
+    const string newName = newParentDir_p->getDirName() + newname;
+    if (!replay) {
+        // Peers address files by path: resolve one existing name of the target.
+        targetName = FindPath(ino);
+        if (targetName.empty()) {
+            fuse_reply_err(req, ENOENT);
+            return;
+        }
+        if (targetName.size() >= kMaxPathLength || newName.size() >= kMaxPathLength) {
+            fuse_reply_err(req, ENAMETOOLONG);
+            return;
+        }
+    }
+#endif
     newParentDir_p->UpdateChild(string(newname), ino);
-
-    // Update the number of hardlinks in the target
     inode_p->AddHardLink();
+    Touch(inode_p, false);
+    Touch(newParentDir_p, true);
 
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tlink " << newname << " in " << newparent << " to " << ino);
     inode_p->Lookup();
     fuse_reply_entry(req, &(inode_p->m_fuseEntryParam));
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Creating hard link -> FuseRamFs::FuseLink completed");
+#ifdef DAGONFS_P2P
+    if (!replay) {
+        RequestSender::sendLinkRequest(targetName, newName, mpiRank, mpiWorldSize);
+    }
+#endif
 }
 
 void FileSystem::FuseOpen(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Opening file -> FuseRamFs::FuseOpen");
 
-    // TODO: Node may also be deleted.
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *inode = INodeManager->getINodeByINodeNumber(ino);
-
-    // You can't open a dir with 'open'. Check for this.
-    Directory *dir = dynamic_cast<Directory *>(inode);
-    if (dir != nullptr) {
+    if (isDirectory(inode)) {
         fuse_reply_err(req, EISDIR);
         return;
     }
-
     File *file_p = dynamic_cast<File *>(inode);
     if (file_p == nullptr) {
-        fuse_reply_err(req, EPERM);
+        fuse_reply_err(req, EINVAL);
         return;
     }
 
-    // TODO: Handle permissions on files:
-    //    else if ((fi->flags & 3) != O_RDONLY)
-    //        fuse_reply_err(req, EACCES);
-    if ( fi->flags & (O_WRONLY | O_TRUNC) ) {
+    if (fi->flags & O_TRUNC) {
+        // The previous content is discarded: no distributed read is needed.
+        if (file_p->m_fuseEntryParam.attr.st_size > 0 || file_p->m_storedSize > 0) {
+            file_p->setWaiting();
+        }
+        SetSize(file_p, 0);
+        if (file_p->m_buf != nullptr) {
+            memset(file_p->m_buf, 0, file_p->m_capacity);
+        }
+        Touch(file_p, true);
+    } else if (!LoadFileContent(file_p, ino)) {
+        fuse_reply_err(req, ENOMEM);
+        return;
+    }
+    if ((fi->flags & O_ACCMODE) != O_RDONLY) {
         startWriteTime = MPI_Wtime();
-        LOG4CPLUS_DEBUG(FSLogger, FSLogger.getName() << "\tFile opened in write only mode or with O_TRUNC mode, the content must be deleted");
-        file_p->m_fuseEntryParam.attr.st_size = 0;
-        file_p->m_fuseEntryParam.attr.st_blocks = 0;
     }
-    else {
-        LOG4CPLUS_DEBUG(FSLogger, FSLogger.getName() << "\tFile opened in read and write or a mode that not erase the file content, the content must be loaded");
-        RequestSender::sendReadRequest(mpiRank, mpiWorldSize);
-        //4KB
-        startReadTime = MPI_Wtime();
-        file_p->m_buf = distributedProcessCode->DAGonFS_Read(mpiRank, ino,
-                                                    file_p->m_fuseEntryParam.attr.st_size,
-                                                    file_p->m_fuseEntryParam.attr.st_size,
-                                                    0);
+    file_p->m_openCount++;
 
-        //
-    }
-    // TODO: We seem to be able to delete a file and copy it back without a new inode being created. The only evidence is the open call. How do we handle this?
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\topen for " << ino << ". with flags " << fi->flags);
-
+    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\topen for " << ino << " with flags " << fi->flags);
     fuse_reply_open(req, fi);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Opening file -> FuseRamFs::FuseOpen completed!");
-}
-
-void FileSystem::FuseFlush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Flushing file -> FuseRamFs::FuseFlush");
-
-    if (ino >= INodeManager->getNumberOfINodes()) {
-        fuse_reply_err(req, ENOENT);
-        return;
-    }
-
-    // TODO: Handle info in fi.
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tflush for " << ino);
-
-    File *file_p = dynamic_cast<File *>(INodeManager->getINodeByINodeNumber(ino));
-    string fileContent = "Timing for distributed operation on inode="+to_string(ino)+"\n";
-    if (file_p->m_buf != nullptr) {
-        if (file_p->isWaitingForWriting()) {
-            LOG4CPLUS_DEBUG(FSLogger, FSLogger.getName() << ino << " will flush with distributed write");
-            RequestSender::sendWriteRequest(mpiRank, mpiWorldSize);
-            distributedProcessCode->DAGonFS_Write(mpiRank, file_p->m_buf, ino, file_p->m_fuseEntryParam.attr.st_size);
-            endWriteTime = MPI_Wtime();
-            fileContent += "Total write time: "+to_string(endWriteTime - startWriteTime)+"\n";
-            fileContent += "Time for Scat-Gath in DAGonFS_Write: "+ to_string(distributedProcessCode->getDAGonFSWriteSGElapsedTime()) +"\n";
-            fileContent += "Time for entire DAGonFS_Write: "+ to_string(distributedProcessCode->getLastWriteTime()) +"\n";
-            file_p->removeWaiting();
-        }
-        else {
-            endReadTime = MPI_Wtime();
-            fileContent += "Total read time: "+to_string(endReadTime - startReadTime)+"s\n";
-            fileContent += "Time for Scat-Gath in DAGonFS_Read: "+ to_string(distributedProcessCode->getDAGonFSReadSGElapsedTime()) +"\n";
-            fileContent += "Time for entire DAGonFS_Read: "+ to_string(distributedProcessCode->getLastReadTime()) +"\n";
-        }
-        LOG4CPLUS_DEBUG(FSLogger, FSLogger.getName() << "Freeing file_p->m_buf");
-        free(file_p->m_buf);
-        file_p->m_buf = nullptr;
-    }
-
-
-    fuse_reply_err(req, 0);
-    fileContent += "\n";
-    fwrite(fileContent.c_str(),sizeof(char),fileContent.length(),timeFile);
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Flushing file -> FuseRamFs::FuseFlush completed!");
 }
 
 /**
- * Invoked when there's no other references to the given inode.
+ * Called on every close(2) of a descriptor: publish dirty content to the ranks.
+ */
+void FileSystem::FuseFlush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
+    (void) fi;
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+    File *file_p = dynamic_cast<File *>(inode);
+    if (file_p != nullptr) {
+        StoreFileContent(file_p, ino);
+    }
+    fuse_reply_err(req, 0);
+}
+
+/**
+ * Invoked when the last reference to an open file handle goes away.
  */
 void FileSystem::FuseRelease(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Releasing file -> FuseRamFs::FuseRelease completed!");
-
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    (void) fi;
+    INode *inode_p = GetINode(ino);
+    if (inode_p == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-
-    // You can't release a dir with 'close'. Check for this.
-    Directory *dir = dynamic_cast<Directory *>(inode_p);
-    if (dir != nullptr) {
-        fuse_reply_err(req, EISDIR);
+    File *file_p = dynamic_cast<File *>(inode_p);
+    if (file_p == nullptr) {
+        fuse_reply_err(req, isDirectory(inode_p) ? EISDIR : EINVAL);
         return;
     }
 
-    // TODO: Handle permissions on files:
-    //    else if ((fi->flags & 3) != O_RDONLY)
-    //        fuse_reply_err(req, EACCES);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\trelease for " << ino);
-
-    File *file_p = dynamic_cast<File *>(INodeManager->getINodeByINodeNumber(ino));
-    if (file_p != nullptr) {
-        if (file_p->m_buf != nullptr) {
-            LOG4CPLUS_DEBUG(FSLogger, FSLogger.getName() << "\tFreeing file_p->m_buf");
-            free(file_p->m_buf);
-            file_p->m_buf = nullptr;
+    if (file_p->m_openCount > 0) {
+        file_p->m_openCount--;
+    }
+    if (file_p->m_openCount == 0) {
+        if (file_p->HasNoLinks()) {
+            DiscardFileContent(file_p, ino);
+        } else {
+            StoreFileContent(file_p, ino);
+            file_p->releaseBuffer();
         }
     }
-
     fuse_reply_err(req, 0);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Releasing file -> FuseRamFs::FuseRelease completed!");
 }
 
-/**
- * Since the file system is in RAM, it's not necessary synchronize file content on HDD/SSD.
- */
 void FileSystem::FuseFsync(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info* fi) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Synchronizing file -> FuseRamFs::Fsync");
-
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    (void) datasync;
+    (void) fi;
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\tfysnc for " << ino);
+    File *file_p = dynamic_cast<File *>(inode);
+    if (file_p != nullptr) {
+        StoreFileContent(file_p, ino);
+    }
     fuse_reply_err(req, 0);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Synchronizing file -> FuseRamFs::Fsync completed");
 }
 
 void FileSystem::FuseOpenDir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Opening directory -> FuseRamFs::FuseOpenDir()");
-
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *inode = INodeManager->getINodeByINodeNumber(ino);
-
-    // You can't open a file with 'opendir'. Check for this.
-    File *file = dynamic_cast<File *>(inode);
-    if (file != nullptr) {
+    if (!isDirectory(inode)) {
         fuse_reply_err(req, ENOTDIR);
         return;
     }
-
-    // TODO: Handle permissions on files:
-    //    else if ((fi->flags & 3) != O_RDONLY)
-    //        fuse_reply_err(req, EACCES);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\topendir for " << ino);
     fuse_reply_open(req, fi);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Opening directory -> FuseRamFs::FuseOpenDir() completed!");
 }
 
 /**
- * Since the file system is in RAM, all directory entries will show in the first readdir() API call.
+ * Directory offsets are positions in the ordered child map: 1 and 2 follow
+ * "." and "..", child k is followed by offset k + 3. Offsets therefore stay
+ * valid across calls, survive concurrent insertions/removals (which POSIX
+ * allows to be reported or not) and never refer to heap memory.
  */
 void FileSystem::FuseReadDir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info* fi) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Reading directory -> FuseRamFs::FuseReadDir()");
-
     (void) fi;
 
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\treaddir for ");
-
-    size_t numInodes = INodeManager->getNumberOfINodes();
-    // TODO: Node may also be deleted.
-    if (ino >= numInodes) {
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *inode = INodeManager->getINodeByINodeNumber(ino);
     Directory *dir = dynamic_cast<Directory *>(inode);
     if (dir == nullptr) {
         fuse_reply_err(req, ENOTDIR);
         return;
     }
-
-    map<string, fuse_ino_t>::const_iterator *childIterator = (map<string, fuse_ino_t>::const_iterator *) off;
-
-    if (childIterator != nullptr && *childIterator == dir->Children().end()) {
-        LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tWas going to delete childIterator at " << (void *) childIterator << " pointing to " << (void *) &(**childIterator) << ". Let it leak instead");
-        //delete childIterator;
-        // This is the case where we've been called after we've sent all the children. End
-        // with an empty buffer.
-        fuse_reply_buf(req, NULL, 0);
+    if (off < 0) {
+        fuse_reply_err(req, EINVAL);
         return;
     }
 
-    // Loop through and put children into a buffer until we have either:
-    // a) exceeded the passed in size parameter, or
-    // b) filled the maximum number of children per response, or
-    // c) come to the end of the directory listing
-    //
-    // In the case of (a), we won't know if this is the case until we've
-    // added a child and exceeded the size. In that case, we need to back up.
-    // In the process, we may end up exceeding our buffer size for this
-    // resonse. In that case, increase the buffer size and add the child again.
-    //
-    // We must exercise care not to re-send children because one may have been
-    // added in the middle of our map of children while we were sending them.
-    // This is why we access the children with an iterator (instead of using
-    // some sort of index).
-
-    struct stat stbuf;
-    memset(&stbuf, 0, sizeof(stbuf));
-
-    // Pick the lesser of the max response size or our max size.
-    size_t bufSize = FileSystem::kReadDirBufSize < size ? FileSystem::kReadDirBufSize : size;
-    char *buf = (char *) malloc(bufSize);
-    if (buf == NULL) {
-        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() << "*** fatal error: cannot allocate memory");
-        cerr << "*** fatal error: cannot allocate memory" << endl;
-        abort();
-    }
-
-    // We'll assume that off is 0 when we start. This means that
-    // childIterator hasn't been newed up yet.
+    vector<char> buf(size);
     size_t bytesAdded = 0;
-    size_t entriesAdded = 0;
-    if (childIterator == nullptr) {
-        childIterator = new map<string, fuse_ino_t>::const_iterator(dir->Children().begin());
-        LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\twith new iterator at " << (void *) childIterator << " pointing to " << (void *) &(**childIterator));
+    off_t position = off;
+    struct stat stbuf{};
 
-        // Add . and .. - We'll assume that there's enough space in the buffer
-        // to do this.
-        stbuf.st_ino = ino;
-        bytesAdded += fuse_add_direntry(req,
-                                        buf + bytesAdded,
-                                        bufSize - bytesAdded,
-                                        ".",
-                                        &stbuf,
-                                        (off_t) childIterator);
-        bytesAdded += fuse_add_direntry(req,
-                                        buf + bytesAdded,
-                                        bufSize - bytesAdded,
-                                        "..",
-                                        &stbuf,
-                                        (off_t) childIterator);
-        entriesAdded +=2;
-    }
-
-    while (entriesAdded < FileSystem::kReadDirEntriesPerResponse &&
-           *childIterator != dir->Children().end()) {
-        stbuf.st_ino = (*childIterator)->second;
-        size_t oldSize = bytesAdded;
-        //Add the directory entry only if the i-node still exists and hasn't been eliminated
-        //inode = INodes[stbuf.st_ino];
-        //if (!inode->isDeleted()) {
-            // TODO: We don't look at sticky bits, etc. Revisit this in the future.
-            //        Inode &childInode = Inodes[stbuf.st_ino];
-            //        Directory *childDir = dynamic_cast<Directory *>(&childInode);
-            //        if (childDir == NULL) {
-            //            // This must be a file.
-            //            stbuf.st_mode
-            //        }
-            bytesAdded += fuse_add_direntry(req,
-                                        buf + bytesAdded,
-                                        bufSize - bytesAdded,
-                                        (*childIterator)->first.c_str(),
-                                        &stbuf,
-                                        (off_t) childIterator);
-        //}
-        if (bytesAdded > bufSize) {
-            // Oops. There wasn't enough space for that last item. Back up and exit.
-            --(*childIterator);
-            LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\t. backed iterator at " << (void *) childIterator << " to point to " << (void *) &(**childIterator));
-            bytesAdded = oldSize;
-            break;
+    auto add = [&](const char *entryName, fuse_ino_t entryIno, mode_t mode) {
+        stbuf.st_ino = entryIno;
+        stbuf.st_mode = mode;
+        const size_t needed = fuse_add_direntry(req, buf.data() + bytesAdded, size - bytesAdded, entryName, &stbuf, position + 1);
+        if (needed > size - bytesAdded) {
+            return false;
         }
-        else {
-            ++(*childIterator);
-            LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\t. advanced iterator at " << (void *) childIterator << " to point to " << (void *) &(**childIterator));
-            ++entriesAdded;
+        bytesAdded += needed;
+        ++position;
+        return true;
+    };
+
+    if (position == 0 && !add(".", ino, S_IFDIR)) {
+        fuse_reply_buf(req, buf.data(), bytesAdded);
+        return;
+    }
+    if (position == 1) {
+        Directory *parentDir = dir->getParent();
+        const fuse_ino_t parentIno = parentDir == nullptr ? ino : parentDir->inodeNumber;
+        if (!add("..", parentIno, S_IFDIR)) {
+            fuse_reply_buf(req, buf.data(), bytesAdded);
+            return;
         }
     }
 
-    fuse_reply_buf(req, buf, bytesAdded);
-    if (buf) free(buf);
+    auto &children = dir->Children();
+    const size_t skip = static_cast<size_t>(position - 2);
+    if (skip < children.size()) {
+        auto child = children.begin();
+        std::advance(child, skip);
+        for (; child != children.end(); ++child) {
+            INode *childInode = GetINode(child->second);
+            const mode_t mode = childInode == nullptr ? 0 : (childInode->m_fuseEntryParam.attr.st_mode & S_IFMT);
+            if (!add(child->first.c_str(), child->second, mode)) {
+                break;
+            }
+        }
+    }
 
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Reading directory -> FuseRamFs::FuseReadDir() completed!");
+    fuse_reply_buf(req, bytesAdded == 0 ? nullptr : buf.data(), bytesAdded);
 }
 
-/**
- * Invoked for every opendir() call.
- */
 void FileSystem::FuseReleaseDir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Closing directory -> FuseRamFs::ReleaseDir");
-
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    (void) fi;
+    INode *inode = GetINode(ino);
+    if (inode == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *inode = INodeManager->getINodeByINodeNumber(ino);
-
-    // You can't close a file with 'closedir'. Check for this.
-    File *file = dynamic_cast<File *>(inode);
-    if (file != nullptr) {
+    if (!isDirectory(inode)) {
         fuse_reply_err(req, ENOTDIR);
         return;
     }
-
-    // TODO: Handle permissions on files:
-    //    else if ((fi->flags & 3) != O_RDONLY)
-    //        fuse_reply_err(req, EACCES);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\treleasedir for " << ino);
     fuse_reply_err(req, 0);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Closing directory -> FuseRamFs::ReleaseDir completed!");
 }
 
 /**
  * Since the file system is in RAM, it's not necessary synchronize directory content on HDD/SSD.
  */
 void FileSystem::FuseFsyncDir(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info* fi) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Synchronizing directory -> FuseRamFs::FuseFsyncDir");
-
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    (void) datasync;
+    (void) fi;
+    if (GetINode(ino) == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\tfysncdir for " << ino);
     fuse_reply_err(req, 0);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Synchronizing directory -> FuseRamFs::FuseFsyncDir completed");
 }
 
-/**
- * Get the file system information by filling the statvfs data structure (it is a member funciont of this class)
- */
 void FileSystem::FuseStatfs(fuse_req_t req, fuse_ino_t ino) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Getting FS information -> FuseRam::FuseStatfs");
-    // TODO: Why were we given an inode? What do we do with it?
-    //    if (ino >= Inodes.size()) {
-    //        fuse_reply_err(req, ENOENT);
-    //        return;
-    //    }
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\tstatfs for " << ino);
-
+    (void) ino;
     fuse_reply_statfs(req, &m_stbuf);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Getting FS information -> FuseRamFs::FuseStatfs completed");
 }
-
 
 #ifdef __APPLE__
 void FileSystem::FuseSetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value, size_t size, int flags, uint32_t position)
@@ -1334,25 +1464,19 @@ void FileSystem::FuseSetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 void FileSystem::FuseSetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value, size_t size, int flags)
 #endif
 {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Setting " << name << "attribute with value " << value <<" -> FuseRamFs::FuseSetXAttr");
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    INode *inode_p = GetINode(ino);
+    if (inode_p == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-
-    #ifndef __APPLE__
-    uint32_t position = 0;
-    #endif
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\tsetxattr for " << ino);
-
-    int ret_val = inode_p->SetXAttr(string(name), value, size, flags, position);
-
+#ifndef __APPLE__
+    const uint32_t position = 0;
+#endif
+    const int ret_val = inode_p->SetXAttr(string(name), value, size, flags, position);
+    if (ret_val == 0) {
+        Touch(inode_p, false);
+    }
     fuse_reply_err(req, ret_val);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Setting " << name << "attribute with value " << value <<" -> FuseRamFs::FuseSetXAttr completed");
 }
 
 #ifdef __APPLE__
@@ -1361,433 +1485,276 @@ void FileSystem::FuseGetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, 
 void FileSystem::FuseGetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t size)
 #endif
 {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Getting " << name << "attribute -> FuseRamFs::FuseSetXAttr");
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    INode *inode_p = GetINode(ino);
+    if (inode_p == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
+#ifndef __APPLE__
+    const uint32_t position = 0;
+#endif
 
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-
-    #ifndef __APPLE__
-    uint32_t position = 0;
-    #endif
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\tgetxattr for " << ino);
-    map<string, pair<void *, size_t> > xattrs = inode_p->GetXAttr();
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\tGetting "<< name << "attribute -> INode::GetXAttrAndReply");
-
-    if (xattrs.find(name) == xattrs.end()) {
-        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() <<  "xattr named '"<< name << "' not found");
-        #ifdef __APPLE__
+    auto &xattrs = inode_p->GetXAttr();
+    const auto attribute = xattrs.find(name);
+    if (attribute == xattrs.end()) {
+#ifdef __APPLE__
         fuse_reply_err(req, ENOATTR);
-        #else
+#else
         fuse_reply_err(req, ENODATA);
-        #endif
+#endif
         return;
     }
-
-    // The requestor wanted the size. TODO: How does position figure into this?
-    if (size == 0) {
-        fuse_reply_xattr(req, xattrs[name].second);
-        return;
-    }
-
-    // TODO: What about overflow with size + position?
-    size_t newExtent = size + position;
-
-    // TODO: Is this the case where "the size is to small for the value"?
-    if (xattrs[name].second < newExtent) {
+    const size_t valueSize = attribute->second.second;
+    if (position > valueSize) {
         fuse_reply_err(req, ERANGE);
         return;
     }
+    const size_t available = valueSize - position;
 
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tGetting "<< name << "attribute -> INode::GetXAttrAndReply completed!");
-
-    // TODO: It's fine for someone to just read part of a value, right (i.e. size is less than m_xattr[name].second)?
-    fuse_reply_buf(req, (char *) xattrs[name].first + position, size);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Getting " << name << "attribute -> FuseRamFs::FuseSetXAttr completed");
+    // A zero size asks for the length of the value.
+    if (size == 0) {
+        fuse_reply_xattr(req, available);
+        return;
+    }
+    // The caller's buffer must be able to hold the whole value.
+    if (size < available) {
+        fuse_reply_err(req, ERANGE);
+        return;
+    }
+    fuse_reply_buf(req, static_cast<const char *>(attribute->second.first) + position, available);
 }
 
 void FileSystem::FuseListXAttr(fuse_req_t req, fuse_ino_t ino, size_t size) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Listing attributes -> FuseRamFs::FuseListXAttr");
-
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    INode *inode_p = GetINode(ino);
+    if (inode_p == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
 
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\tlistxattr for " << ino);
-    map<string, pair<void *, size_t> > xattrs = inode_p->GetXAttr();
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tListing attributes -> INode::ListXAttrAndReply");
+    auto &xattrs = inode_p->GetXAttr();
     size_t listSize = 0;
-    for(map<string, pair<void *, size_t> >::iterator it = xattrs.begin(); it != xattrs.end(); it++) {
-        listSize += (it->first.size() + 1);
+    for (const auto &attribute : xattrs) {
+        listSize += attribute.first.size() + 1;
     }
 
-    // The requestor wanted the size
+    // A zero size asks for the length of the list.
     if (size == 0) {
         fuse_reply_xattr(req, listSize);
+        return;
     }
-
-    // "If the size is too small for the list, the ERANGE error should be sent"
     if (size < listSize) {
         fuse_reply_err(req, ERANGE);
-        return ; //A
+        return;
     }
 
-    // TODO: Is EIO really the best error to return if we ran out of memory?
-    void *buf = malloc(listSize);
-    if (buf == NULL) {
-        fuse_reply_err(req, EIO);
-        return ; //A
+    string names;
+    names.reserve(listSize);
+    for (const auto &attribute : xattrs) {
+        names.append(attribute.first);
+        names.push_back('\0');
     }
-
-    size_t position = 0;
-    for(map<string, pair<void *, size_t> >::iterator it = xattrs.begin(); it != xattrs.end(); it++) {
-        // Copy the name as well as the null termination character.
-        memcpy((char *) buf + position, it->first.c_str(), it->first.size() + 1);
-        position += (it->first.size() + 1);
-    }
-
-    fuse_reply_buf(req, (char *) buf, position);
-    if (buf) free(buf);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tListing attributes -> INode::ListXAttrAndReply completed!");
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Listing attributes -> FuseRamFs::FuseListXAttr completed!");
+    fuse_reply_buf(req, names.data(), names.size());
 }
 
 void FileSystem::FuseRemoveXAttr(fuse_req_t req, fuse_ino_t ino, const char* name) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Removing " << name << "attribute -> FuseRamFs::FuseRemoveXAttr");
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    INode *inode_p = GetINode(ino);
+    if (inode_p == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tremovexattr for " << ino);
-    int ret_val = inode_p->RemoveXAttr(string(name));
-
-    fuse_reply_err(req,ret_val);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Removing " << name << "attribute -> FuseRamFs::FuseRemoveXAttr completed!");
+    const int ret_val = inode_p->RemoveXAttr(string(name));
+    if (ret_val == 0) {
+        Touch(inode_p, false);
+    }
+    fuse_reply_err(req, ret_val);
 }
 
 void FileSystem::FuseAccess(fuse_req_t req, fuse_ino_t ino, int mask) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Accessing -> FuseRamFs::FuseAccess");
-
-    if (ino >= INodeManager->getNumberOfINodes()) {
-        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() <<  "\tino >= size");
-        fuse_reply_err(req, ENOENT);
-        return;
-    }
-
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-
-    if (inode_p->isDeleted()) {
-        LOG4CPLUS_ERROR(FSLogger, FSLogger.getName() << "Deleted inode");
+    INode *inode_p = GetINode(ino);
+    if (inode_p == nullptr || inode_p->isDeleted()) {
         fuse_reply_err(req, ENOENT);
         return;
     }
 
     const struct fuse_ctx* ctx_p = fuse_req_ctx(req);
+    const struct stat &attr = inode_p->m_fuseEntryParam.attr;
 
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\taccess for " << ino);
-
-    // If all the user wanted was to know if the file existed, it does.
-    if (mask == F_OK) {
+    if (mask == F_OK || ctx_p->uid == 0) {
         fuse_reply_err(req, 0);
         return;
     }
 
-    // Check other
-    if ((inode_p->m_fuseEntryParam.attr.st_mode & mask) == mask) {
-        fuse_reply_err(req,0);
-        return;
+    // Select the owner, group or other permission triplet, as the kernel does.
+    mode_t granted;
+    if (ctx_p->uid == attr.st_uid) {
+        granted = (attr.st_mode >> 6) & 07;
+    } else if (ctx_p->gid == attr.st_gid) {
+        granted = (attr.st_mode >> 3) & 07;
+    } else {
+        granted = attr.st_mode & 07;
     }
-    mask <<= 3;
-
-    // Check group. TODO: What about other groups the user is in?
-    if ((inode_p->m_fuseEntryParam.attr.st_mode & mask) == mask) {
-        // Go ahead if the user's main group is the same as the file's
-        if (ctx_p->gid == inode_p->m_fuseEntryParam.attr.st_gid) {
-            fuse_reply_err(req,0);
-            return;
-        }
-
-        // Now check the user's other groups. TODO: Where is this function?! not on this version of FUSE?
-        // int numGroups = fuse_req_getgroups(req, 0, NULL);
-
-    }
-    mask <<= 3;
-
-    // Check owner.
-    if ((ctx_p->uid == inode_p->m_fuseEntryParam.attr.st_uid) && (inode_p->m_fuseEntryParam.attr.st_mode & mask) == mask) {
-        fuse_reply_err(req,0);
-        return;
-    }
-
-    fuse_reply_err(req, EACCES);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Accessing -> FuseRamFs::FuseAccess completed!");
+    fuse_reply_err(req, (granted & mask) == static_cast<mode_t>(mask) ? 0 : EACCES);
 }
 
 void FileSystem::FuseCreate(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode, struct fuse_file_info* fi) {
+#ifdef DAGONFS_P2P
+    // Consume the replay flag first so that an early error cannot leak it
+    // into the next, locally originated, operation.
+    const bool replay = consume(createFileFromThread);
+#endif
     LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Creating " << name << " -> FuseRamFs::FuseCreate");
 
-    if (parent >= INodeManager->getNumberOfINodes()) {
+    INode *parent_p = GetINode(parent);
+    if (parent_p == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *parent_p = INodeManager->getINodeByINodeNumber(parent);
     Directory *parentDir_p = dynamic_cast<Directory *>(parent_p);
     if (parentDir_p == nullptr) {
-        // The parent wasn't a directory. It can't have any children.
-        fuse_reply_err(req, ENOENT);
+        fuse_reply_err(req, ENOTDIR);
         return;
     }
-
-    string tmp_string = string(name);
-    if (tmp_string.length() > kMaxFilenameLength) {
-        fuse_reply_err(req, ENAMETOOLONG);
+    const int nameError = ValidateName(name);
+    if (nameError != 0) {
+        fuse_reply_err(req, nameError);
         return;
     }
-    if (parentDir_p->ChildINodeNumberWithName(tmp_string) != static_cast<fuse_ino_t>(-1)) {
+    if (parentDir_p->ChildINodeNumberWithName(string(name)) != static_cast<fuse_ino_t>(-1)) {
         fuse_reply_err(req, EEXIST);
         return;
     }
+#ifdef DAGONFS_P2P
+    const string fileName = parentDir_p->getDirName() + name;
+    if (!replay && fileName.size() >= kMaxPathLength) {
+        fuse_reply_err(req, ENAMETOOLONG);
+        return;
+    }
+#endif
 
     const struct fuse_ctx* ctx_p = fuse_req_ctx(req);
+    fuse_ino_t ino = RegisterINode(REGULAR_FILE, S_IFREG | (mode & 07777), 1, ctx_p->gid, ctx_p->uid);
+    File *file_p = dynamic_cast<File *>(INodeManager->getINodeByINodeNumber(ino));
 
-    // TODO: It looks like, according to the documentation, that this will never be called to
-    // make a dir--only a file. Test to make sure this is true.
-    fuse_ino_t ino = RegisterINode(REGULAR_FILE, S_IFREG | (mode & 0777), 1, ctx_p->gid, ctx_p->uid);
-    BlocksManager->createEmptyBlockListForInode(ino);
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-
-    // Insert the inode into the directory. TODO: What if it already exists?
     parentDir_p->UpdateChild(string(name), ino);
+    Touch(parentDir_p, true);
+#ifdef DAGONFS_P2P
+    const uint64_t globalId = AssignGlobalId(file_p, ino, replay);
+#endif
 
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "\tcreate for " << ino << " with name " << name << " in " << parent);
-    inode_p->Lookup();
-    if ( fi->flags & (O_WRONLY | O_TRUNC) ) {
-        LOG4CPLUS_DEBUG(FSLogger, FSLogger.getName() << " File created with O_WRONLY | O_TRUNC");
+    if ((fi->flags & O_ACCMODE) != O_RDONLY) {
         startWriteTime = MPI_Wtime();
-        File *file_p = dynamic_cast<File *>(inode_p);
-        if (file_p != nullptr) {
-            file_p->m_fuseEntryParam.attr.st_size = 0;
-            file_p->m_fuseEntryParam.attr.st_blocks = 0;
-        }
     }
-    /*
-    cout << fi->cache_readdir <<endl;
-    cout << fi->direct_io <<endl;
-    cout << fi->fh <<endl;
-    cout << fi->flags <<endl;
-    cout << fi->flock_release <<endl;
-    cout << fi->flush <<endl;
-    cout << fi->keep_cache <<endl;
-    cout << fi->lock_owner <<endl;
-    cout << fi->noflush <<endl;
-    cout << fi->nonseekable <<endl;
-    cout << fi->padding <<endl;
-    cout << fi->padding2 <<endl;
-    cout << fi->parallel_direct_writes <<endl;
-    cout << fi->poll_events <<endl;
-    cout << fi->writepage <<endl;
-    */
-    LOG4CPLUS_DEBUG(FSLogger, FSLogger.getName() << " E' QUI CHE MI BLOCCO?");
-    fuse_reply_create(req, &(inode_p->m_fuseEntryParam), fi);
-    LOG4CPLUS_DEBUG(FSLogger, FSLogger.getName() << " NO SUPERATO");
+    file_p->m_openCount++;
+    file_p->Lookup();
+    fuse_reply_create(req, &(file_p->m_fuseEntryParam), fi);
 
-    string fileName = parentDir_p->getDirName() + name;
-    if (!createFileFromThread) {
-        RequestSender::sendCreateFileRequest(fileName, mpiRank, mpiWorldSize);
+#ifdef DAGONFS_P2P
+    if (!replay) {
+        RequestSender::sendCreateFileRequest(fileName, globalId, mpiRank, mpiWorldSize);
     }
-    createFileFromThread = false;
-
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Creating " << name << " -> FuseRamFs::FuseCreate completed!");
-
+#endif
 }
 
 void FileSystem::FuseGetLock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi, struct flock* lock) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Getting the lock -> FuseRamFs::FuseGetLock");
-
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    (void) fi;
+    if (GetINode(ino) == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tgetlk for " << ino);
     // DAGonFS does not retain POSIX byte-range locks. Report that no lock
     // conflicts with the requested range, as required by F_GETLK.
     lock->l_type = F_UNLCK;
     fuse_reply_lock(req, lock);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Getting the lock -> FuseRamFs::FuseGetLock completed!");
 }
 
 /**
- * The data of the inode (when it's a File inode) are stored in its member attribute "m_buf", since
- * the file system is in RAM.
+ * Serve a read from the front-end buffer loaded at open time.
  */
 void FileSystem::FuseRead(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info* fi) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Reading " << ino << " -> FuseRamFs::FuseRead");
-
-    // TODO: Node may also be deleted.
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    (void) fi;
+    INode *inode_p = GetINode(ino);
+    if (inode_p == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-
-    // TODO: Handle info in fi.
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tread for " << size << " at " << off << " from " << ino);
-
-    //Directory
-    Directory *dir_p = dynamic_cast<Directory *>(inode_p);
-    if (dir_p != nullptr) {
+    if (isDirectory(inode_p)) {
         fuse_reply_err(req, EISDIR);
         return;
     }
-
-    //SpecialINode
-    SpecialINode *special_p = dynamic_cast<SpecialINode *>(inode_p);
-    if (special_p != nullptr) {
-        fuse_reply_err(req, ENOENT);
-        return;
-    }
-
-    //SymbolicLink
-    SymbolicLink *symlink_p = dynamic_cast<SymbolicLink *>(inode_p);
-    if (symlink_p != nullptr) {
-        fuse_reply_err(req, EISDIR);
-        return;
-    }
-
-    //File
     File *file_p = dynamic_cast<File *>(inode_p);
-
-    // Don't start the read past our file size
-    if (off > file_p->m_fuseEntryParam.attr.st_size) {
-        fuse_reply_buf(req, (const char *) file_p->m_buf, 0);
+    if (file_p == nullptr) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    if (off < 0) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    if (!LoadFileContent(file_p, ino)) {
+        fuse_reply_err(req, ENOMEM);
+        return;
     }
 
-    // Update access time. TODO: This could get very intensive. Some
-    // filesystems buffer this with options at mount time. Look into this.
-    // TODO: What do we do if this fails? Do we care? Log the event?
-    #ifdef __APPLE__
-    clock_gettime(CLOCK_REALTIME, &(m_fuseEntryParam.attr.st_atimespec));
-    #else
-    clock_gettime(CLOCK_REALTIME, &(file_p->m_fuseEntryParam.attr.st_atim));
-    #endif
+    const size_t fileSize = static_cast<size_t>(file_p->m_fuseEntryParam.attr.st_size);
+    const size_t offset = static_cast<size_t>(off);
+    setTimeNow(file_p->m_fuseEntryParam.attr, true, false, false);
 
-    // Handle reading past the file size as well as inside the size.
-    size_t bytesRead = off + size > file_p->m_fuseEntryParam.attr.st_size ? file_p->m_fuseEntryParam.attr.st_size - off : size;
-
-    // TODO: There are all sorts of other replies. What about them?
-    fuse_reply_buf(req, (const char *) file_p->m_buf + off, bytesRead);
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() <<  "Reading " << ino << " -> FuseRamFs::FuseRead completed!");
+    // A read at or beyond the end of the file returns no data.
+    if (offset >= fileSize || file_p->m_buf == nullptr) {
+        fuse_reply_buf(req, nullptr, 0);
+        return;
+    }
+    const size_t bytesRead = std::min(size, fileSize - offset);
+    fuse_reply_buf(req, static_cast<const char *>(file_p->m_buf) + offset, bytesRead);
 }
 
 /**
- * The data will be written in the inode member attribute "m_buf", since the file system is in RAM.
+ * Apply a write to the front-end buffer; the data reach the ranks on flush.
  */
 void FileSystem::FuseWrite(fuse_req_t req, fuse_ino_t ino, const char* buf, size_t size, off_t off, struct fuse_file_info* fi) {
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Writing " << ino << " -> FuseRamFs::FuseWrite");
-
-    // TODO: Fuse seems to have problems writing with a null (buf) buffer.
-    if (buf == nullptr) {
-        fuse_reply_err(req, EPERM);
-        return;
-    }
-
-    // TODO: Node may also be deleted.
-    if (ino >= INodeManager->getNumberOfINodes()) {
+    INode *inode_p = GetINode(ino);
+    if (inode_p == nullptr) {
         fuse_reply_err(req, ENOENT);
         return;
     }
-
-    INode *inode_p = INodeManager->getINodeByINodeNumber(ino);
-
-    Directory *dir_p = dynamic_cast<Directory *>(inode_p);
-    if (dir_p != nullptr) {
+    if (isDirectory(inode_p)) {
         fuse_reply_err(req, EISDIR);
         return;
     }
-    SymbolicLink *symlink_p = dynamic_cast<SymbolicLink *>(inode_p);
-    if (symlink_p != nullptr) {
-        fuse_reply_err(req, ENOENT);
-        return;
-    }
-    SpecialINode *special_p = dynamic_cast<SpecialINode *>(inode_p);
-    if (special_p != nullptr) {
-        fuse_reply_err(req, EISDIR);
-        return;
-    }
-
     File *file_p = dynamic_cast<File *>(inode_p);
     if (file_p == nullptr) {
-        fuse_reply_err(req, ENOENT);
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    if (buf == nullptr || off < 0) {
+        fuse_reply_err(req, EINVAL);
+        return;
+    }
+    if (!LoadFileContent(file_p, ino)) {
+        fuse_reply_err(req, ENOMEM);
         return;
     }
 
-    if (!file_p->isWaitingForWriting()) {
-        file_p->setWaiting();
+    size_t offset = static_cast<size_t>(off);
+    if (fi != nullptr && (fi->flags & O_APPEND)) {
+        offset = static_cast<size_t>(file_p->m_fuseEntryParam.attr.st_size);
+    }
+    if (size > SIZE_MAX - offset) {
+        fuse_reply_err(req, EFBIG);
+        return;
+    }
+    const size_t newSize = offset + size;
+    if (!file_p->ensureCapacity(newSize)) {
+        fuse_reply_err(req, ENOMEM);
+        return;
     }
 
-    // TODO: Handle info in fi
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tWrite request for " << size << " bytes at " << off << " to " << ino);
-    //LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "\tcontent: '" << buf << "'");
-
-    //Allocate more memory if we don't have space.
-    size_t newSize = off + size;
-    size_t originalCapacity = Nodes::INodeBufBlockSize * file_p->m_fuseEntryParam.attr.st_blocks;
-    if (newSize > originalCapacity) {
-        size_t newBlocks = newSize/Nodes::INodeBufBlockSize + (newSize % Nodes::INodeBufBlockSize != 0);
-        void *newBuf = realloc(file_p->m_buf, newBlocks * Nodes::INodeBufBlockSize);
-        // If we ran out of memory, let the caller know that no bytes were
-        // written.
-        if (newBuf == nullptr) {
-            fuse_reply_write(req, 0);
-        }
-
-        // Update our buffer size
-        file_p->m_buf = newBuf;
-        FileSystem::UpdateUsedBlocks(newBlocks - file_p->m_fuseEntryParam.attr.st_blocks);
-        file_p->m_fuseEntryParam.attr.st_blocks = newBlocks;
+    memcpy(static_cast<char *>(file_p->m_buf) + offset, buf, size);
+    if (newSize > static_cast<size_t>(file_p->m_fuseEntryParam.attr.st_size)) {
+        SetSize(file_p, newSize);
     }
-
-    // Write to the buffer. TODO: Check if SRC and DST overlap.
-    // We assume that there can be no buffer overflow since realloc has already
-    // been called with the new size and offset. If realloc failed, we wouldn't
-    // be here.
-    memcpy((char *) file_p->m_buf + off, buf, size);
-    if (newSize > file_p->m_fuseEntryParam.attr.st_size) {
-        file_p->m_fuseEntryParam.attr.st_size = newSize;
-    }
-
-
-    // TODO: What do we do if this fails? Do we care? Log the event?
-    #ifdef __APPLE__
-    clock_gettime(CLOCK_REALTIME, &(m_fuseEntryParam.attr.st_ctimespec));
-    m_fuseEntryParam.attr.st_mtimespec = m_fuseEntryParam.attr.st_ctimespec;
-    #else
-    clock_gettime(CLOCK_REALTIME, &(file_p->m_fuseEntryParam.attr.st_ctim));
-    file_p->m_fuseEntryParam.attr.st_mtim = file_p->m_fuseEntryParam.attr.st_ctim;
-    #endif
+    file_p->setWaiting();
+    Touch(file_p, true);
 
     fuse_reply_write(req, size);
-
-    LOG4CPLUS_TRACE(FSLogger, FSLogger.getName() << "Writing " << ino << " -> FuseRamFs::FuseWrite completed!");
 }

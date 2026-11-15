@@ -9,21 +9,19 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(CTest)
 
-option(USE_MPI "Use MPI for distributed memory." OFF)
+# DAGonFS is intrinsically MPI-distributed; the option is kept for backward
+# compatibility with existing build scripts.
+option(USE_MPI "Use MPI for distributed memory." ON)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/CMake)
 
 find_package(FUSE3 REQUIRED)
 include_directories(SYSTEM ${FUSE3_INCLUDE_DIR})
 
-find_package(MPI)
-if(MPI_C_FOUND)
-  if (USE_MPI)
-    message(STATUS "Using MPI for distributed memory.")
-    add_definitions(-DUSE_MPI)
-    include_directories(SYSTEM ${MPI_INCLUDE_PATH})
-  endif()
-endif()
+find_package(MPI REQUIRED COMPONENTS C)
+message(STATUS "Using MPI for distributed memory.")
+add_definitions(-DUSE_MPI)
+include_directories(SYSTEM ${MPI_C_INCLUDE_DIRS} ${MPI_INCLUDE_PATH})
 
 if(WIN32)
   set(SHAREDIR ".")
@@ -58,6 +56,9 @@ ExternalProject_Add(log4cplus
         CONFIGURE_COMMAND ./configure --prefix=${EXTERNAL_INSTALL_LOCATION} CFLAGS=-fPIC CPPFLAGS=-I${EXTERNAL_INSTALL_LOCATION}/include/ LDFLAGS=-L${EXTERNAL_INSTALL_LOCATION}/lib/
         BUILD_COMMAND make
         INSTALL_COMMAND make install
+        BUILD_BYPRODUCTS
+            ${EXTERNAL_INSTALL_LOCATION}/lib/liblog4cplus.so
+            ${EXTERNAL_INSTALL_LOCATION}/lib/liblog4cplus.dylib
 )
 set(LOG4CPLUS_LIBRARIES ${EXTERNAL_INSTALL_LOCATION}/lib/liblog4cplus.so)
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
@@ -151,26 +152,48 @@ add_executable("${PROJECT_NAME}_P2P.exe" src/peer-to-peer/main.cpp ${DAGONFS_P2P
 # Creation of DAGonFS launcher
 add_executable("${PROJECT_NAME}_Launcher" src/DAGonFS_Launcher.cpp)
 
+# The executables include log4cplus headers produced by the external project,
+# so they must not be compiled before it has been installed in the build tree.
+add_dependencies("${PROJECT_NAME}_CS.exe" log4cplus)
+add_dependencies("${PROJECT_NAME}_P2P.exe" log4cplus)
+
 # Compilation with required libraries (MPI, FUSE and log4cplus)
 target_link_libraries("${PROJECT_NAME}_CS.exe" ${FUSE3_LIBRARIES} ${MPI_C_LIBRARIES} ${LOG4CPLUS_LIBRARIES} -lpthread)
 target_link_libraries("${PROJECT_NAME}_P2P.exe" ${FUSE3_LIBRARIES} ${MPI_C_LIBRARIES} ${LOG4CPLUS_LIBRARIES} -lpthread)
 
 # Specific definitions
 target_compile_definitions(${PROJECT_NAME}_CS.exe PRIVATE FUSE_USE_VERSION=32 _FILE_OFFSET_BITS=64)
-target_compile_definitions(${PROJECT_NAME}_P2P.exe PRIVATE FUSE_USE_VERSION=32 _FILE_OFFSET_BITS=64)
+target_compile_definitions(${PROJECT_NAME}_P2P.exe PRIVATE FUSE_USE_VERSION=32 _FILE_OFFSET_BITS=64 DAGONFS_P2P)
 
-# Imposta C++ Standard
+# C++ standard
 set_property(TARGET ${PROJECT_NAME}_CS.exe PROPERTY CXX_STANDARD 23)
 set_property(TARGET ${PROJECT_NAME}_P2P.exe PROPERTY CXX_STANDARD 23)
 set_property(TARGET ${PROJECT_NAME}_Launcher PROPERTY CXX_STANDARD 23)
 
-# Installazione
+# Installation: the bundled log4cplus shared library is installed next to the
+# executables' library directory and found through a relative RPATH.
+if(APPLE)
+    set(DAGONFS_INSTALL_RPATH "@loader_path/../lib")
+else()
+    set(DAGONFS_INSTALL_RPATH "$ORIGIN/../lib")
+endif()
+set_target_properties(${PROJECT_NAME}_CS.exe ${PROJECT_NAME}_P2P.exe PROPERTIES INSTALL_RPATH "${DAGONFS_INSTALL_RPATH}")
 install(TARGETS ${PROJECT_NAME}_CS.exe ${PROJECT_NAME}_P2P.exe ${PROJECT_NAME}_Launcher DESTINATION bin)
+install(DIRECTORY ${EXTERNAL_INSTALL_LOCATION}/lib/ DESTINATION lib FILES_MATCHING PATTERN "liblog4cplus*")
+install(FILES src/DAGonFS.ini DESTINATION "${SHAREDIR}")
 
 if(BUILD_TESTING)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(
         NAME dagonfs-source-contract
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_source_contract.py
+    )
+    add_test(
+        NAME dagonfs-usage
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/usage.py ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    add_test(
+        NAME dagonfs-launcher-dry-run
+        COMMAND ${PROJECT_NAME}_Launcher ${CMAKE_CURRENT_SOURCE_DIR}/src/DAGonFS.ini --dry-run
     )
 endif()

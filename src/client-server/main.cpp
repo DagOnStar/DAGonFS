@@ -23,13 +23,13 @@ int main(int argc, char *argv[]){
 
     if (argc < 3) {
         show_usage(argv[0]);
-        return ret;
+        return 1;
     }
 
-    if(argc == 4){
-        bool logLevelFlag;
-        istringstream(argv[3]) >> logLevelFlag;
-        if(logLevelFlag) DAGONFS_LOG_LEVEL = ALL_LOG_LEVEL;
+    // An optional trailing "0"/"1" enables verbose logging; it is not a FUSE option.
+    const string lastArgument = argv[argc - 1];
+    if (argc >= 4 && (lastArgument == "0" || lastArgument == "1")) {
+        if (lastArgument == "1") DAGONFS_LOG_LEVEL = ALL_LOG_LEVEL;
         argc--;
     }
     

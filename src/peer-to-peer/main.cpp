@@ -25,13 +25,13 @@ int main(int argc, char *argv[]){
 
     if (argc < 3) {
         show_usage(argv[0]);
-        return ret;
+        return 1;
     }
 
-    if(argc == 4){
-        bool logLevelFlag;
-        istringstream(argv[3]) >> logLevelFlag;
-        if(logLevelFlag) DAGONFS_LOG_LEVEL = ALL_LOG_LEVEL;
+    // An optional trailing "0"/"1" enables verbose logging; it is not a FUSE option.
+    const string lastArgument = argv[argc - 1];
+    if (argc >= 4 && (lastArgument == "0" || lastArgument == "1")) {
+        if (lastArgument == "1") DAGONFS_LOG_LEVEL = ALL_LOG_LEVEL;
         argc--;
     }
     
@@ -47,6 +47,11 @@ int main(int argc, char *argv[]){
     //Inizialize MPI
     int mpiWorldSize, mpiRank, provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    if (provided < MPI_THREAD_MULTIPLE) {
+        // The listener thread and the FUSE thread both call MPI concurrently.
+        cerr << "DAGonFS peer-to-peer requires an MPI library with MPI_THREAD_MULTIPLE support" << endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
 
     //MPI
     //Get number of involved processes
@@ -65,7 +70,7 @@ int main(int argc, char *argv[]){
     mpiProcess->setup();
     std::thread mpiProcessThread(mpiProcess->start);
     FileSystem ramfs = FileSystem(mpiRank,mpiWorldSize);
-    ramfs.start(argc,argv);
+    ret = ramfs.start(argc,argv);
 
     mpiProcessThread.join();
 
