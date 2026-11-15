@@ -28,13 +28,13 @@ DAGonFS provides **close-to-open consistency**, the model of NFS and of most wor
 
 * While a file is open on a front end, reads and writes operate on an in-memory whole-file buffer held by that front end; several descriptors on the same file share it.
 * The content is distributed to the storage ranks (write-back) on `fsync`, `flush` of a dirty file, and when the last descriptor is released. `truncate` on a closed file is applied and written back immediately.
-* An `open` that follows a completed `close` (on any peer, in the peer-to-peer model) observes the closed content. Concurrent writers of the same file on different peers are not serialised: the last write-back wins.
+* An `open` that follows a completed `close` (on any peer, in the peer-to-peer model) observes the closed content: in the peer-to-peer model, `close`/`fsync` returns only after every peer has stored its slice and updated its size. Concurrent writers of the same file on different peers are not serialised: the last write-back wins.
 * `O_TRUNC` truncates; `O_APPEND` appends; `O_WRONLY` alone preserves existing content.
 * `st_blocks` is reported in 512-byte units as POSIX specifies; `statfs` reports a writable file system.
 
 ## Peer-to-peer specifics
 
-Namespace operations (`create`, `mknod`, `mkdir`, `unlink`, `rmdir`, `rename`, `link`) are replicated to every peer in origination order. Symbolic links, `setattr` changes other than size, and extended attributes are **local to the peer** on which they were made. Paths longer than 4095 bytes fail with `ENAMETOOLONG` on the originating peer. See [PROTOCOL.md](PROTOCOL.md).
+Namespace operations (`create`, `mknod`, `mkdir`, `unlink`, `rmdir`, `rename`, `link`) are replicated to every peer in origination order, asynchronously: a name created on one peer appears on the others shortly afterwards (applications that hand a path from one node to another should do so after the producer has closed the file, as DAG-structured workflows naturally do). The kernel's name and attribute caches are disabled in this model, so a replicated change is visible as soon as it has been applied. Symbolic links, `setattr` changes other than size, and extended attributes are **local to the peer** on which they were made. Paths longer than 4095 bytes fail with `ENAMETOOLONG` on the originating peer. See [PROTOCOL.md](PROTOCOL.md).
 
 ## Python example
 

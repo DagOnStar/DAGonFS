@@ -8,9 +8,9 @@ The assessment combined three techniques.
 
 1. **Static review** of every FUSE handler against the libfuse low-level contract (exactly one reply per request; `fuse_reply_none` only for `forget`) and of every MPI exchange against the MPI standard's matching and ownership rules.
 2. **Differential review** of the two source trees, which had been maintained by hand as near-copies and had drifted.
-3. **Dynamic testing** on a production HPC system (Rocky Linux 8.10, GCC 12.2, Open MPI 4.1.4, libfuse 3.3.0): a regression suite of fifteen POSIX scenarios, written *before* the fixes so that each scenario reproduces a suspected defect, executed against both models with 1, 2 and 4 ranks on one node and with 4 ranks across two nodes under Slurm.
+3. **Dynamic testing** on a production HPC system (Rocky Linux 8.10, GCC 12.2, Open MPI 4.1.4, libfuse 3.3.0): a regression suite of fifteen POSIX scenarios, written *before* the fixes so that each scenario reproduces a suspected defect, executed against both models with 1, 2 and 4 ranks on one node and with 4 ranks across two nodes under Slurm. It was complemented by a per-operation latency micro-benchmark, a concurrent two-peer workload, and repeated stress runs to expose timing-dependent failures.
 
-Against the unmodified code, the client-server file system terminated with a segmentation fault (exit status 139) during the suite; once the daemon had died, every remaining scenario failed with a disconnected mount (3 failures, 12 errors out of 15). After remediation all fifteen scenarios pass on both models and in every configuration, and the cross-peer replication checks pass in both directions.
+Against the unmodified code, the client-server file system terminated with a segmentation fault (exit status 139) during the suite; once the daemon had died, every remaining scenario failed with a disconnected mount (3 failures, 12 errors out of 15). After remediation, all fifteen scenarios pass on both models in every configuration, as do the cross-peer replication and concurrency checks, including 20 consecutive stress runs.
 
 ## 2. Memory-safety defects in the data plane
 
@@ -58,13 +58,27 @@ Against the unmodified code, the client-server file system terminated with a seg
 
 **D23 — Silent path truncation.** Paths were copied into 256-byte arrays; longer paths were truncated and replayed on the wrong object. *Remedy:* paths of up to 4095 bytes, explicit lengths validated by the receiver, and `ENAMETOOLONG` at the originator.
 
-**D24 — Replay flags.** Plain `bool`s shared between threads (a data race), cleared only on the success path. *Remedy:* `std::atomic<bool>` consumed first in each handler.
+**D24 — Replay flags.** Plain `bool`s shared between threads (a data race), cleared only on the success path. *Remedy:* replays are identified by the requesting thread (D36); the flags remain only as a fallback and are always consumed first.
 
 **D25 — Missing replication.** `link` and `mknod` were not replicated. *Remedy:* `mknod` replays as an exclusive create; a new `LINK` message replays hard links.
 
 **D26 — Shell-based unmount.** Termination executed `<root>/unmount.sh` through `system()`, a script that the project did not provide and that would run with the user's privileges from a shared directory. *Remedy:* `fusermount3 -u` through `posix_spawnp`, without a shell.
 
-**D33 — Per-operation latency across nodes.** Each replicated operation was sent as a header plus a fixed-size payload (up to 8 KiB for `RENAME`) in two blocking sends per peer. On two nodes over TCP every metadata operation took roughly 200 ms, as the payload crossed the rendezvous threshold. *Remedy:* one variable-length message per request carrying only the bytes in use (see [PROTOCOL.md](PROTOCOL.md) §2).
+**D33 — Per-operation latency across nodes.** On two nodes every replicated operation took 360–480 ms. This held even for `mkdir`, which sends one small message and waits for nothing, and the fifteen-scenario suite took 571 s against 0.45 s on one node. Shrinking the messages (one variable-length message per request instead of a header plus fixed 4 KiB path buffers) did not help. The cause was the listener's blocking `MPI_Probe`. Under `MPI_THREAD_MULTIPLE` it holds the MPI library's progress lock while it waits, starving the FUSE thread's own MPI calls in the same process. *Remedy:* `MPI_Iprobe` with a back-off bounded at 0.5 ms. Per-operation latency dropped to 0.03–0.4 ms (Table 2 of [TESTING.md](TESTING.md)).
+
+The remaining defects of this section were latent behind D33: the 400 ms serialisation made the interleavings that trigger them improbable. They surfaced as soon as D33 was fixed, through a new test in which two peers create and write files simultaneously.
+
+**D34 — Concurrent collectives on one communicator.** Each peer ran `MPI_Scatterv`/`MPI_Gatherv` rooted at itself on `MPI_COMM_WORLD`. Its FUSE thread acted as root, while its listener thread took part in other peers' collectives. When two peers' operations overlapped, collectives ran concurrently on the same communicator, which the MPI standard declares erroneous. *Observed:* a file rewritten on one peer read back on another with the right size but a mixture of old and new blocks. *Remedy:* a point-to-point data plane on dedicated tags, with the originator posting all transfers before waiting (invariant I6 of [DATA-PLANE.md](DATA-PLANE.md)).
+
+**D35 — Distributed deadlock between replays and transfers.** The listener replayed namespace operations by issuing system calls on the local mount, which needs the peer's own FUSE thread. With two writers, peer A's FUSE thread waited for B's listener, B's listener was blocked in a replay needing B's FUSE thread, and B's FUSE thread waited for A's listener, itself blocked in a replay. *Observed:* both ranks spinning, the volume frozen. *Remedy:* replays run on a dedicated replayer thread fed by a FIFO, so the listener never depends on the local kernel. Remote writes that overtake their replayed create are kept as pending sizes.
+
+**D36 — Replay misattribution.** The "this request is a replay" signal was a single global flag set by the listener just before its system call. A local request queued in the kernel immediately before the replayed one consumed the flag, so the local operation was never replicated and the replay was echoed back. *Remedy:* a replay is recognised by the requesting thread (`fuse_req_ctx(req)->pid` equals the replayer's thread id).
+
+**D37 — Inode table read across threads.** To mirror a remote write, the listener looked up the file through the inode table, a `std::vector` that the FUSE thread grows (and may reallocate) concurrently. A missed lookup parked the new size as pending for a create that had already happened, so the size was never applied. *Observed:* a remotely written file read back as 0 bytes. *Remedy:* the global-id index holds `File` pointers, which stay valid because peer-to-peer volumes never reclaim inode objects.
+
+**D38 — Kernel cache populated after its invalidation.** The listener could update a replica's size and invalidate the kernel's cache while the reply to the replayed create, carrying size 0, was still on its way to the kernel. The invalidation hit an inode the kernel did not know yet, and the late reply re-populated the cache with the stale size. *Observed:* `stat` reported 0 bytes for up to the 1 s attribute timeout, then the correct size. *Remedy:* in the peer-to-peer model, names and attributes are not cached by the kernel (timeouts 0). Every `stat` and `lookup` is answered from local memory without MPI, so the cost is one user-space round trip.
+
+**D39 — Reads bounded by a size that another thread changes.** A descriptor that was already open kept its buffer while a remote write enlarged the file, and `read` was bounded only by `st_size`. *Remedy:* reads are bounded by the buffer capacity as well, and an open file's buffer grows when the reported size does.
 
 ## 6. Lifecycle, launcher and build defects
 
@@ -82,4 +96,11 @@ Against the unmodified code, the client-server file system terminated with a seg
 
 ## 7. Structural remedy
 
-The two trees previously duplicated `FileSystem.cpp` with ad-hoc divergence. All shared sources are now byte-identical across the trees and specialised at compile time (`DAGONFS_P2P`). `tests/test_source_contract.py` enforces the identity, the single-reply rule, the absence of pointers in MPI packets, bounded peer paths, and the build-ordering constraint, so the most consequential classes of defect above are checked on every CI run without a FUSE-capable host.
+The client-server and peer-to-peer front ends were originally two hand-maintained copies of the code in `src/client-server` and `src/peer-to-peer`, and their divergence caused several of the defects above. They are now **one code base**:
+
+* There is a single `src/` tree and a single executable, `dagonfs`. The deployment model is a run-time property of each volume: `--model`, `dagonfs_model` in `DAGonFS.ini`, or `dagonfs::VolumeOptions` in the C++ and Python APIs.
+* Client-server storage ranks run the same listener as peers, and both models share one wire protocol and one point-to-point data plane.
+* The few behaviours intrinsic to a model (namespace replication, inode reclamation, kernel cache timeouts, MPI thread level) are run-time branches on the model.
+* `DAGonFS_CS.exe` and `DAGonFS_P2P.exe` survive only as symbolic links, for backward compatibility.
+
+`tests/test_source_contract.py` enforces the absence of model-specific trees and compile-time switches. It also enforces the single-reply rule, the absence of pointers in MPI messages, bounded paths, the absence of collectives in the data plane, and listener-independent replays, so the most consequential classes of defect above are checked on every CI run without a FUSE-capable host. `tests/mount.py` adds a concurrent two-peer workload that reproduces D34–D38 on the old code.

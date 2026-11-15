@@ -12,7 +12,8 @@ import sys
 def main():
     build_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "build")
     failures = 0
-    for name in ("DAGonFS_CS.exe", "DAGonFS_P2P.exe"):
+    # dagonfs plus its backward-compatible aliases (symbolic links).
+    for name in ("dagonfs", "DAGonFS_CS.exe", "DAGonFS_P2P.exe"):
         binary = build_dir / name
         if not binary.exists():
             print(f"skip: {binary} not built")

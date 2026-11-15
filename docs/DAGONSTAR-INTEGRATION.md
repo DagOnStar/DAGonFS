@@ -35,6 +35,25 @@ workflow.run()
 
 This example works with the upstream DAGonStar API. The site-specific setting that chooses the scratch path is intentionally not embedded here because configuration names and scheduler wrappers vary by DAGonStar release.
 
+## Creating the volume from a workflow script
+
+The Python module `python/dagonfs` creates a volume with either model and removes it when the workflow ends. This keeps the scratch file system's life cycle inside the workflow script:
+
+```python
+import sys; sys.path.insert(0, "/path/to/DAGonFS/python")
+from dagonfs import Volume
+
+with Volume("/tmp/dagonfs", model="client-server", ranks=8,
+            executable="/opt/dagonfs/bin/dagonfs",
+            mpirun_args=["--hostfile", "hosts"]) as volume:
+    scratch = volume.mountpoint(0)          # point DAGonStar's scratch root here
+    ...                                     # build and run the workflow
+```
+
+Use `model="client-server"` when every task runs on the node hosting rank 0. Use `model="peer-to-peer"` when tasks run on several nodes, each using the mount point of a rank on its own node (`volume.mountpoint(r)`, with `local_ranks` listing the ranks placed on the calling host). The same choice is available without Python as `dagonfs --model …` or as `dagonfs_model` in `DAGonFS.ini`.
+
+In a peer-to-peer volume, a file written and closed on one peer can be read on any other peer as soon as `close` returns. Namespace changes (creation, rename, removal) reach the other peers asynchronously, typically within milliseconds, so a consumer on another node should wait for the producer task's completion, which DAGonStar's dependency graph already enforces.
+
 ## Operational procedure
 
 1. Reserve nodes and ensure MPI, FUSE, DAGonStar, and task executables are available on every node.

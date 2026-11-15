@@ -2,18 +2,32 @@
 
 ## Project layout
 
-- `src/client-server/` contains the single FUSE front end and MPI storage workers.
-- `src/peer-to-peer/` contains the distributed FUSE front end used by every peer.
+- `src/` contains the single implementation, built as one executable, `dagonfs`:
+  - `ramfs/FileSystem.*`: the FUSE low-level handlers;
+  - `nodes/`: the namespace (`INode`, `Directory`, `File`, `SymbolicLink`);
+  - `blocks/` and `mpi/DataBlockManager.*`: the data plane;
+  - `mpi/RequestSender.*`, `mpi/DistributedCode.*` and `mpi/mpi_data.hpp`: the control plane;
+  - `volume/`: `Options` (model, ini and command line, with no MPI or FUSE dependency) and `Volume` (`runVolume`);
+  - `main.cpp`: a thin wrapper around `runVolume`;
+  - `DAGonFS_Launcher.cpp`: the ini-driven launcher.
+- `python/dagonfs/` contains the Python volume API (standard library only).
 - `doc/` contains the installed manual page; `docs/` contains maintained project documentation.
-- `tests/` contains smoke-test helpers. Do not require a mounted filesystem in unit tests.
+- `tests/` contains the source-contract tests, the mounted suite and the harness. Do not require a mounted filesystem in unit tests.
 
-The two implementations intentionally mirror each other. Changes to shared filesystem behaviour must be applied and reviewed in both trees unless the difference is intrinsic to the distribution model.
+### Deployment models
 
-- The following files are **byte-identical** in both trees and must stay so (enforced by `tests/test_source_contract.py`): `blocks/*`, `mpi/DataBlockManager.*`, `nodes/*`, `ramfs/FileSystem.*`, `utils/ArgumentParser.*`, `utils/fuse_headers.hpp`. Edit one copy, then copy it to the other tree.
-- Model-specific behaviour inside shared files is selected with `#ifdef DAGONFS_P2P`, defined only for the peer-to-peer target in `CMakeLists.txt`.
-- Model-specific code lives in `mpi/` only: `MasterProcessCode`/`NodeProcessCode` (client-server) and `DistributedCode`/`RequestSender` (peer-to-peer).
-- Peer-to-peer requests are one message each (`PeerRequest` header + path bytes); see `docs/PROTOCOL.md` before changing the wire format, and update the contract tests with it.
-- The data plane addresses peer-to-peer files by their cluster-wide `m_globalId`, never by local inode numbers. Replicated FUSE handlers consume their replay flag as the first statement.
+- The client-server and peer-to-peer models are a **run-time** property of a volume (`dagonfs::Model`, selected with `--model`, `dagonfs_model` or the APIs). Do not reintroduce per-model source trees, executables or preprocessor switches. Branch on `FileSystem::peerToPeer`, and only where the behaviour is intrinsic to the model.
+- `DAGonFS_CS.exe` and `DAGonFS_P2P.exe` are symbolic links kept for backward compatibility. The program name only sets the default model.
+- `MPI_THREAD_MULTIPLE` is requested only for peer-to-peer volumes (`dagonfs::requiredThreadLevel`).
+
+### Protocol and threading invariants
+
+- Every request is one message (`PeerRequest` header + path bytes) on `DAGONFS_TAG_REQUEST`; see `docs/PROTOCOL.md` before changing the wire format, and update the contract tests with it.
+- The data plane is point-to-point: post every `MPI_Isend`/`MPI_Irecv` before waiting. Never use collectives, because several peers originate transfers concurrently. A `WRITE` completes only after an ACK from every rank.
+- The listener waits with `waitForRequest` (an `MPI_Iprobe` back-off), never with a blocking `MPI_Probe`.
+- The listener never issues a system call on a mount point. Namespace replays go to the replayer thread's FIFO.
+- Replicated FUSE handlers call `IsReplay(req, ...)` as their first statement. A replay is identified by the replayer's thread id and is never re-broadcast.
+- The data plane addresses files by their cluster-wide `m_globalId`, never by local inode numbers. The listener reaches files only through the global-id index, never through the inode table.
 
 ## Engineering rules
 
@@ -31,7 +45,7 @@ Run the checks appropriate to the change:
 ```bash
 cmake -S . -B build -DUSE_MPI=ON
 cmake --build build
-python3 -m py_compile tests/mount.py tests/usage.py
+python3 -m py_compile tests/*.py python/dagonfs/*.py
 python3 tests/test_source_contract.py
 # Requires a running DAGonFS mount:
 DAGONFS_MOUNTPOINT=/path/to/mount python3 tests/test_python_posix.py
@@ -48,4 +62,4 @@ sbatch -p <partition> -N 2 --ntasks-per-node=2 tests/slurm/multinode.sbatch buil
 
 A new regression scenario belongs in `tests/test_python_posix.py`; a new architectural invariant belongs in `tests/test_source_contract.py`. Record validation results in `docs/TESTING.md`.
 
-The build requires FUSE3, MPI, CMake 3.20+, a C++23 compiler, and network access on the first build for log4cplus. Mount tests require a FUSE-capable host and must always unmount the test mountpoint during cleanup.
+The build requires FUSE3, MPI, CMake 3.20+, a C++23 compiler, and network access on the first build for log4cplus. Mount tests require a FUSE-capable host and must always unmount the test mountpoint during cleanup. On clusters, run multi-node tests with Slurm only on nodes that provide `/dev/fuse`, and never cancel jobs you did not submit.

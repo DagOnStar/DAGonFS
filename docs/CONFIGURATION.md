@@ -18,52 +18,93 @@ ctest --test-dir build --output-on-failure
 cmake --install build --prefix "$HOME/opt/dagonfs"   # optional
 ```
 
-The build produces `DAGonFS_CS.exe` (client-server), `DAGonFS_P2P.exe` (peer-to-peer, compiled with `-DDAGONFS_P2P`) and `DAGonFS_Launcher`. Installation places the log4cplus shared library under `lib/` and sets a relative RPATH, so the installed tree can be relocated or staged to compute nodes as a unit.
+The build produces one executable for both deployment models, `dagonfs`, plus `DAGonFS_Launcher`. `DAGonFS_CS.exe` and `DAGonFS_P2P.exe` are created as symbolic links to `dagonfs` for backward compatibility; each alias defaults to its model. The volume API is installed as `include/dagonfs/{Options,Volume}.hpp` with the static libraries `libdagonfs_core.a` and `libdagonfs_options.a`. The log4cplus shared library is installed under `lib/` with a relative RPATH, so the installed tree can be relocated or staged to compute nodes as a unit.
 
-## 3. Running an executable directly
+## 3. Creating a volume
+
+A volume is created by running `dagonfs` on every rank of an MPI job. The deployment model is chosen **per volume, at run time**:
 
 ```bash
-mpirun -np <P> [--hostfile <file>] ./DAGonFS_CS.exe  -f <mountpoint> [0|1]
-mpirun -np <P> [--hostfile <file>] ./DAGonFS_P2P.exe -f <root>       [0|1]
+mpirun -np <P> [--hostfile <file>] dagonfs [--model client-server|peer-to-peer] [--config DAGonFS.ini] [-f|-d] [--log] <root>
 ```
 
-* `-f` runs FUSE in the foreground, which is required under MPI because the rank must stay alive inside `mpirun`; `-d` additionally prints the FUSE request trace.
-* The trailing `1` enables log4cplus logging; `0` or nothing disables it.
-* **Client-server:** rank 0 mounts `<mountpoint>`; ranks 1…P−1 are storage workers.
-* **Peer-to-peer:** rank *r* mounts `<root>/<r>`. Each peer's mount shows the same namespace; files written on any peer are readable on every other peer after `close`.
+| Option | Meaning |
+| --- | --- |
+| `-m`, `--model M` | `client-server` (`cs`): rank 0 mounts `<root>`, ranks 1…P−1 store blocks. `peer-to-peer` (`p2p`): rank *r* mounts `<root>/<r>`, and the namespace is replicated. Default: `client-server`. |
+| `-c`, `--config F` | Read `dagonfs_model`, `dagonfs_root_dir`, `fuse_mode` and `enable_logging` from an ini file. |
+| `-f` / `-d` | FUSE in the foreground (default; required under MPI) / foreground with a trace of every FUSE request. |
+| `--log` | Verbose log4cplus output. The legacy form is a trailing `1` (`0` disables). |
+| `<root>` | Mount point (client-server) or parent of the per-rank mount points (peer-to-peer). May be omitted if the ini file sets `dagonfs_root_dir`. |
 
-Mount points, and any missing parent directories, are created on each node. Startup failures (for instance an existing non-empty mount point or a missing `/dev/fuse`) are always reported on standard error with the rank number, regardless of the logging flag. If a rank fails before mounting it still notifies the others, so the job never hangs.
+Precedence, from lowest to highest: built-in defaults; the program name (`DAGonFS_CS.exe` / `DAGonFS_P2P.exe`); the `--config` file; explicit flags. The legacy invocations `mpirun -np P DAGonFS_CS.exe -f <root> [0|1]` and `… DAGonFS_P2P.exe …` therefore keep working unchanged.
+
+Mount points, and any missing parent directories, are created on each node. Startup failures, for instance an existing non-empty mount point or a missing `/dev/fuse`, are always reported on standard error with the rank number, whatever the logging flag. A rank that fails before mounting still notifies the others, so the job never hangs. A peer-to-peer volume requires an MPI library with `MPI_THREAD_MULTIPLE`; `dagonfs` requests it only for that model.
+
+### 3.1 From C++
+
+```cpp
+#include <dagonfs/Volume.hpp>
+
+dagonfs::VolumeOptions options;
+options.model = dagonfs::Model::PeerToPeer;
+options.root = "/tmp/dagonfs";
+int provided;
+MPI_Init_thread(&argc, &argv, dagonfs::requiredThreadLevel(options.model), &provided);
+int status = dagonfs::runVolume(options);   // collective; returns when the volume is unmounted
+MPI_Finalize();
+```
+
+Link with `dagonfs_core` (and FUSE3, MPI and log4cplus). `dagonfs::readIni`, `applyIni` and `parseCommandLine` expose the same configuration handling as the executable.
+
+### 3.2 From Python
+
+`python/dagonfs` is a dependency-free module that creates and destroys volumes from Python, for example from a DAGonStar workflow script:
+
+```python
+import sys; sys.path.insert(0, "python")
+from dagonfs import Volume
+
+with Volume("/tmp/dagonfs", model="peer-to-peer", ranks=4, executable="build/dagonfs",
+            mpirun_args=["--hostfile", "hosts"], local_ranks=(0,)) as volume:
+    scratch = volume.mountpoint(0)     # /tmp/dagonfs/0
+    ...
+# leaving the block unmounts the volume and waits for the MPI job
+```
+
+`Volume.start()` returns once the mount points of `local_ranks`, those on the calling host, are mounted. `Volume.stop()` unmounts them, which shuts the whole volume down, and returns the job's exit status.
 
 ## 4. The launcher
 
-`DAGonFS_Launcher [path/to/DAGonFS.ini] [-n|--dry-run]` reads a configuration file (default `./DAGonFS.ini`), validates it, and replaces itself with the corresponding `mpirun` command via `execvp`. No shell is involved, so values containing spaces or shell metacharacters are passed literally. `--dry-run` prints the command instead of running it.
+`DAGonFS_Launcher [path/to/DAGonFS.ini] [-m|--model M] [-n|--dry-run]` reads a configuration file (default `./DAGonFS.ini`), validates it, and runs the corresponding `mpirun` command through `execvp`. No shell is involved, so values containing spaces or shell metacharacters are passed literally. `--model` overrides `dagonfs_model`, and `--dry-run` prints the command instead of running it.
 
 ```ini
 [DAGonFS_config]
-num_processes = 8            # positive integer
-machinefile =                # optional Open MPI hostfile
+num_processes = 8              # positive integer
+machinefile =                  # optional Open MPI hostfile
 dagonfs_model = client-server  # client-server | peer-to-peer
-fuse_mode = f                # f (foreground) | d (foreground + FUSE debug)
+fuse_mode = f                  # f (foreground) | d (foreground + FUSE debug)
 dagonfs_root_dir = /tmp/DAGonFS
-enable_logging = false       # true | false
-mpirun = mpirun              # launcher command (e.g. srun, mpiexec)
+enable_logging = false         # true | false
+mpirun = mpirun                # launcher command (e.g. srun, mpiexec)
+executable =                   # default: dagonfs next to the launcher, else from PATH
 ```
 
-| Key | Required | Meaning |
+| Key | Used by | Meaning |
 | --- | --- | --- |
-| `num_processes` | yes | Number of MPI ranks *P*. |
-| `machinefile` | no | Adds `--hostfile <file>` when non-empty. |
-| `dagonfs_model` | no (default `client-server`) | Selects `./DAGonFS_CS.exe` or `./DAGonFS_P2P.exe`, resolved relative to the working directory. |
-| `fuse_mode` | no (default `f`) | `f` or `d`. |
-| `dagonfs_root_dir` | yes | Mount point (client-server) or parent of per-rank mount points (peer-to-peer). |
-| `enable_logging` | no (default `false`) | Passes `1` or `0` as the last argument. |
-| `mpirun` | no (default `mpirun`) | Command used to start the job. |
+| `num_processes` | launcher | Number of MPI ranks *P* (required). |
+| `machinefile` | launcher | Adds `--hostfile <file>` when non-empty. |
+| `mpirun` | launcher | Command used to start the job (default `mpirun`). |
+| `executable` | launcher | Path of `dagonfs`. |
+| `dagonfs_model` | launcher, `dagonfs --config` | `client-server` (default) or `peer-to-peer`. |
+| `dagonfs_root_dir` | launcher, `dagonfs --config` | Mount point / parent of the per-rank mount points (required). |
+| `fuse_mode` | launcher, `dagonfs --config` | `f` (default) or `d`. |
+| `enable_logging` | launcher, `dagonfs --config` | `true` or `false` (default). |
 
 Example:
 
 ```bash
-cd build && cp ../src/DAGonFS.ini . && ./DAGonFS_Launcher --dry-run
-# mpirun -np 8 ./DAGonFS_CS.exe -f /tmp/DAGonFS 0
+cd build && cp ../src/DAGonFS.ini . && ./DAGonFS_Launcher --model peer-to-peer --dry-run
+# Executing: mpirun -np 8 ./dagonfs --model peer-to-peer -f /tmp/DAGonFS
 ```
 
 ## 5. Shutdown

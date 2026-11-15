@@ -12,6 +12,20 @@ T_{operation} = T_{FUSE} + T_{metadata} + T_{MPI} + T_{memory}.
 
 For small files, FUSE crossings and metadata management dominate. For large files, MPI communication and memory-copy costs dominate. This model is useful when interpreting measurements: a bandwidth result should include the file size, block size, rank count, host topology, and whether caches were warm.
 
+## Measured operation latency
+
+Table 1 reports the mean latency per operation in a peer-to-peer volume, measured on two nodes with two ranks each, from rank 0's mount (see [TESTING.md](TESTING.md) §4.1).
+
+**Table 1 — peer-to-peer latency per operation across two nodes.**
+
+| Operation | Before D33 | Current |
+| --- | --- | --- |
+| `mkdir` / `rmdir` | 363 / 450 ms | 0.43 / 0.03 ms |
+| create / `unlink` | 427 / 415 ms | 0.07 / 0.03 ms |
+| write 4 KiB / read 4 KiB | 373 / 476 ms | 0.26 / 0.20 ms |
+
+The earlier figures were dominated by the listener's blocking `MPI_Probe`. Under `MPI_THREAD_MULTIPLE` it held the MPI progress engine and delayed the front end's own messages. The listener now polls with `MPI_Iprobe` and an exponential back-off capped at 0.5 ms. An idle peer therefore costs a fraction of a core, and a request waits at most 0.5 ms before it is picked up. Namespace replays are asynchronous and do not add to the originator's latency. A write, however, waits for an acknowledgement from every rank.
+
 ## Deployment guidance
 
 - Use `Release` builds for measurement; debug logging and sanitizers materially alter timing.

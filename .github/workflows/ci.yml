@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Byte-compile test helpers
-        run: python3 -m py_compile tests/mount.py tests/usage.py tests/test_python_posix.py tests/test_source_contract.py
+        run: python3 -m py_compile tests/mount.py tests/usage.py tests/test_python_posix.py tests/test_source_contract.py python/dagonfs/__init__.py python/dagonfs/volume.py
       - name: Architectural invariants
         run: python3 tests/test_source_contract.py -v
       - name: Whitespace errors introduced by the change
@@ -63,8 +63,7 @@ jobs:
         with:
           name: dagonfs-linux-x86_64
           path: |
-            build/DAGonFS_CS.exe
-            build/DAGonFS_P2P.exe
+            build/dagonfs
             build/DAGonFS_Launcher
           retention-days: 7
 

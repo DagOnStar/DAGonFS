@@ -2,97 +2,111 @@
 
 ## 1. Purpose and design boundary
 
-DAGonFS is an ad-hoc, in-memory file system that exposes the aggregate RAM of a set of MPI processes as a single POSIX namespace through FUSE. It was conceived for the *scratch path* of scientific workflows orchestrated by DAGonStar: the intermediate files that one task produces and a downstream task consumes, and that are discarded once the workflow completes. The design deliberately trades durability for latency and aggregate bandwidth. All metadata and contents are volatile; a successful `fsync` is an ordering barrier within the in-memory service, never a persistence guarantee.
+DAGonFS is an ad-hoc, in-memory file system. It exposes the aggregate RAM of a set of MPI processes as a single POSIX namespace through FUSE. It was conceived for the *scratch path* of scientific workflows orchestrated by DAGonStar: the intermediate files that one task produces and a downstream task consumes, and that are discarded once the workflow completes. The design deliberately trades durability for latency and aggregate bandwidth. All metadata and contents are volatile. A successful `fsync` is an ordering barrier within the in-memory service, never a persistence guarantee.
 
-Two deployment models are provided. They share the namespace implementation, the inode model and the data plane, and differ only in *where* requests enter the system and *how* namespace changes are propagated.
+A DAGonFS **volume** is created by running the single executable `dagonfs` on every rank of an MPI job. The volume's *deployment model* is a run-time property of the volume, not of the build. It is chosen with `dagonfs --model`, with the `dagonfs_model` key of `DAGonFS.ini`, or with `dagonfs::VolumeOptions` in the C++ and Python APIs:
 
-| Model | Front ends (FUSE mounts) | Namespace authority | Data plane root |
+| Model | Front ends (FUSE mounts) | Namespace authority | Originator of data transfers |
 | --- | --- | --- | --- |
-| Client-server (`DAGonFS_CS.exe`) | Rank 0 only | Rank 0 | Always rank 0 |
-| Peer-to-peer (`DAGonFS_P2P.exe`) | Every rank, at `<root>/<rank>` | Replicated on every peer | The peer that originated the operation |
+| `client-server` | Rank 0 only, at `<root>` | Rank 0 | Always rank 0 |
+| `peer-to-peer` | Every rank, at `<root>/<rank>` | Replicated on every peer | The peer on which the application performed the operation |
+
+The two models share all code. They differ only in which ranks mount the volume, and in whether namespace operations are replicated to the other ranks.
 
 ```mermaid
 flowchart TB
-    subgraph CS["Client-server model"]
+    subgraph CS["client-server volume"]
         direction LR
         A1["Applications on node 0"] --> K1["VFS / FUSE"]
-        K1 --> R0["Rank 0<br/>FileSystem + MasterProcessCode"]
-        R0 <-- "MPI_Bcast / Scatterv / Gatherv" --> W1["Rank 1<br/>NodeProcessCode"]
-        R0 <--> W2["Rank 2<br/>NodeProcessCode"]
-        R0 <--> W3["Rank P-1<br/>NodeProcessCode"]
+        K1 --> R0["Rank 0<br/>FileSystem (FUSE thread)"]
+        R0 -- "requests + block slices" --> W1["Rank 1<br/>listener"]
+        R0 --> W2["Rank 2<br/>listener"]
+        R0 --> W3["Rank P-1<br/>listener"]
     end
-    subgraph P2P["Peer-to-peer model"]
+    subgraph P2P["peer-to-peer volume"]
         direction LR
-        P0["Peer 0<br/>FUSE thread + listener"] <-- "metadata replay<br/>(point-to-point)" --> P1["Peer 1<br/>FUSE thread + listener"]
-        P1 <--> P2["Peer P-1<br/>FUSE thread + listener"]
-        P0 <-- "collectives rooted at the originating peer" --> P2
+        P0["Peer 0<br/>FUSE thread · listener · replayer"] <-- "requests, block slices, acks" --> P1["Peer 1<br/>FUSE thread · listener · replayer"]
+        P1 <--> P2["Peer P-1<br/>FUSE thread · listener · replayer"]
+        P0 <--> P2
     end
 ```
 
 ## 2. Layered decomposition
 
-Every rank executes the same layered stack; the client-server storage ranks simply do not instantiate the FUSE layer.
+Every rank executes the same stack. In a client-server volume, ranks other than 0 do not instantiate the FUSE layer.
 
 ```mermaid
 flowchart TB
-    App["Application (POSIX calls, Python, shell tools)"] --> VFS["Linux VFS + FUSE kernel module<br/>(dentry/attribute/page caches)"]
-    VFS -- "/dev/fuse requests" --> FS["FileSystem<br/>FUSE low-level callbacks (src/*/include/ramfs)"]
-    FS --> NS["Namespace layer<br/>Nodes, INode, Directory, File, SymbolicLink"]
+    App["Application (POSIX calls, Python, shell tools)"] --> VFS["Linux VFS + FUSE kernel module"]
+    VFS -- "/dev/fuse requests" --> FS["FileSystem<br/>FUSE low-level callbacks (src/ramfs)"]
+    FS --> NS["Namespace layer<br/>Nodes, INode, Directory, File, SymbolicLink (src/nodes)"]
     FS --> FB["Front-end file buffer<br/>File::m_buf, capacity, dirty flag, open count"]
-    FB -- "load on open / store on flush" --> DP["Data plane<br/>DataBlockManager (scatterStore / gatherLoad)"]
-    DP --> REG["Local block registry<br/>Blocks: inode → ordered DataBlock slice"]
-    DP <-- "MPI collectives" --> NET["Other ranks"]
-    CP["Control plane<br/>MasterProcessCode / NodeProcessCode (CS)<br/>DistributedCode / RequestSender (P2P)"] --> DP
+    FB -- "load on open / store on flush" --> DP["Data plane<br/>DataBlockManager (src/mpi)"]
+    DP --> REG["Local block registry<br/>Blocks: file id → ordered DataBlock slice (src/blocks)"]
+    DP <-- "point-to-point transfers" --> NET["Other ranks"]
+    CP["Control plane<br/>RequestSender (originator) · DistributedCode (listener, replayer)"] --> DP
     FS --> CP
+    VOL["Volume API (src/volume)<br/>Options: model, root, flags · runVolume()"] --> FS
+    VOL --> CP
 ```
 
-**FUSE layer (`FileSystem`).** A single, shared implementation of the FUSE 3 low-level operations (`FileSystem.cpp`), compiled verbatim into both executables. Behaviour intrinsic to the distribution model is selected at compile time by the `DAGONFS_P2P` definition. Handlers validate inode numbers, parent types and names, and reply exactly once.
+**Volume layer (`src/volume`).** `Options` parses the model, mount root and flags from the command line and from `DAGonFS.ini`, with no MPI or FUSE dependency, so the launcher shares it. `runVolume()` starts the rank's role for the chosen model; it is the entry point of both `dagonfs` and the C++ API.
 
-**Namespace layer.** An inode table (`Nodes`) holds polymorphic `INode` objects. `Directory` maps names to inode numbers through an ordered `std::map`, which gives deterministic enumeration order and stable `readdir` offsets. `File` carries the per-file I/O state described in §4. Inode 0 is a placeholder so that the root directory receives `FUSE_ROOT_ID` (1).
+**FUSE layer (`FileSystem`).** One implementation of the FUSE 3 low-level operations. Behaviour that depends on the model is selected at run time by `FileSystem::peerToPeer`: namespace replication, inode reclamation and kernel cache timeouts. Handlers validate inode numbers, parent types and names, and reply exactly once.
 
-**Data plane (`DataBlockManager`, `Blocks`, `DataBlock`).** File contents are partitioned into fixed blocks of $B = 128\ \text{KiB}$ and distributed over all ranks with a deterministic, contiguous layout (see [DATA-PLANE.md](DATA-PLANE.md)). Each rank keeps only the blocks it owns; no process-local address ever crosses an MPI boundary.
+**Namespace layer.** An inode table (`Nodes`) holds polymorphic `INode` objects. `Directory` maps names to inode numbers through an ordered `std::map`, which gives a deterministic enumeration order and stable `readdir` offsets. `File` carries the per-file I/O state described in §4. Inode 0 is a placeholder, so the root directory receives `FUSE_ROOT_ID` (1).
 
-**Control plane.** In the client-server model, rank 0 broadcasts a request header to the storage ranks, which loop in `NodeProcessCode::start`. In the peer-to-peer model, each peer runs a listener thread (`DistributedCode::start`) that serves requests originating at other peers, while the peer's FUSE thread originates its own. The message formats are specified in [PROTOCOL.md](PROTOCOL.md).
+**Data plane (`DataBlockManager`, `Blocks`, `DataBlock`).** File contents are divided into fixed blocks of $B = 128\ \text{KiB}$ and distributed over all ranks with a deterministic, contiguous layout (see [DATA-PLANE.md](DATA-PLANE.md)). Each rank keeps only the blocks it owns. No process-local address ever crosses an MPI boundary.
+
+**Control plane (`RequestSender`, `DistributedCode`).** The rank where an operation originates sends one self-describing request message to each other rank. Every rank that is not a pure originator runs a *listener* (`DistributedCode::start`). The listener serves data transfers, block releases and acknowledgements, and hands namespace replays to a separate *replayer* thread. The message formats are specified in [PROTOCOL.md](PROTOCOL.md).
+
+### Threads per rank
+
+| Rank role | FUSE thread | Listener | Replayer |
+| --- | --- | --- | --- |
+| client-server rank 0 | yes (single-threaded FUSE loop) | — | — |
+| client-server rank r ≥ 1 | — | main thread | — |
+| peer-to-peer peer | yes | yes | yes |
+
+Peer-to-peer ranks need `MPI_THREAD_MULTIPLE`; client-server ranks need only `MPI_THREAD_SINGLE`. `dagonfs` parses the model before `MPI_Init_thread`, so each volume requests exactly the level it needs.
 
 ## 3. Client-server model
 
-Rank 0 mounts the file system and owns the complete namespace. Ranks $1 \ldots P-1$ are pure storage servers. Because only rank 0 receives kernel requests, the namespace is never replicated and every data-plane collective is rooted at rank 0. Applications must therefore run on the node hosting rank 0, while the aggregate memory of all ranks — possibly on other nodes — stores file contents.
+Rank 0 mounts the volume and owns the complete namespace. Ranks $1 \ldots P-1$ are storage servers. Only rank 0 receives kernel requests, so the namespace is never replicated and every data transfer is rooted at rank 0. Applications must therefore run on the node hosting rank 0. The aggregate memory of all ranks, possibly on other nodes, stores the file contents.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant App as Application (node of rank 0)
     participant K as Kernel / FUSE
-    participant M as Rank 0 (FileSystem + Master)
-    participant W as Ranks 1..P-1 (NodeProcessCode)
+    participant M as Rank 0 (FileSystem)
+    participant W as Ranks 1..P-1 (listener)
     App->>K: open("f", O_RDWR)
     K->>M: FUSE_OPEN(ino)
-    M->>W: MPI_Bcast {READ}, MPI_Bcast {ino, storedSize}
-    W-->>M: MPI_Gatherv(local slices)
+    M->>W: READ {id, storedSize}
+    W-->>M: block slices (tag LOAD)
     M-->>K: reply_open
     App->>K: write / read (served from m_buf)
-    K->>M: FUSE_WRITE / FUSE_READ
     App->>K: close
     K->>M: FUSE_FLUSH
-    M->>W: MPI_Bcast {WRITE}, MPI_Bcast {ino, size}
-    M->>W: MPI_Scatterv(blocks)
-    Note over W: each rank replaces its slice
+    M->>W: WRITE {id, size} + block slices (tag STORE)
+    W-->>M: ACK (slice stored)
     M-->>K: reply_err(0)
 ```
 
 ## 4. File I/O state machine
 
-A file's content lives in two places: the *distributed copy* (blocks spread over the ranks, of `m_storedSize` bytes) and, while at least one descriptor is open, the *front-end buffer* `m_buf` on the front-end rank. The buffer is a whole-file, block-aligned, zero-padded image; reads and writes are served from it at memory speed, and the distributed copy is refreshed at well-defined synchronisation points.
+A file's content lives in two places. The *distributed copy* is spread in blocks over the ranks and holds `m_storedSize` bytes. While at least one descriptor is open, the *front-end buffer* `m_buf` on the front-end rank holds a whole-file, block-aligned, zero-padded image. Reads and writes are served from the buffer at memory speed, and the distributed copy is refreshed at well-defined synchronisation points.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Closed: create / mknod
-    Closed --> Clean: open (gatherLoad if storedSize > 0)
+    Closed --> Clean: open (load if storedSize > 0)
     Closed --> Dirty: open(O_TRUNC) of non-empty file
     Clean --> Dirty: write / ftruncate
-    Dirty --> Clean: flush / fsync (scatterStore)
+    Dirty --> Clean: flush / fsync (store, wait for acks)
     Clean --> Closed: last release (buffer freed)
-    Dirty --> Closed: last release (scatterStore, buffer freed)
+    Dirty --> Closed: last release (store, buffer freed)
     Closed --> Closed: truncate(path) (load, resize, store)
     Closed --> [*]: unlink of last name (blocks released)
     Clean --> Orphan: unlink while open
@@ -100,55 +114,82 @@ stateDiagram-v2
     Orphan --> [*]: last release (no store, blocks released)
 ```
 
-The state is carried by four fields of `File`: `m_buf`/`m_capacity` (the buffer and its block-aligned size), `m_storedSize` (size of the distributed copy, which fixes the block layout for the next read), `m_openCount` (open handles; the buffer is shared by all descriptors of the inode), and the dirty flag. The logical size `st_size` may differ from `m_storedSize` between synchronisation points, e.g. after `ftruncate` grows a file; bytes beyond `m_storedSize` are materialised as zeros.
+The state is carried by four fields of `File`:
+
+* `m_buf`/`m_capacity`: the buffer and its block-aligned size.
+* `m_storedSize`: the size of the distributed copy, which fixes the block layout for the next read.
+* `m_openCount`: the number of open handles. All descriptors of the inode share one buffer.
+* The dirty flag.
+
+The logical size `st_size` may differ from `m_storedSize` between synchronisation points, for example after `ftruncate` grows a file. Bytes beyond `m_storedSize` are materialised as zeros. Reads never extend past `m_capacity`, whatever the size says.
 
 ## 5. Peer-to-peer model
 
-Each peer mounts `<root>/<rank>` and holds a full replica of the namespace. A namespace mutation performed on peer $i$ (create, mknod, mkdir, unlink, rmdir, rename, link) is applied locally, acknowledged to the kernel, and then sent to every other peer, whose listener thread *replays* it by issuing the corresponding system call on its own mount point. A thread-safe "replayed" flag, consumed at the top of the FUSE handler, prevents the replay from being re-broadcast.
+Each peer mounts `<root>/<rank>` and holds a full replica of the namespace. A namespace mutation performed on peer $i$ (create, mknod, mkdir, unlink, rmdir, rename, link) follows four steps:
 
-File data are addressed by a **cluster-wide identity** assigned at creation, $\mathit{gid} = ((r_c + 1) \ll 48) \,|\, \mathit{ino}_c$, where $r_c$ and $\mathit{ino}_c$ are the creating peer and its local inode number. The identity travels in the create message, so every peer indexes the same file under the same key even though local inode numbers diverge (for example because symbolic links are not replicated). When a remote write changes a file, the listener updates the local replica's size and invalidates the local kernel's cached attributes and pages (`fuse_lowlevel_notify_inval_inode`), so a subsequent read observes the new contents.
+1. It is applied locally.
+2. It is acknowledged to the kernel.
+3. It is sent to every other peer.
+4. On each receiving peer, the listener queues it for that peer's *replayer*, which issues the corresponding system call on the peer's own mount point.
+
+A replayed request is recognised by the requesting thread: the FUSE context reports the replayer's kernel thread id. A replay is therefore never re-broadcast, even when a local request for the same directory was queued in the kernel just before it.
+
+File data are addressed by a **cluster-wide identity** assigned at creation, $\mathit{gid} = ((r_c + 1) \ll 48) \,|\, \mathit{ino}_c$, where $r_c$ and $\mathit{ino}_c$ are the creating peer and its local inode number. The identity travels in the create message, so every peer indexes the same file under the same key, even though local inode numbers diverge (for example because symbolic links are not replicated).
+
+When a remote write changes a file, the listener updates the local replica's size. If the replayed create has not run yet, the size is kept as *pending* and applied when the create assigns the identity. The listener then invalidates the local kernel's cached pages, and only then acknowledges the write.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant A as Peer 0 FUSE thread
-    participant LA as Peer 0 listener
     participant LB as Peer 1 listener
+    participant RB as Peer 1 replayer
     participant B as Peer 1 FUSE thread
     A->>A: FUSE_CREATE "/d/f" (gid assigned)
     A->>LB: CREATE_FILE {gid, "/d/f"}
-    LB->>B: open("<root>/1/d/f", O_CREAT|O_EXCL)
+    LB->>RB: queue replay
+    RB->>B: open("<root>/1/d/f", O_CREAT|O_EXCL)
     B->>B: FUSE_CREATE (replay: adopt gid)
     Note over A: application writes, then close()
-    A->>LB: WRITE {gid, size} (one message)
-    A-->>LB: MPI_Scatterv rooted at peer 0
-    LB->>LB: store slice, update size, invalidate kernel cache
+    A->>LB: WRITE {gid, size} + block slice
+    LB->>LB: store slice, update size (or keep pending)
+    LB-->>A: ACK
+    Note over A: close() returns
 ```
+
+### 5.1 Why three threads
+
+A replayed system call is served by the peer's own FUSE thread. That thread may itself be blocked, waiting for an acknowledgement or a block slice from another peer's listener. If the listener performed replays itself, two peers writing at the same time could each wait for the other's listener, while each listener waits for its own FUSE thread, and the volume would deadlock. Replays therefore run on the replayer. The listener only performs work that completes without the local kernel, so every wait-for chain ends at a listener that can make progress.
 
 ## 6. Consistency model
 
-* **Client-server.** Rank 0 serialises all requests (the FUSE loop is single-threaded), so the file system is linearizable from the point of view of applications on node 0. Within a node, the kernel's attribute and entry caches (1 s timeouts) are kept coherent because every mutation flows through the same process.
-* **Peer-to-peer.** Namespace replication is asynchronous and ordered per originating peer (MPI's non-overtaking rule on a single communicator and tag). Data visibility follows *close-to-open* semantics: a writer's content becomes visible to other peers when it closes (or `fsync`s) the file, and a reader that opens the file afterwards obtains it. Concurrent mutations of the same object from different peers are not arbitrated.
+* **Client-server.** Rank 0 serialises all requests (the FUSE loop is single-threaded), so the file system is linearizable from the point of view of applications on node 0. The kernel's attribute and entry caches (1 s timeouts) stay coherent because every mutation flows through the same process.
+* **Peer-to-peer.**
+  * *Namespace replication* is asynchronous and ordered per originating peer, by MPI's non-overtaking rule on a single communicator and tag. A name created on one peer appears on the others shortly afterwards.
+  * *Data* follows **close-to-open** semantics. A writer's `close` (or `fsync`) returns only after every peer has stored its slice and updated its view of the file, so any `open` that starts afterwards on any peer where the name is visible observes the new content.
+  * The kernel does not cache names or attributes (timeouts 0), because the listener changes them asynchronously. Concurrent mutations of the same object from different peers are not arbitrated: the last write-back wins.
 
 ## 7. Failure model and limitations
 
-DAGonFS keeps no replica, log or checkpoint: a rank failure loses the blocks it stores and, in the client-server model, the loss of rank 0 loses the namespace. MPI's default error handler aborts the job. The following limitations are inherent to the current design and are documented rather than hidden:
+DAGonFS keeps no replica, log or checkpoint. A rank failure loses the blocks that rank stores, and in the client-server model the loss of rank 0 also loses the namespace. MPI's default error handler aborts the job. The following limitations are inherent to the current design and are documented rather than hidden:
 
-1. **Whole-file front-end buffering.** A file opened on a front end must fit in that process's memory; the distributed copy multiplies capacity but not the size of a single open file.
-2. **Concurrent originators in peer-to-peer mode.** Two peers that originate data-plane collectives at the same time on `MPI_COMM_WORLD` violate MPI's ordering requirements for collectives and can deadlock. Workflows should ensure that at any instant at most one peer is writing or opening a file, which is the natural regime of DAG-structured tasks synchronised by the engine.
-3. **Metadata not replicated in peer-to-peer mode.** `chmod`, `chown`, `utimens`, extended attributes and symbolic links are local to the peer that performed them.
-4. **No byte-range locks.** `getlk` reports `F_UNLCK`; `setlk`/`flock` are not registered.
+1. **Whole-file front-end buffering.** A file opened on a front end must fit in that process's memory. The distributed copy multiplies total capacity, but not the size of a single open file.
+2. **Metadata not replicated in peer-to-peer mode.** `chmod`, `chown`, `utimens`, extended attributes and symbolic links are local to the peer that performed them.
+3. **No byte-range locks.** `getlk` reports `F_UNLCK`; `setlk`/`flock` are not registered.
+4. **Homogeneous ranks.** Messages are raw structures, so all ranks must run the same binary on the same architecture.
 
 ## 8. Source map
 
-| Component | Client-server | Peer-to-peer |
-| --- | --- | --- |
-| Entry point | `src/client-server/main.cpp` | `src/peer-to-peer/main.cpp` |
-| FUSE callbacks (shared) | `include/ramfs/FileSystem.{hpp,cpp}` | identical copy |
-| Namespace (shared) | `include/nodes/*` | identical copy |
-| Data plane (shared) | `include/mpi/DataBlockManager.*`, `include/blocks/*` | identical copy |
-| Control plane | `include/mpi/MasterProcessCode.*`, `NodeProcessCode.*` | `include/mpi/DistributedCode.*`, `RequestSender.*` |
-| Wire formats | `include/mpi/mpi_data.hpp` | `include/mpi/mpi_data.hpp` |
-| Launcher | `src/DAGonFS_Launcher.cpp` | same |
+| Component | Location |
+| --- | --- |
+| Entry point (`dagonfs`) | `src/main.cpp` |
+| Volume API: options, ini, command line, `runVolume` | `src/volume/Options.*`, `src/volume/Volume.*` |
+| FUSE callbacks | `src/ramfs/FileSystem.*` |
+| Namespace | `src/nodes/*` |
+| Data plane | `src/mpi/DataBlockManager.*`, `src/blocks/*` |
+| Control plane | `src/mpi/RequestSender.*` (originator), `src/mpi/DistributedCode.*` (listener, replayer) |
+| Wire format | `src/mpi/mpi_data.hpp` |
+| Launcher | `src/DAGonFS_Launcher.cpp` |
+| Python API | `python/dagonfs/` |
 
-`tests/test_source_contract.py` fails if any shared file diverges between the two trees.
+`tests/test_source_contract.py` checks mechanically that there is no model-specific source tree and no compile-time model switch.

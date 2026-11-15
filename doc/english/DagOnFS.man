@@ -1,8 +1,16 @@
-.TH DAGonFS 1 "21 June 2026" "DAGonFS" "DAGonFS"
+.TH DAGonFS 1 "15 November 2026" "DAGonFS" "DAGonFS"
 .SH NAME
 DAGonFS \- MPI-distributed in-memory filesystem using FUSE3
 .SH SYNOPSIS
+.B mpirun \-np
+.I P
+.B dagonfs
+[\fB\-\-model\fR \fIclient-server\fR|\fIpeer-to-peer\fR]
+[\fB\-\-config\fR \fIfile\fR] [\fB\-f\fR|\fB\-d\fR] [\fB\-\-log\fR]
+.I root
+.br
 .B DAGonFS_Launcher
+[\fIDAGonFS.ini\fR] [\fB\-\-model\fR \fIM\fR] [\fB\-\-dry-run\fR]
 .br
 .SH DESCRIPTION
 .B DAGonFS
@@ -10,9 +18,22 @@ is an in-memory FUSE3 filesystem for temporary workflow data. It coordinates fil
 data between MPI processes using either a client-server or peer-to-peer model.
 It is not durable storage: unmounting or stopping the service discards its contents.
 .PP
+.B dagonfs
+runs on every rank of an MPI job. The deployment model is chosen per volume:
+.B client-server
+(the default) mounts
+.I root
+on rank 0;
+.B peer-to-peer
+mounts
+.IR root / rank
+on every rank and replicates the namespace. Precedence, lowest first: defaults, the program
+name (the aliases DAGonFS_CS.exe and DAGonFS_P2P.exe), the configuration file, explicit options.
+.PP
 .B DAGonFS_Launcher
-reads DAGonFS.ini in its current directory and invokes MPI with the configured model,
-mountpoint, and logging settings. The executable requires FUSE3 and Open MPI.
+reads DAGonFS.ini (by default in its current directory) and runs mpirun with the configured
+model, mount point and logging settings. Unmount the mount point (any peer's in peer-to-peer
+mode) with fusermount3 \-u to stop the volume.
 .SH POSIX OPERATIONS
 The filesystem supports regular file and directory creation, lookup, reads, writes,
 renames, links, symbolic links, metadata changes, extended attributes, statfs, and

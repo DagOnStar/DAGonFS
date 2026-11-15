@@ -14,32 +14,15 @@ job, even when the tests fail. Extra arguments after ``--`` are passed to
 import argparse
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
 import time
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "python"))
 
-
-def is_mounted(path):
-    path = os.path.realpath(path)
-    try:
-        with open("/proc/self/mounts", encoding="utf-8") as mounts:
-            return any(line.split()[1] == path for line in mounts)
-    except FileNotFoundError:  # macOS
-        return os.path.ismount(path)
-
-
-def unmount(path):
-    if not is_mounted(path):
-        return
-    if sys.platform == "darwin":
-        command = ["umount", path]
-    else:
-        command = [shutil.which("fusermount3") or "fusermount", "-u", path]
-    subprocess.run(command, check=False)
+from dagonfs import MODELS, Volume  # noqa: E402
 
 
 def wait_for(predicate, timeout):
@@ -79,13 +62,63 @@ def peer_to_peer_checks(root, peer):
     (first / "p2p-renamed").rmdir()
     if not wait_for(lambda: not (last / "p2p-renamed").exists(), 10):
         raise AssertionError("directory removal did not replicate")
+    concurrent_originators(first, last)
     print("peer-to-peer replication checks: OK")
+
+
+def concurrent_originators(first, last, files=12):
+    """Two peers create, write and read files at the same time.
+
+    Each peer is the root of its own transfers while serving the other's, which
+    exercises the point-to-point data plane (concurrent collectives on one
+    communicator would be erroneous) and the write acknowledgements.
+    """
+    import threading
+
+    def payload(tag, index):
+        return (f"{tag}-{index}-".encode() * 40_000)[: 150_000 + 9_973 * index]
+
+    errors = []
+
+    def writer(mount, tag):
+        try:
+            (mount / f"conc-{tag}").mkdir()
+            for index in range(files):
+                (mount / f"conc-{tag}" / f"f{index}").write_bytes(payload(tag, index))
+        except Exception as error:  # reported by the main thread
+            errors.append(error)
+
+    threads = [threading.Thread(target=writer, args=(first, "a")),
+               threading.Thread(target=writer, args=(last, "b"))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(120)
+        if thread.is_alive():
+            raise AssertionError("concurrent writers did not finish (deadlock?)")
+    if errors:
+        raise AssertionError(f"concurrent writer failed: {errors[0]!r}")
+    # Each peer reads what the other one wrote.
+    for mount, tag in ((last, "a"), (first, "b")):
+        for index in range(files):
+            observed = (mount / f"conc-{tag}" / f"f{index}").read_bytes()
+            expected = payload(tag, index)
+            if observed != expected:
+                first_difference = next((i for i, (x, y) in enumerate(zip(observed, expected)) if x != y),
+                                        min(len(observed), len(expected)))
+                raise AssertionError(f"conc-{tag}/f{index}: content differs across peers "
+                                     f"(read {len(observed)} bytes, expected {len(expected)}; "
+                                     f"first difference at byte {first_difference})")
+    for tag in ("a", "b"):
+        for index in range(files):
+            (first / f"conc-{tag}" / f"f{index}").unlink()
+        (first / f"conc-{tag}").rmdir()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--build-dir", default="build", type=Path)
-    parser.add_argument("--model", choices=("client-server", "peer-to-peer"), default="client-server")
+    parser.add_argument("--model", choices=MODELS, default="client-server")
     parser.add_argument("--ranks", type=int, default=2)
     parser.add_argument("--root", type=Path, default=None, help="mount root (default: a new temporary directory)")
     parser.add_argument("--mpirun", default=os.environ.get("MPIRUN", "mpirun"))
@@ -95,31 +128,22 @@ def main():
     parser.add_argument("mpirun_args", nargs="*")
     args = parser.parse_args()
 
-    executable = "DAGonFS_CS.exe" if args.model == "client-server" else "DAGonFS_P2P.exe"
-    binary = (args.build_dir / executable).resolve()
+    binary = (args.build_dir / "dagonfs").resolve()
     if not binary.exists():
         parser.error(f"{binary} does not exist; build the project first")
 
     root = args.root or Path(tempfile.mkdtemp(prefix="dagonfs-mount-"))
-    root.mkdir(parents=True, exist_ok=True)
     peer_rank = args.ranks - 1 if args.peer_rank is None else args.peer_rank
-    if args.model == "client-server":
-        mountpoints = [root]
-    else:
-        # Only the mount points of ranks on this host can be observed locally.
-        mountpoints = [root / "0"] + ([root / str(peer_rank)] if peer_rank > 0 else [])
-    command = [args.mpirun, "-np", str(args.ranks), *args.mpirun_args, str(binary), "-f", str(root), "0"]
-    print("starting:", " ".join(command), flush=True)
-    log = open(root.parent / f"{root.name}.log", "w", encoding="utf-8")
-    job = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=root.parent)
+    # Only the mount points of ranks on this host can be observed locally.
+    local_ranks = [0] + ([peer_rank] if args.model == "peer-to-peer" and peer_rank > 0 else [])
+    volume = Volume(root, model=args.model, ranks=args.ranks, executable=binary, mpirun=args.mpirun,
+                    mpirun_args=args.mpirun_args, local_ranks=local_ranks)
+    print("starting:", " ".join(volume.command()), flush=True)
 
     status = 1
     try:
-        if not wait_for(lambda: all(is_mounted(m) for m in mountpoints) or job.poll() is not None, args.timeout):
-            raise RuntimeError("DAGonFS did not mount in time")
-        if job.poll() is not None:
-            raise RuntimeError(f"DAGonFS exited early with status {job.returncode}")
-        env = dict(os.environ, DAGONFS_MOUNTPOINT=str(mountpoints[0]))
+        volume.start(timeout=args.timeout)
+        env = dict(os.environ, DAGONFS_MOUNTPOINT=str(volume.mountpoint(0)))
         result = subprocess.run([sys.executable, str(HERE / "test_python_posix.py"), "-v"], env=env)
         status = result.returncode
         if status == 0 and args.model == "peer-to-peer" and args.ranks > 1:
@@ -128,23 +152,10 @@ def main():
         print(f"error: {error}", file=sys.stderr)
         status = status or 1
     finally:
-        for mountpoint in mountpoints:
-            unmount(str(mountpoint))
-        try:
-            job.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            job.terminate()
-            try:
-                job.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                job.kill()
-                job.wait()
-        for mountpoint in mountpoints:
-            unmount(str(mountpoint))
-        log.close()
-        print(f"DAGonFS job exited with status {job.returncode}; log: {log.name}")
-        if job.returncode not in (0, None) and status == 0:
-            status = job.returncode
+        job_status = volume.stop()
+        print(f"DAGonFS job exited with status {job_status}; log: {volume.log_path}")
+        if job_status not in (0, None) and status == 0:
+            status = job_status
     return status
 
 

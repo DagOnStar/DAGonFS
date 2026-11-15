@@ -12,7 +12,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VARIANTS = ("client-server", "peer-to-peer")
+SRC = ROOT / "src"
 REQUIRED_OPERATIONS = (
     "getattr", "lookup", "forget", "setattr", "readlink", "mknod", "mkdir",
     "unlink", "rmdir", "symlink", "rename", "link", "open", "read", "write",
@@ -22,32 +22,13 @@ REQUIRED_OPERATIONS = (
     "destroy", "forget_multi",
 )
 
-# Files that must be byte-identical in both trees: shared filesystem
-# behaviour is implemented once and specialised with DAGONFS_P2P.
-SHARED_FILES = (
-    "ramfs/FileSystem.cpp",
-    "ramfs/FileSystem.hpp",
-    "nodes/File.cpp",
-    "nodes/File.hpp",
-    "nodes/Directory.cpp",
-    "nodes/Directory.hpp",
-    "nodes/INode.cpp",
-    "nodes/INode.hpp",
-    "nodes/Nodes.cpp",
-    "nodes/Nodes.hpp",
-    "blocks/Blocks.cpp",
-    "blocks/Blocks.hpp",
-    "blocks/DataBlock.cpp",
-    "blocks/DataBlock.hpp",
-    "mpi/DataBlockManager.cpp",
-    "mpi/DataBlockManager.hpp",
-    "utils/ArgumentParser.cpp",
-    "utils/ArgumentParser.hpp",
-)
+
+def source(relative):
+    return (SRC / relative).read_text()
 
 
-def source(variant, relative):
-    return (ROOT / "src" / variant / "include" / relative).read_text()
+def all_sources():
+    return sorted(p for p in SRC.rglob("*") if p.suffix in (".cpp", ".hpp"))
 
 
 def handler_bodies(text):
@@ -62,55 +43,69 @@ def handler_bodies(text):
 
 
 class FuseSourceContractTests(unittest.TestCase):
-    def test_shared_sources_are_identical_in_both_trees(self):
-        for relative in SHARED_FILES:
-            with self.subTest(file=relative):
-                self.assertEqual(source(VARIANTS[0], relative), source(VARIANTS[1], relative),
-                                 f"{relative} diverged between the two trees")
+    def test_single_code_base_without_model_specific_trees(self):
+        # Both deployment models are built from one tree and chosen at run time.
+        self.assertFalse((SRC / "client-server").exists())
+        self.assertFalse((SRC / "peer-to-peer").exists())
+        for path in all_sources():
+            with self.subTest(file=str(path.relative_to(ROOT))):
+                self.assertNotIn("DAGONFS_P2P", path.read_text(), "the model is a run-time choice")
+
+    def test_model_is_selected_at_run_time(self):
+        options = source("volume/Options.cpp")
+        self.assertIn('"peer-to-peer"', options)
+        self.assertIn('"dagonfs_model"', options)
+        self.assertIn('"--model"', options)
+        volume = source("volume/Volume.cpp")
+        self.assertIn("MPI_THREAD_MULTIPLE", volume)
 
     def test_required_callbacks_are_registered_and_defined(self):
-        text = source(VARIANTS[0], "ramfs/FileSystem.cpp")
+        text = source("ramfs/FileSystem.cpp")
         for operation in REQUIRED_OPERATIONS:
             with self.subTest(operation=operation):
                 self.assertIn(f"FuseOperations.{operation}", text)
 
     def test_every_error_reply_is_followed_by_return(self):
         # AGENTS.md: after fuse_reply_* on an error path, return immediately.
-        text = source(VARIANTS[0], "ramfs/FileSystem.cpp")
+        text = source("ramfs/FileSystem.cpp")
         for name, body in handler_bodies(text):
             lines = [line.strip() for line in body.splitlines()]
             for index, line in enumerate(lines):
                 if line.startswith("fuse_reply_") and index + 1 < len(lines):
                     following = next((l for l in lines[index + 1:] if l), "}")
-                    if following in ("return;", "}", "#endif", "#else", "#ifdef DAGONFS_P2P"):
+                    if following in ("return;", "}", "#endif", "#else"):
+                        continue
+                    is_error = line.startswith("fuse_reply_err(") and not line.startswith("fuse_reply_err(req, 0)")
+                    if following.startswith("if (peerToPeer") and not is_error:
+                        # Replication to the other peers after a successful reply.
                         continue
                     with self.subTest(handler=name, line=line):
                         self.fail(f"{name}: '{line}' is followed by '{following}'")
 
     def test_getlk_always_replies(self):
-        text = source(VARIANTS[0], "ramfs/FileSystem.cpp")
+        text = source("ramfs/FileSystem.cpp")
         start = text.index("void FileSystem::FuseGetLock")
         body = text[start:text.index("\n}\n", start)]
         self.assertIn("fuse_reply_lock(req, lock);", body)
 
     def test_batched_forget_replies_once(self):
-        text = source(VARIANTS[0], "ramfs/FileSystem.cpp")
+        text = source("ramfs/FileSystem.cpp")
         start = text.index("void FileSystem::FuseForgetMulti")
         body = text[start:text.index("\n}\n", start)]
         self.assertEqual(body.count("fuse_reply_none(req);"), 1)
 
     def test_directory_creation_can_insert_a_new_name(self):
-        text = source(VARIANTS[0], "nodes/Directory.cpp")
+        text = source("nodes/Directory.cpp")
         start = text.index("fuse_ino_t Directory::UpdateChild")
         body = text[start:text.index("fuse_ino_t Directory::DeleteChild", start)]
         self.assertIn("m_children.emplace(name, ino);", body)
 
     def test_creation_handlers_reject_existing_names(self):
-        text = source(VARIANTS[0], "ramfs/FileSystem.cpp")
+        text = source("ramfs/FileSystem.cpp")
         self.assertGreaterEqual(text.count("fuse_reply_err(req, EEXIST);"), 5)
 
     def test_readdir_offsets_are_not_pointers(self):
-        text = source(VARIANTS[0], "ramfs/FileSystem.cpp")
+        text = source("ramfs/FileSystem.cpp")
         start = text.index("void FileSystem::FuseReadDir")
         body = text[start:text.index("\n}\n", start)]
         self.assertNotIn("const_iterator *", body)
@@ -118,37 +113,57 @@ class FuseSourceContractTests(unittest.TestCase):
 
     def test_no_process_local_pointers_in_mpi_packets(self):
         # AGENTS.md: never transmit raw process-local pointers.
-        for variant in VARIANTS:
-            text = source(variant, "mpi/mpi_data.hpp")
-            with self.subTest(variant=variant):
-                self.assertNotIn("PointerPacket", text)
-                self.assertIsNone(re.search(r"void\s*\*", text))
+        text = source("mpi/mpi_data.hpp")
+        self.assertNotIn("PointerPacket", text)
+        self.assertIsNone(re.search(r"void\s*\*", text))
 
     def test_peer_requests_use_bounded_paths(self):
-        text = source("peer-to-peer", "mpi/mpi_data.hpp")
+        text = source("mpi/mpi_data.hpp")
         self.assertIn("DAGONFS_MAX_REQUEST_PATH = 4096", text)
         self.assertNotIn("[256]", text)
-        sender = source("peer-to-peer", "mpi/RequestSender.cpp")
+        sender = source("mpi/RequestSender.cpp")
         self.assertIn("DAGONFS_MAX_REQUEST_PATH - 1", sender)
-        listener = source("peer-to-peer", "mpi/DistributedCode.cpp")
+        listener = source("mpi/DistributedCode.cpp")
         self.assertIn("firstLength >= DAGONFS_MAX_REQUEST_PATH", listener)
         self.assertIn("sizeof(PeerRequest) + firstLength + secondLength != static_cast<size_t>(count)", listener)
 
     def test_listener_receives_each_request_as_one_probed_message(self):
-        text = source("peer-to-peer", "mpi/DistributedCode.cpp")
+        text = source("mpi/DistributedCode.cpp")
         start = text.index("void DistributedCode::start()")
         body = text[start:text.index("\n}\n", start)]
-        self.assertEqual(body.count("MPI_ANY_SOURCE"), 1, "only the probe may match any source")
+        self.assertIn("waitForRequest(status);", body)
+        self.assertNotIn("MPI_Probe(", text, "a blocking probe starves the FUSE thread under MPI_THREAD_MULTIPLE")
+        self.assertEqual(text.count("MPI_ANY_SOURCE"), 1, "only the probe may match any source")
         self.assertIn("MPI_Get_count", body)
         self.assertIn("MPI_Recv(message.data(), count, MPI_BYTE, source", body)
 
+    def test_replays_are_identified_per_request_and_never_block_the_listener(self):
+        text = source("ramfs/FileSystem.cpp")
+        self.assertEqual(text.count("const bool replay = IsReplay(req, "), 6)
+        self.assertIn("fuse_req_ctx(req)->pid", text)
+        listener = source("mpi/DistributedCode.cpp")
+        start = listener.index("void DistributedCode::start()")
+        body = listener[start:listener.index("\n}\n", start)]
+        for call in ("createFile(", "deleteFile(", "createDir(", "deleteDir(", "renameHandler(", "linkHandler("):
+            with self.subTest(call=call):
+                self.assertNotIn(call, body, "the listener must queue replays, not perform them")
+
+    def test_data_plane_uses_no_collectives_on_the_shared_communicator(self):
+        # Peers originate transfers concurrently; concurrent collectives on one
+        # communicator are erroneous MPI, so the data plane is point-to-point.
+        for relative in ("mpi/DataBlockManager.cpp", "mpi/DistributedCode.cpp", "mpi/RequestSender.cpp"):
+            text = source(relative)
+            with self.subTest(file=relative):
+                self.assertIsNone(re.search(r"MPI_(Scatterv|Gatherv|Bcast|Barrier|Allreduce)\(", text))
+        self.assertIn("DAGONFS_TAG_ACK", source("mpi/DistributedCode.cpp"))
+
     def test_block_registry_does_not_create_entries_for_read_only_queries(self):
-        text = source(VARIANTS[0], "blocks/Blocks.cpp")
+        text = source("blocks/Blocks.cpp")
         self.assertIn("return FileSystemDataBlocks.find(inode) != FileSystemDataBlocks.end();", text)
         self.assertIn("blocks == FileSystemDataBlocks.end() ? 0", text)
 
     def test_data_blocks_own_their_memory(self):
-        header = source(VARIANTS[0], "blocks/DataBlock.hpp")
+        header = source("blocks/DataBlock.hpp")
         self.assertNotIn("setData", header, "blocks must not adopt foreign addresses")
         self.assertIn("DataBlock(const DataBlock &) = delete;", header)
 
@@ -157,10 +172,17 @@ class FuseSourceContractTests(unittest.TestCase):
         self.assertNotIn("system(", text)
         self.assertIn("execvp(", text)
 
-    def test_p2p_build_defines_the_model_macro(self):
+    def test_build_produces_one_executable_and_waits_for_log4cplus(self):
         text = (ROOT / "CMakeLists.txt").read_text()
-        self.assertRegex(text, r"target_compile_definitions\(\$\{PROJECT_NAME\}_P2P\.exe PRIVATE [^)]*DAGONFS_P2P")
-        self.assertIn('add_dependencies("${PROJECT_NAME}_CS.exe" log4cplus)', text)
+        self.assertIn("add_executable(dagonfs src/main.cpp)", text)
+        self.assertIn("add_dependencies(dagonfs_core log4cplus)", text)
+        self.assertNotIn("DAGONFS_P2P", text)
+
+    def test_main_treats_argv_as_read_only(self):
+        # AGENTS.md: argv is immutable; FUSE receives an owned copy.
+        self.assertIsNone(re.search(r"argv\[[^\]]*\]\s*=[^=]", source("main.cpp")))
+        self.assertIn("const char *const argv[]", source("volume/Options.hpp"))
+        self.assertIn("parser.copy_args", source("ramfs/FileSystem.cpp"))
 
 
 if __name__ == "__main__":
