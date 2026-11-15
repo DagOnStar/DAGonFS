@@ -20,6 +20,7 @@ import shutil
 import socket
 import subprocess
 import stat
+import struct
 import sys
 import tempfile
 import threading
@@ -54,6 +55,16 @@ def start_helper(*args):
     """Start lock_helper.py in the background (stdin and stdout are pipes)."""
     return subprocess.Popen([sys.executable, LOCK_HELPER] + [str(a) for a in args], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, universal_newlines=True)
+
+
+def finish(process, timeout=10.0):
+    """Wait for a helper started by start_helper, close its pipes and return its exit status."""
+    try:
+        return process.wait(timeout)
+    finally:
+        for stream in (process.stdin, process.stdout):
+            if stream:
+                stream.close()
 
 
 def read_line(process, timeout=10.0):
@@ -313,8 +324,13 @@ class PythonPosixIntegrationTests(unittest.TestCase):
             os.getxattr(path, "user.dagonfs")
         self.assertEqual(raised.exception.errno, errno.ENODATA)
         # POSIX ACLs are not enforced, hence refused rather than silently stored.
+        # A valid ACL (user::rw-, group::r--, other::r--): newer kernels turn an
+        # ACL without entries into a removal, which never reaches DAGonFS.
+        undefined = 0xFFFFFFFF
+        acl = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", tag, perm, undefined)
+                                               for tag, perm in ((0x01, 6), (0x04, 4), (0x20, 4)))
         with self.assertRaises(OSError) as raised:
-            os.setxattr(path, "system.posix_acl_access", b"\x02\x00\x00\x00")
+            os.setxattr(path, "system.posix_acl_access", acl)
         self.assertIn(raised.exception.errno, (errno.EOPNOTSUPP, errno.ENOTSUP))
 
 
@@ -343,7 +359,7 @@ class PythonPosixIntegrationTests(unittest.TestCase):
             self.assertIsNone(read_line(waiter, 0.5), "the waiter must block while the range is locked")
             fcntl.lockf(fd, fcntl.LOCK_UN, 100, 0, os.SEEK_SET)
             self.assertEqual(read_line(waiter), "granted")
-            self.assertEqual(waiter.wait(10), 0)
+            self.assertEqual(finish(waiter), 0)
         finally:
             os.close(fd)
 
@@ -387,7 +403,7 @@ class PythonPosixIntegrationTests(unittest.TestCase):
         finally:
             os.close(fd)
         self.assertEqual(read_line(peer), "granted")
-        self.assertEqual(peer.wait(10), 0)
+        self.assertEqual(finish(peer), 0)
 
     def test_flock_between_processes(self):
         path = self.workdir / "flocked"
@@ -404,7 +420,7 @@ class PythonPosixIntegrationTests(unittest.TestCase):
             self.assertIsNone(read_line(waiter, 0.5))
         # The last close of the open file description releases the lock.
         self.assertEqual(read_line(waiter), "granted")
-        self.assertEqual(waiter.wait(10), 0)
+        self.assertEqual(finish(waiter), 0)
 
     def test_locked_read_modify_write_counter(self):
         # Four processes increment a counter under a lock: no update may be lost.
@@ -414,7 +430,7 @@ class PythonPosixIntegrationTests(unittest.TestCase):
             workers = [start_helper("count", counter, 25, kind) for _ in range(4)]
             for worker in workers:
                 self.assertEqual(read_line(worker, 120), "done")
-                self.assertEqual(worker.wait(10), 0)
+                self.assertEqual(finish(worker), 0)
             self.assertEqual(int(counter.read_bytes()), 100, kind)
 
     # ------------------------------------------- space, ranges and copies

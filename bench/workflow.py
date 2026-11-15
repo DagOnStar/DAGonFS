@@ -9,6 +9,9 @@ the producer's output into the consumer's scratch directory.
 * ``large``: a producer writes W files of S MiB; W parallel tasks each stage one
   file, copy it and write a twice-as-large output; a reducer stages all outputs
   and concatenates them.
+* ``python``: the same dataflow as ``large``, but every task is a Python
+  program (``bench/pytask.py``) that reads and writes its files with Python
+  file objects in 1 MiB requests; the reducer verifies every byte.
 * ``small``: a producer writes a directory of N files of 8 KiB; W parallel tasks
   each stage the whole directory and pack it into a tar archive; a reducer
   stages and concatenates the archives.
@@ -20,6 +23,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
+import shlex
 import shutil
 import sys
 import time
@@ -40,6 +44,14 @@ def build(kind, workflow, width, size_mib, files):
                                    f"cat in.bin in.bin > out.bin"))
         inputs = " ".join(f"workflow:///B{i}/out.bin" for i in range(width))
         tasks.append(DagonTask(TaskType.BATCH, "C", f"cat {inputs} > all.bin && wc -c all.bin > size.txt"))
+    elif kind == "python":
+        task = f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve().with_name('pytask.py')))}"
+        tasks = [DagonTask(TaskType.BATCH, "A", f"{task} produce --parts {width} --size-mib {size_mib}")]
+        for i in range(width):
+            tasks.append(DagonTask(TaskType.BATCH, f"B{i}",
+                                   f"{task} transform --input workflow:///A/part{i}.bin --output out.bin"))
+        inputs = " ".join(f"workflow:///B{i}/out.bin" for i in range(width))
+        tasks.append(DagonTask(TaskType.BATCH, "C", f"{task} reduce --output all.bin {inputs}"))
     else:
         produce = (f"mkdir files && for i in $(seq 1 {files}); do "
                    f"head -c 8192 /dev/zero > files/f$i.dat; done")
@@ -67,7 +79,7 @@ def run_once(kind, scratch, width, size_mib, files):
     # The reducer's output proves that every stage ran and staged its inputs.
     sizes = [int(p.read_text().split()[0]) for p in base.rglob("size.txt")]
     shutil.rmtree(base, ignore_errors=True)
-    expected = width * 2 * size_mib << 20 if kind == "large" else None
+    expected = width * 2 * size_mib << 20 if kind in ("large", "python") else None
     if failed or len(sizes) != 1 or (expected is not None and sizes[0] != expected) or sizes[0] == 0:
         raise RuntimeError(f"workflow incomplete: failed={failed} reducer sizes={sizes} expected={expected}")
     return elapsed
@@ -76,9 +88,9 @@ def run_once(kind, scratch, width, size_mib, files):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dir", required=True, type=Path, help="scratch base on the file system under test")
-    parser.add_argument("--kind", choices=("large", "small"), default="large")
+    parser.add_argument("--kind", choices=("large", "python", "small"), default="large")
     parser.add_argument("--width", type=int, default=8, help="parallel tasks")
-    parser.add_argument("--size-mib", type=int, default=64, help="large: MiB per producer file")
+    parser.add_argument("--size-mib", type=int, default=64, help="large, python: MiB per producer file")
     parser.add_argument("--files", type=int, default=2000, help="small: files written by the producer")
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Charts and Markdown tables from bench/run.py results (requires matplotlib).
 
-    python bench/plot.py --out figures bench/results/single.json [bench/results/two-nodes.json:2n]
+    python bench/plot.py --out figures bench/results/single.json \
+        [bench/results/two-nodes.json:"2 nodes":dagonfs-cs,dagonfs-p2p]
 
 A ``:label`` suffix marks a result file whose targets are shown as
-"<target> (<label>)", for example the same volumes spread over two nodes.
+"<target>, <label>", for example the same volumes spread over two nodes; a
+further ``:target,...`` suffix keeps only those targets of that file.
 """
 
 import argparse
@@ -29,10 +31,14 @@ def load(specs):
     targets = {}
     meta = []
     for spec in specs:
-        path, _, label = spec.partition(":")
+        path, _, rest = spec.partition(":")
+        label, _, keep = rest.partition(":")
+        keep = set(keep.split(",")) if keep else None
         data = json.loads(Path(path).read_text())
         meta.append((data.get("nodes"), data.get("ranks"), label))
         for key, value in data["targets"].items():
+            if keep is not None and key not in keep:
+                continue
             name = NAMES.get(key, key) + (f", {label}" if label else "")
             targets[name] = value
     return targets, meta
@@ -112,12 +118,21 @@ def figure_throughput(targets, out):
     plt.close(fig)
 
 
+WORKFLOWS = ("workflow_large", "workflow_python", "workflow_small")
+
+
+def workflow_keys(targets):
+    """Workflow kinds present in every target (older result files lack workflow_python)."""
+    return [key for key in WORKFLOWS if all(key in run for run in targets.values())]
+
+
 def figure_workflow(targets, out):
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
     names = list(targets)
-    titles = {key: "DAGonStar dataflow, " + workflow_label(targets[names[0]][key])
-              for key in ("workflow_large", "workflow_small")}
-    for ax, key in zip(axes, ("workflow_large", "workflow_small")):
+    keys = workflow_keys(targets)
+    fig, axes = plt.subplots(1, len(keys), figsize=(5.6 * len(keys), 4.4), squeeze=False)
+    axes = list(axes[0])
+    titles = {key: "DAGonStar, " + workflow_label(targets[names[0]][key]) for key in keys}
+    for ax, key in zip(axes, keys):
         med = [statistics.median(targets[t][key]["seconds"]) for t in names]
         low = [m - min(targets[t][key]["seconds"]) for m, t in zip(med, names)]
         high = [max(targets[t][key]["seconds"]) - m for m, t in zip(med, names)]
@@ -126,11 +141,11 @@ def figure_workflow(targets, out):
         base = med[names.index(NAMES["nfs"])] if NAMES["nfs"] in names else None
         for bar, value, name, up in zip(bars, med, names, high):
             faster = base and value and name != NAMES["nfs"]
-            label = f"{value:.1f} s" + (f"\n{base / value:.2f}× vs NFS" if faster else "")
+            label = f"{value:.1f} s" + (f"\n{base / value:.1f}×" if faster else "")
             # Above the whisker, so that the label never overlaps it.
             ax.annotate(label, (bar.get_x() + bar.get_width() / 2, value + up), ha="center", va="bottom",
                         fontsize=7.5, color=MUTED, xytext=(0, 3), textcoords="offset points")
-        ax.set_xticks(range(len(names)), [n.replace(" ", "\n", 1) for n in names], fontsize=7.5)
+        ax.set_xticks(range(len(names)), [n.replace(" ", "\n", 1).replace(", ", "\n") for n in names], fontsize=7.5)
         ax.set_title(titles[key], loc="left", color=INK, fontsize=11)
         ax.set_ylim(0, max(m + h for m, h in zip(med, high)) * 1.3)
         style(ax, "wall time, s (median; whiskers: min–max)" if ax is axes[0] else "")
@@ -142,6 +157,8 @@ def figure_workflow(targets, out):
 def workflow_label(run):
     if run["kind"] == "large":
         return f"{run['width']} × {run['size_mib']} MiB"
+    if run["kind"] == "python":
+        return f"Python tasks, {run['width']} × {run['size_mib']} MiB"
     return f"{run['files']} × 8 KiB files, {run['width']} tasks"
 
 
@@ -161,7 +178,7 @@ def tables(targets):
         for kind in ("write", "read"):
             row(f"{size} MiB {kind} (MiB/s)",
                 [targets[t]["fs"]["large"][index][f"{kind}_MiBps"]["median"] for t in names], "{:,.0f}")
-    for key in ("workflow_large", "workflow_small"):
+    for key in workflow_keys(targets):
         label = f"DAGonStar, {workflow_label(targets[names[0]][key])} (s)"
         row(label, [statistics.median(targets[t][key]["seconds"]) for t in names], "{:.2f}")
     return "\n".join(lines)

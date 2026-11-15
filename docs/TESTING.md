@@ -99,12 +99,25 @@ python3 tests/dagonstar/run_workflow.py --build-dir build --model peer-to-peer  
 `tests/slurm/multinode.sbatch` runs both models with the ranks of the allocation. It places ranks 0 and 1 on the first node (`--map-by slot`), so the harness can observe both mount points locally while data blocks are stored on every node.
 
 ```bash
-sbatch -p <partition> -N 2 --ntasks-per-node=2 tests/slurm/multinode.sbatch build
+sbatch -p <partition> -N 2 --ntasks-per-node=2 tests/slurm/multinode.sbatch build [python]
 ```
 
-Every allocated node needs `/dev/fuse`, a set-uid `fusermount3` and the libfuse3 runtime. On clusters where only some node classes provide FUSE, select them with `-w`/`--constraint`.
+For each model the script runs the mounted suite (`tests/mount.py`, with the peer-to-peer checks between ranks 0 and 1) and then, when `<python>` can import DAGonStar, the workflow of §2.2 with eight Python tasks. It exits non-zero if any of the four runs fails.
+
+Every allocated node needs `/dev/fuse` and the libfuse3 runtime. The script sources `tests/slurm/fuse-env.sh`, which accepts either helper: when a node has only the FUSE 2 `fusermount` (as on the `low-wn` partition of §4.0), it creates a `fusermount3` link to it in a directory of the submission directory, which every node sees, and puts it first on `PATH`. On clusters where only some node classes provide FUSE, select them with a partition or `--constraint`.
 
 ## 4. Recorded results
+
+### 4.0a Slurm partition `low-wn`, one and two nodes (15 November 2026)
+
+`tests/slurm/multinode.sbatch` on the `low-wn` nodes (Rocky Linux 8.10, kernel 4.18, libfuse 3.3.0 runtime with only the FUSE 2 `fusermount`, used through `tests/slurm/fuse-env.sh`; Open MPI 4.1.4; DAGonStar 1.0.2 on Python 3.11.13):
+
+| Job | Nodes | Ranks | Suite (30 scenarios) | Peer-to-peer checks | DAGonStar workflow, 8 Python tasks |
+| --- | --- | --- | --- | --- | --- |
+| 19446 | wn01 | 4 | 30/30 pass in both models | pass | 10/10 tasks, consistent result, both models (13.1 / 13.2 s) |
+| 19447 | wn01–wn02 | 2 + 2 | 30/30 pass in both models | pass | 10/10 tasks, consistent result, both models (13.7 / 16.8 s) |
+
+Every job shut down cleanly. The benchmark of [PERFORMANCE.md](PERFORMANCE.md) §4 (jobs 19453 and 19454) then ran nine DAGonStar workflows per volume, including the Python-task workflow, whose reducer verifies every byte; all completed with the expected output. The run fixed one test defect: the lock scenarios left the helper processes' pipes open (`ResourceWarning`), and they are now closed by `finish()`.
 
 ### 4.0 Full POSIX operation coverage (15 November 2026)
 

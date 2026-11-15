@@ -46,6 +46,9 @@ def benchmark(directory, args):
     out["workflow_large"] = run_json([python, HERE / "workflow.py", "--dir", directory, "--kind", "large",
                                       "--width", args.width, "--size-mib", args.size_mib,
                                       "--repeats", args.workflow_repeats])
+    out["workflow_python"] = run_json([python, HERE / "workflow.py", "--dir", directory, "--kind", "python",
+                                       "--width", args.width, "--size-mib", args.size_mib,
+                                       "--repeats", args.workflow_repeats])
     out["workflow_small"] = run_json([python, HERE / "workflow.py", "--dir", directory, "--kind", "small",
                                       "--width", args.width, "--files", args.files,
                                       "--repeats", args.workflow_repeats])

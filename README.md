@@ -135,7 +135,7 @@ The complete wire specification and ordering guarantees are in [docs/PROTOCOL.md
 
 ## Getting started
 
-Requirements: CMake ≥ 3.20, a C++23 compiler, MPI (Open MPI ≥ 4.1 tested; `MPI_THREAD_MULTIPLE` for peer-to-peer), libfuse ≥ 3.3 with `fusermount3`. The first configure downloads log4cplus.
+Requirements: CMake ≥ 3.20, a C++23 compiler, MPI (Open MPI ≥ 4.1 tested; `MPI_THREAD_MULTIPLE` for peer-to-peer), libfuse ≥ 3.3 with `fusermount3` (or the FUSE 2 `fusermount`, through `tests/slurm/fuse-env.sh`). The first configure downloads log4cplus.
 
 ```bash
 git clone https://github.com/DagOnStar/DAGonFS.git
@@ -189,30 +189,22 @@ The November 2026 assessment found and fixed 46 defects. They include cross-addr
 
 ## Performance
 
-We compared DAGonFS with the cluster's NFS home directory as the scratch space of **real DAGonStar workflows** (Slurm job 19406, one node, 4 ranks, November 2026). DAGonFS ran a large-file dataflow (8 × 128 MiB) **2.4× faster** than NFS, and a small-file dataflow (2000 files of 8 KiB staged by 8 tasks) **9.1× faster**.
+We compared DAGonFS with the cluster's NFS home directory as the scratch space of **real DAGonStar workflows** (Slurm jobs 19453 and 19454, partition `low-wn`, 4 ranks on one node and on two nodes, November 2026). On one node DAGonFS ran a large-file dataflow (8 × 128 MiB) **2.1× faster** than NFS, the same dataflow with **Python tasks** reading and writing the volume **2.0× faster**, and a small-file dataflow (2000 files of 8 KiB staged by 8 tasks) **11.8× faster**. Spread over two nodes it stays 1.8–11.2× faster.
 
 ![DAGonStar workflows on NFS, tmpfs and DAGonFS](figures/bench-workflow.png)
 
-| Workload (median) | NFS | DAGonFS client-server | DAGonFS peer-to-peer | tmpfs (node-local bound) |
+| Workload (median, one node) | NFS | DAGonFS client-server | DAGonFS peer-to-peer | tmpfs (node-local bound) |
 | --- | ---: | ---: | ---: | ---: |
-| File creation (ops/s) | 331 | 18,797 | 15,522 | 402,111 |
-| 4 KiB files written (files/s) | 194 | 4,562 | 4,393 | 187,894 |
-| 512 MiB write / read (MiB/s) | 496 / 287 | 963 / 1,656 | 928 / 1,671 | 4,077 / 5,774 |
-| DAGonStar, 8 × 128 MiB (s) | 59.7 | 25.1 | 26.5 | 14.3 |
-| DAGonStar, 2000 × 8 KiB (s) | 208.6 | 22.9 | 23.5 | 14.4 |
+| File creation (ops/s) | 230 | 40,172 | 13,525 | 274,889 |
+| 4 KiB files written (files/s) | 184 | 5,969 | 4,470 | 121,827 |
+| 512 MiB write / read (MiB/s) | 484 / 303 | 809 / 1,467 | 790 / 1,411 | 3,174 / 5,036 |
+| DAGonStar, 8 × 128 MiB, shell tasks (s) | 61.8 | 28.8 | 29.2 | 14.9 |
+| DAGonStar, 8 × 128 MiB, Python tasks (s) | 55.5 | 28.2 | 30.1 | 15.4 |
+| DAGonStar, 2000 × 8 KiB (s) | 270.4 | 22.9 | 26.2 | 14.5 |
 
 Unlike tmpfs, DAGonFS presents one namespace to tasks on different nodes, and its capacity is the memory of the whole allocation. Charts for every micro-benchmark, a discussion and memory-sizing advice are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md) §4. The benchmark itself is in [bench/](bench).
 
-Earlier experiments, reported in the WiDE '24 paper, measured file copies up to 47% faster than on NFS, and a DAGonStar dataflow 37% faster:
-
-| File copy vs. number of processes | File copy vs. block size |
-| --- | --- |
-| ![Execution time as the number of process varies](figures/DAGonFS_P2P-processes.png) | ![Execution time as the data block size varies](figures/DAGonFS_P2P-blocksize.png) |
-
-| DAGonStar dataflow vs. number of processes | DAGonStar dataflow vs. block size |
-| --- | --- |
-| ![DAGonStar execution as the number of process varies](figures/DAGonFS_with_DAGonStar-processes.png) | ![DAGonStar execution as the data block size](figures/DAGonFS_with_DAGonStar-blocksize.png) |
-
+The WiDE '24 paper reported earlier experiments on the code base before the November 2026 assessment (file copies up to 47% faster than NFS, a DAGonStar dataflow 37% faster). They are superseded by the measurements above.
 
 ## Documentation
 
