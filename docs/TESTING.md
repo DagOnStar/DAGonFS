@@ -104,13 +104,13 @@ sbatch -p <partition> -N 2 --ntasks-per-node=2 tests/slurm/multinode.sbatch buil
 
 For each model the script runs the mounted suite (`tests/mount.py`, with the peer-to-peer checks between ranks 0 and 1) and then, when `<python>` can import DAGonStar, the workflow of §2.2 with eight Python tasks. It exits non-zero if any of the four runs fails.
 
-Every allocated node needs `/dev/fuse` and the libfuse3 runtime. The script sources `tests/slurm/fuse-env.sh`, which accepts either helper: when a node has only the FUSE 2 `fusermount` (as on the `low-wn` partition of §4.0), it creates a `fusermount3` link to it in a directory of the submission directory, which every node sees, and puts it first on `PATH`. On clusters where only some node classes provide FUSE, select them with a partition or `--constraint`.
+Every allocated node needs `/dev/fuse` and the libfuse3 runtime. The script sources `tests/slurm/fuse-env.sh`, which accepts either helper: when a node has only the FUSE 2 `fusermount` (as the `low-wn` nodes had until 15 November 2026, §4.0a), it creates a `fusermount3` link to it in a directory of the submission directory, which every node sees, and puts it first on `PATH`. On clusters where only some node classes provide FUSE, select them with a partition or `--constraint`.
 
 ## 4. Recorded results
 
 ### 4.0a Slurm partition `low-wn`, one and two nodes (15 November 2026)
 
-`tests/slurm/multinode.sbatch` on the `low-wn` nodes (Rocky Linux 8.10, kernel 4.18, libfuse 3.3.0 runtime with only the FUSE 2 `fusermount`, used through `tests/slurm/fuse-env.sh`; Open MPI 4.1.4; DAGonStar 1.0.2 on Python 3.11.13):
+`tests/slurm/multinode.sbatch` on the `low-wn` nodes (Rocky Linux 8.10, kernel 4.18, libfuse 3.3.0 runtime; at the time of these jobs the nodes had only the FUSE 2 `fusermount`, used through `tests/slurm/fuse-env.sh`, and `fusermount3` 3.3.0 was installed later that day, so the script no longer needs the link there; Open MPI 4.1.4; DAGonStar 1.0.2 on Python 3.11.13):
 
 | Job | Nodes | Ranks | Suite (30 scenarios) | Peer-to-peer checks | DAGonStar workflow, 8 Python tasks |
 | --- | --- | --- | --- | --- | --- |

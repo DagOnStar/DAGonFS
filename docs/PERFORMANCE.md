@@ -43,7 +43,7 @@ This section compares DAGonFS with the file system that HPC workflows most often
 | Item | Value |
 | --- | --- |
 | Compute nodes | Slurm partition `low-wn`: 2 × Intel Xeon Gold 5218 (32 cores), 187 GB RAM, InfiniBand (mlx5), Rocky Linux 8.10 (kernel 4.18.0-553) |
-| FUSE | libfuse 3.3.0 runtime; only the FUSE 2 helper `fusermount` 2.9.7 is installed, used through `tests/slurm/fuse-env.sh` |
+| FUSE | libfuse 3.3.0 (`fuse3-libs`). The `fuse3` package, which provides `fusermount3`, was installed on the nodes during 15 November 2026 (wn02–wn04 at about 14:15, wn01 at 17:49). Job 19454 therefore used `fusermount3` 3.3.0, and job 19453 used the FUSE 2 `fusermount` 2.9.7 through `tests/slurm/fuse-env.sh`. |
 | NFS | `/home`, NFS 4.2 over TCP, `rsize = wsize = 1 MiB`, hard mount, served by a dedicated file server |
 | tmpfs | `/dev/shm` on the compute node |
 | DAGonFS | 4 ranks, Open MPI 4.1.4 (UCX 1.15), Release build, 128 KiB blocks, `--map-by slot --bind-to none` |
