@@ -12,7 +12,7 @@ The documents are written to be read in order by a newcomer, and individually as
 | [PERFORMANCE.md](PERFORMANCE.md) | Methodology, tuning, and the DAGonFS vs. NFS benchmark with DAGonStar workflows |
 | [DAGONSTAR-INTEGRATION.md](DAGONSTAR-INTEGRATION.md) | Using DAGonFS as the scratch space of DAGonStar workflows |
 | [TESTING.md](TESTING.md) | Validation levels, test harness, the DAGonStar workflow test, recorded results |
-| [DEFECT-ANALYSIS.md](DEFECT-ANALYSIS.md) | November 2026 assessment: defects D1–D46, root causes and remedies |
+| [DEFECT-ANALYSIS.md](DEFECT-ANALYSIS.md) | November 2026 assessment: defects D1–D47, root causes and remedies |
 | [man/dagonfs.1](man/dagonfs.1) | Manual page of `dagonfs` and `DAGonFS_Launcher` (`man docs/man/dagonfs.1`) |
 
 Contributor rules are in [../AGENTS.md](../AGENTS.md). The benchmark scripts are in [../bench](../bench), and the figures in [../figures](../figures).

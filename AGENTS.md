@@ -14,7 +14,7 @@
 - `python/dagonfs/` contains the Python volume API (standard library only).
 - `docs/` contains all documentation: the Markdown documents and the manual page (`docs/man/dagonfs.1`, installed by `docs/CMakeLists.txt`). Keep the manual page consistent with `docs/CONFIGURATION.md` and `dagonfs --help`.
 - `bench/` contains the benchmark (`fsbench.py`, `workflow.py`, `run.py`, `plot.py`, `slurm/bench.sbatch`). Its charts go to `figures/bench-*.png`, and its results are recorded in `docs/PERFORMANCE.md`.
-- `tests/` contains the source-contract tests, the lock-table unit tests (`test_lock_table.cpp`), the mounted suite and its harness (`mount.py`, `lock_helper.py`), and the DAGonStar workflow test (`dagonstar/run_workflow.py` with the Python task scripts in `dagonstar/tasks/`). Do not require a mounted filesystem in unit tests.
+- `tests/` contains the source-contract tests, the lock-table unit tests (`test_lock_table.cpp`), the mounted suite and its harness (`mount.py`, `lock_helper.py`), the parallel MPI-IO check (`mpiio_check.c`, built as `dagonfs_mpiio_check` and run by `mount.py`), and the DAGonStar workflow test (`dagonstar/run_workflow.py` with the Python task scripts in `dagonstar/tasks/`). Do not require a mounted filesystem in unit tests.
 
 ### Deployment models
 

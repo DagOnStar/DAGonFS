@@ -9,11 +9,19 @@ Usage::
 The harness always unmounts every mountpoint it created and terminates the MPI
 job, even when the tests fail. Extra arguments after ``--`` are passed to
 ``mpirun`` (for example ``-- --oversubscribe``).
+
+After the suite, the harness runs the parallel MPI-IO check
+(``dagonfs_mpiio_check``, built from ``tests/mpiio_check.c``) as an MPI job of
+its own on this host, once per MPI-IO implementation that Open MPI provides
+(OMPIO and ROMIO). In peer-to-peer mode another peer then verifies the shared
+file that the MPI-IO ranks wrote through rank 0's mount point.
 """
 
 import argparse
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -230,6 +238,51 @@ def concurrent_originators(first, last, files=12):
         (first / f"conc-{tag}").rmdir()
 
 
+def mpiio_components(mpirun):
+    """MPI-IO components to test: Open MPI's (ompio, romio...), or the default one otherwise."""
+    info = Path(shutil.which(mpirun) or mpirun).with_name("ompi_info")
+    try:
+        output = subprocess.run([str(info)], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return [None]
+    return re.findall(r"MCA io: (\w+)", output) or [None]
+
+
+def mpiio_checks(args, volume, peer_rank):
+    """Parallel MPI-IO on the mounted volume; returns 0 on success.
+
+    The ranks of the MPI-IO job run on this host (where the mount point is),
+    in a job separate from the DAGonFS one.
+    """
+    binary = (args.build_dir / "dagonfs_mpiio_check").resolve()
+    if not binary.exists():
+        print(f"MPI-IO checks skipped: {binary} was not built")
+        return 0
+    first = Path(volume.mountpoint(0))
+    launch = args.mpiio_args.format(ranks=args.mpiio_ranks).split()
+    for component in mpiio_components(args.mpirun):
+        directory = first / f"mpiio-{component or 'default'}"
+        directory.mkdir()
+        mca = ["--mca", "io", component] if component else []
+        command = [args.mpirun, "-np", str(args.mpiio_ranks)] + launch + mca + [str(binary), "run", str(directory)]
+        print(f"MPI-IO ({component or 'default'}, {args.mpiio_ranks} ranks):", " ".join(command), flush=True)
+        if subprocess.run(command, timeout=600).returncode != 0:
+            return 1
+        if args.model == "peer-to-peer" and peer_rank > 0:
+            # The shared file written through rank 0's mount, read through another peer's.
+            other = Path(volume.mountpoint(peer_rank)) / directory.name
+            if not wait_for(lambda: (other / "independent.dat").exists(), 10):
+                print("MPI-IO file written on rank 0 is not visible on the other peer", file=sys.stderr)
+                return 1
+            command = [args.mpirun, "-np", "2"] + args.mpiio_args.format(ranks=2).split() + mca + [
+                str(binary), "verify", str(other), str(args.mpiio_ranks)]
+            if subprocess.run(command, timeout=600).returncode != 0:
+                return 1
+        shutil.rmtree(directory)
+    print("MPI-IO checks: OK")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--build-dir", default="build", type=Path)
@@ -240,6 +293,9 @@ def main():
     parser.add_argument("--timeout", type=float, default=30.0, help="seconds to wait for the mount")
     parser.add_argument("--peer-rank", type=int, default=None,
                         help="peer used for the cross-peer checks (default: last rank; must share rank 0's host)")
+    parser.add_argument("--mpiio-ranks", type=int, default=4, help="ranks of the MPI-IO check (0 skips it)")
+    parser.add_argument("--mpiio-args", default="--oversubscribe --host localhost:{ranks}",
+                        help="mpirun options of the MPI-IO job, which must run on this host ({ranks} is replaced)")
     parser.add_argument("mpirun_args", nargs="*")
     args = parser.parse_args()
 
@@ -263,6 +319,8 @@ def main():
         status = result.returncode
         if status == 0 and args.model == "peer-to-peer" and args.ranks > 1:
             peer_to_peer_checks(root, peer_rank)
+        if status == 0 and args.mpiio_ranks > 0:
+            status = mpiio_checks(args, volume, peer_rank)
     except Exception as error:  # report and fall through to cleanup
         print(f"error: {error}", file=sys.stderr)
         status = status or 1

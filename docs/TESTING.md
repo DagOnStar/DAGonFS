@@ -6,7 +6,7 @@ DAGonFS is validated at three levels of increasing cost and fidelity. The lower 
 | --- | --- | --- | --- |
 | Source contract | Architectural invariants (every POSIX FUSE operation registered, single-reply handlers, deferred lock replies, no pointers in MPI packets, bounded peer paths, build ordering) | Python 3 | `python3 tests/test_source_contract.py` |
 | Build and smoke | `dagonfs` and the launcher compile with `-Wall -Wextra`; the lock table passes its unit tests; usage and launcher dry-run behave | CMake, C++23 compiler, MPI, FUSE3 headers | `cmake -S . -B build && cmake --build build && ctest --test-dir build` |
-| Mounted integration | Thirty POSIX scenarios through the kernel, plus cross-peer replication and cross-peer locks | Linux, `/dev/fuse`, `fusermount3`, MPI | `python3 tests/mount.py --model … --ranks …` |
+| Mounted integration | Thirty POSIX scenarios through the kernel, cross-peer replication and cross-peer locks, and parallel MPI-IO with OMPIO and ROMIO | Linux, `/dev/fuse`, `fusermount3`, MPI | `python3 tests/mount.py --model … --ranks …` |
 | Workflow | A DAGonStar workflow whose tasks are Python scripts executed from the volume | the above, plus DAGonStar | `python3 tests/dagonstar/run_workflow.py --model … --ranks …` |
 | Multi-node | Mounted integration with ranks spread over several hosts | Slurm cluster whose nodes provide FUSE | `sbatch … tests/slurm/multinode.sbatch` |
 
@@ -14,7 +14,7 @@ The lock table (`src/locks/LockTable.*`) is pure bookkeeping, so `tests/test_loc
 
 ## 1. Mounted integration harness
 
-`tests/mount.py` creates a volume through the Python API (`python/dagonfs`). It waits until the mount point(s) appear in `/proc/self/mounts`, runs `tests/test_python_posix.py` against rank 0's mount and, for peer-to-peer volumes, runs the cross-peer checks of §2.1. It **always** unmounts every mount point it created and waits for the MPI job (or terminates it), even when a test fails.
+`tests/mount.py` creates a volume through the Python API (`python/dagonfs`). It waits until the mount point(s) appear in `/proc/self/mounts`, runs `tests/test_python_posix.py` against rank 0's mount, for peer-to-peer volumes runs the cross-peer checks of §2.1, and then runs the parallel MPI-IO check of §2.3. It **always** unmounts every mount point it created and waits for the MPI job (or terminates it), even when a test fails.
 
 ```bash
 python3 tests/mount.py --build-dir build --model client-server --ranks 4 -- --oversubscribe
@@ -94,6 +94,20 @@ python3 tests/dagonstar/run_workflow.py --build-dir build --model peer-to-peer  
 
 `--width` sets the number of parallel tasks (default 6) and `--size` the bytes per input part (default 9 blocks + 777 bytes, so that every part is scattered over every rank). DAGonStar must be installed for the interpreter that runs the driver (`pip install dagonstar`); the tasks run with the same interpreter.
 
+### 2.3 Parallel MPI-IO
+
+`tests/mpiio_check.c` is built as `dagonfs_mpiio_check`. `tests/mount.py` runs it as an MPI job of its own: four ranks (`--mpiio-ranks`) on the harness's host (`--mpiio-args`, default `--oversubscribe --host localhost:{ranks}`), in a fresh directory of rank 0's mount. It runs once for each MPI-IO component that `ompi_info` lists (OMPIO and ROMIO with Open MPI 4.1), and once with the default component for other MPI libraries. Every byte read is compared with a deterministic pattern:
+
+| Scenario | MPI-IO calls | What it exercises in DAGonFS |
+| --- | --- | --- |
+| Independent I/O | `MPI_File_write_at`, `read_at`, `sync`, `get_size`; blocks of 300 000 bytes interleaved by rank; each rank reads another rank's blocks | concurrent writers on one shared buffer; write-back on `fsync`; sizes that are not multiples of the block size |
+| Collective I/O | strided vector file view, `MPI_File_write_all`, `read_all` | two-phase aggregation: few large writes from aggregator ranks |
+| Data sieving | independent non-contiguous `MPI_File_write` of 1000-byte pieces with holes, by all ranks at once | ROMIO's read-modify-write under `F_SETLKW` byte-range locks: a piece is lost if locking or read-after-write is incoherent |
+| Atomic mode | `MPI_File_set_atomicity`, `write_at`, `read_at` | locked I/O |
+| Shared file pointer and resizing | `MPI_File_write_ordered`, `set_size` (shrink, grow), `get_size`, `delete` | the shared-pointer side files and their locks; `ftruncate` |
+
+In the peer-to-peer model, a second job of two ranks then reads the independent-I/O file through another peer's mount (`verify`), after the writers have closed it. The check exits 0 only if every scenario passed. It needs no DAGonFS: `mpirun -np 4 build/dagonfs_mpiio_check run <directory>` works on any file system.
+
 ## 3. Multi-node validation with Slurm
 
 `tests/slurm/multinode.sbatch` runs both models with the ranks of the allocation. It places ranks 0 and 1 on the first node (`--map-by slot`), so the harness can observe both mount points locally while data blocks are stored on every node.
@@ -107,6 +121,30 @@ For each model the script runs the mounted suite (`tests/mount.py`, with the pee
 Every allocated node needs `/dev/fuse` and the libfuse3 runtime. The script sources `tests/slurm/fuse-env.sh`, which accepts either helper: when a node has only the FUSE 2 `fusermount` (as the `low-wn` nodes had until 15 November 2026, §4.0a), it creates a `fusermount3` link to it in a directory of the submission directory, which every node sees, and puts it first on `PATH`. On clusters where only some node classes provide FUSE, select them with a partition or `--constraint`.
 
 ## 4. Recorded results
+
+### 4.0b Full re-run with parallel MPI-IO, and D47 (15 November 2026)
+
+The complete validation was repeated after the `fuse3` package (`fusermount3` 3.3.0) had been installed on the `low-wn` nodes, so `tests/slurm/fuse-env.sh` no longer had to link the FUSE 2 helper. The parallel MPI-IO check (§2.3) was added during this run.
+
+**Table 0b — complete validation, Open MPI 4.1.4, libfuse 3.3.0, kernel 4.18.**
+
+| Check | Where | Model | Ranks | Result |
+| --- | --- | --- | --- | --- |
+| `ctest` | login node | — | — | 4/4 pass |
+| `tests/mount.py` (30 scenarios) | login node | client-server, peer-to-peer | 1, 2, 3, 4 | 30/30 pass; peer-to-peer checks pass; clean shutdown |
+| `tests/dagonstar/run_workflow.py`, widths 6 and 16 | login node | client-server, peer-to-peer | 4 | 8/8 and 18/18 tasks, consistent result (7.4–8.0 s) |
+| `tests/mount.py` with the MPI-IO check, 4 times per model | login node | client-server, peer-to-peer | 4 | 30/30 pass; MPI-IO passes with OMPIO and ROMIO; peer-to-peer cross-peer `verify` passes |
+| `tests/slurm/multinode.sbatch`, job 19507 | wn01 | client-server, peer-to-peer | 4 | 30/30 pass; MPI-IO 22/22 scenario results; workflow 10/10 tasks, consistent result; every job exits 0 |
+| same, job 19508 | wn01–wn02 | client-server, peer-to-peer | 2 + 2 | same results |
+| Concurrent shutdown stress, job 19509: three two-node client-server workflows at a time, 8 rounds | wn01–wn02 | client-server | 2 + 2, ×3 | 24/24 workflows consistent, 24/24 DAGonFS jobs exit 0 within 8 s of unmount |
+
+*D47.* Before its fix, the first runs of this round (jobs 19496 and 19501) passed every test, but the two-node client-server workflow job exited with status 1. A wrapper that logged each rank's exit status showed that no rank had returned. The harness had waited 30 s after a clean unmount, then terminated `mpirun`. The failure could not be reproduced in 14 sequential two-node runs. It hit 1 of 24 runs when three volumes shared the nodes (job 19505), and stack traces taken 8 s after unmount showed every rank inside `MPI_Finalize`, one in HCOLL's teardown ([DEFECT-ANALYSIS.md](DEFECT-ANALYSIS.md) D47). After the fix, the same stress (job 19509) completed 24 of 24 runs.
+
+*MPI-IO.* The MPI-IO check found no defect in DAGonFS. Three failures during its development were errors in the check itself, confirmed by running it on the node's local XFS and on `/dev/shm`:
+
+* a size check raced with a rank that had already entered the next `MPI_File_set_size`, which needs no synchronisation;
+* a second such race, between the shrink and the grow;
+* a check that holes stay zero, whereas ROMIO's data sieving writes back undefined bytes there on every file system.
 
 ### 4.0a Slurm partition `low-wn`, one and two nodes (15 November 2026)
 

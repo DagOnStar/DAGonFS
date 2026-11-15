@@ -185,7 +185,7 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for every option and for clus
 | DAGonStar workflow with Python script tasks | `python3 tests/dagonstar/run_workflow.py --model peer-to-peer --ranks 4 -- --oversubscribe` |
 | Multi-node | `sbatch -N 2 --ntasks-per-node=2 tests/slurm/multinode.sbatch build` |
 
-The November 2026 assessment found and fixed 46 defects. They include cross-address-space `free()`, double FUSE replies, peer inode desynchronisation, concurrent collectives, unreplicated metadata, inode numbers that were all 0, and locks, FIFOs and space operations that were missing. Before the fixes the client-server model crashed during the suite, and a peer-to-peer operation across nodes took about 400 ms. Afterwards both models pass on one node and across two Slurm nodes, including concurrent writers on two peers, and cross-node operations take 0.03–0.43 ms. See [docs/DEFECT-ANALYSIS.md](docs/DEFECT-ANALYSIS.md) and [docs/TESTING.md](docs/TESTING.md).
+The November 2026 assessment found and fixed 47 defects. They include cross-address-space `free()`, double FUSE replies, peer inode desynchronisation, concurrent collectives, unreplicated metadata, inode numbers that were all 0, locks, FIFOs and space operations that were missing, and a shutdown that Open MPI's HCOLL library could deadlock. Before the fixes the client-server model crashed during the suite, and a peer-to-peer operation across nodes took about 400 ms. Afterwards both models pass on one node and across two Slurm nodes, including concurrent writers on two peers and parallel MPI-IO (OMPIO and ROMIO), and cross-node operations take 0.03–0.43 ms. See [docs/DEFECT-ANALYSIS.md](docs/DEFECT-ANALYSIS.md) and [docs/TESTING.md](docs/TESTING.md).
 
 ## Performance
 

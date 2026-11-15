@@ -4,6 +4,7 @@
 //   mpirun -np <P> dagonfs [--model client-server|peer-to-peer] [--config DAGonFS.ini] [-f|-d] [--log] <root>
 //
 
+#include <cstdlib>
 #include <iostream>
 #include <string>
 
@@ -28,6 +29,11 @@ int main(int argc, char *argv[]) {
             break;
     }
 
+    // DAGonFS uses point-to-point messages only, never collectives. Open MPI's
+    // Mellanox HCOLL component adds nothing but a teardown in MPI_Finalize
+    // that was observed to deadlock intermittently across nodes (D47). An
+    // explicit setting in the environment still takes precedence.
+    setenv("OMPI_MCA_coll_hcoll_enable", "0", 0);
     int provided = MPI_THREAD_SINGLE;
     MPI_Init_thread(&argc, &argv, dagonfs::requiredThreadLevel(options.model), &provided);
     const int status = dagonfs::runVolume(options);

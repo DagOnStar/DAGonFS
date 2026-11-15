@@ -211,6 +211,13 @@ class FuseSourceContractTests(unittest.TestCase):
                 self.assertIsNone(re.search(r"MPI_(Scatterv|Gatherv|Bcast|Barrier|Allreduce)\(", text))
         self.assertIn("DAGONFS_TAG_ACK", source("mpi/DistributedCode.cpp"))
 
+    def test_collective_library_is_disabled_before_mpi_init(self):
+        # D47: HCOLL's teardown deadlocked MPI_Finalize; DAGonFS uses no collectives.
+        text = source("main.cpp")
+        setting = text.find('setenv("OMPI_MCA_coll_hcoll_enable", "0", 0)')
+        self.assertGreater(setting, 0)
+        self.assertLess(setting, text.find("MPI_Init_thread("))
+
     def test_block_registry_does_not_create_entries_for_read_only_queries(self):
         text = source("blocks/Blocks.cpp")
         self.assertIn("return FileSystemDataBlocks.find(inode) != FileSystemDataBlocks.end();", text)

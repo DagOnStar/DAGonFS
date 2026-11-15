@@ -157,6 +157,11 @@ if(BUILD_TESTING)
     # The lock table is pure bookkeeping: unit-tested without MPI or FUSE.
     add_executable(test_lock_table tests/test_lock_table.cpp src/locks/LockTable.cpp)
     add_test(NAME dagonfs-lock-table COMMAND test_lock_table)
+    # Parallel MPI-IO client for the mounted tests (tests/mount.py runs it as
+    # an MPI job of its own against the mounted volume).
+    add_executable(dagonfs_mpiio_check tests/mpiio_check.c)
+    target_include_directories(dagonfs_mpiio_check SYSTEM PRIVATE ${MPI_C_INCLUDE_DIRS})
+    target_link_libraries(dagonfs_mpiio_check PRIVATE ${MPI_C_LIBRARIES})
     add_test(
         NAME dagonfs-launcher-dry-run
         COMMAND ${PROJECT_NAME}_Launcher ${CMAKE_CURRENT_SOURCE_DIR}/src/DAGonFS.ini --dry-run

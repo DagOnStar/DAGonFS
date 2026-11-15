@@ -102,6 +102,10 @@ A review of the FUSE low-level API against POSIX found four more defects: operat
 
 **D46 — A buffer opened before a remote write-back stayed stale.** In the peer-to-peer model, a file that was open on a peer kept the content loaded at open time, even after another peer had written the file back. A process that opened a shared file, then waited for a lock, read the previous holder's data only if no other descriptor of the file was open on its peer. Similarly, data written under a lock and unlocked without `close` stayed on the writer's peer. *Remedy:* a remote write-back marks the local file as changed, and a buffer without unflushed local writes is reloaded before its next use; unlocking or downgrading a lock writes the file back first, as `close` does.
 
+### 6.2 Defect found by the multi-node regression runs
+
+**D47 — An MPI collective library could deadlock the shutdown.** About one client-server volume in twenty spread over two nodes never exited after a clean unmount: the harness waited 30 s, then terminated `mpirun`, which reported status 1. Stack traces showed every rank in `MPI_Finalize`: one in the teardown of Mellanox HCOLL (`hcoll_context_free`, disconnecting its UCX endpoints), the others waiting for it in UCX's `del_procs` and the PMIx fence. Open MPI loads HCOLL on `MPI_COMM_WORLD` whenever it is installed, although DAGonFS performs no collective operation. The failure appeared only when other MPI jobs loaded the node, which slowed the teardown. *Remedy:* `dagonfs` sets `OMPI_MCA_coll_hcoll_enable=0` before `MPI_Init` unless the environment already sets it. A contract test checks the order. Twenty-four concurrent two-node shutdowns then completed (§4.0b of [TESTING.md](TESTING.md)).
+
 ## 7. Lifecycle, launcher and build defects
 
 **D27 — Workers left blocked.** If the front end failed before mounting, it returned without sending `TERMINATE`, leaving every other rank blocked forever. *Remedy:* `FileSystem::start` always notifies termination.

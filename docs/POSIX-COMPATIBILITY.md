@@ -58,6 +58,18 @@ The semantics are those of Linux:
 
 A lock therefore also orders data: unlocking, downgrading or closing first writes the file's dirty data back, so a process that acquires the lock afterwards, on any node, reads the data written under it (see the consistency model below).
 
+### MPI-IO
+
+Parallel programs can use MPI-IO on a mounted volume through either Open MPI implementation, OMPIO or ROMIO (driver `ufs`). `tests/mpiio_check.c` (run by `tests/mount.py`, [TESTING.md](TESTING.md) §2.3) validates:
+
+* independent and collective I/O on shared files, including strided file views;
+* concurrent non-contiguous writes, which ROMIO serves by data sieving: read-modify-write under byte-range locks;
+* atomic mode;
+* the shared file pointer (`MPI_File_write_ordered`);
+* `MPI_File_set_size`, `MPI_File_get_size`, `MPI_File_sync` and `MPI_File_delete`.
+
+The usual MPI rules apply. Data written by one process are visible to another after `MPI_File_sync`, a barrier and another `MPI_File_sync`, or after a `close` and reopen. Bytes never written have undefined content: ROMIO's data sieving may write back arbitrary bytes into holes, also on local file systems. Collective calls such as `MPI_File_set_size` do not synchronise the ranks, so a rank may apply the change before the others have entered the call. In the peer-to-peer model, all ranks that write one shared file should use the same peer's mount, because concurrent writers on different peers are not serialised (see below). A file closed on one peer can be read on any other.
+
 ## Consistency model
 
 DAGonFS provides **close-to-open consistency**, the model of NFS and of most workflow scratch file systems.
