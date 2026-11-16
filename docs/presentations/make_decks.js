@@ -58,7 +58,7 @@ function newDeck(title, footer) {
     objects: [
       { placeholder: { options: { name: "title", type: "title", align: "left", x: 0.8, y: 1.9, w: 11.7, h: 1.9, fontSize: 40, bold: true, color: C.background1, valign: "bottom", fontFace: "+mj-lt" }, text: "" } },
       { placeholder: { options: { name: "subtitle", type: "body", x: 0.8, y: 3.95, w: 11.7, h: 1.0, fontSize: 20, color: C.accent2, valign: "top" }, text: "" } },
-      { placeholder: { options: { name: "meta", type: "body", x: 0.8, y: 5.7, w: 11.7, h: 1.0, fontSize: 14, color: C.background2, valign: "top" }, text: "" } },
+      { placeholder: { options: { name: "meta", type: "body", x: 0.8, y: 5.35, w: 11.7, h: 1.4, fontSize: 14, color: C.background2, valign: "top" }, text: "" } },
     ],
   });
   pres.defineSlideMaster({
@@ -197,7 +197,11 @@ async function scientific() {
   s = pres.addSlide({ masterName: "Title (dark)", sectionTitle: "Introduction" });
   s.addText("DAGonFS: an ad-hoc, in-memory, MPI-distributed file system for workflow scratch data", { placeholder: "title" });
   s.addText("One POSIX namespace over the aggregate RAM of an MPI job, for DAGonStar workflows on HPC systems", { placeholder: "subtitle" });
-  s.addText("DAGonCAPIO research project · Università degli Studi di Napoli “Parthenope”\nWorkshop talk · 20 minutes", { placeholder: "meta" });
+  s.addText([
+    { text: "Raffaele Montella", options: { bold: true, fontSize: 18, color: C.background1, breakLine: true } },
+    { text: "High-Performance Scientific Computing Laboratory, Department of Science and Technology, University of Naples “Parthenope”", options: { breakLine: true } },
+    { text: "Workshop talk · 20 minutes" },
+  ], { placeholder: "meta" });
   s.addNotes("0:00–0:45. Introduce the problem in one sentence: workflow scratch data live on file systems built for durability. DAGonFS keeps them in the memory of the allocation instead. Outline: motivation, design, engineering assessment, evaluation with real DAGonStar workflows, limitations.");
 
   // 2 — motivation
@@ -515,7 +519,11 @@ async function tutorial() {
   s = pres.addSlide({ masterName: "Title (dark)", sectionTitle: "Overview" });
   s.addText("DAGonFS hands-on tutorial", { placeholder: "title" });
   s.addText("Compile, install, configure, test and evaluate an in-memory MPI file system for workflow scratch data", { placeholder: "subtitle" });
-  s.addText("Tutorial · 20 minutes · Linux with FUSE 3, MPI and CMake\nRepository: github.com/DagOnStar/DAGonFS", { placeholder: "meta" });
+  s.addText([
+    { text: "Raffaele Montella", options: { bold: true, fontSize: 18, color: C.background1, breakLine: true } },
+    { text: "High-Performance Scientific Computing Laboratory, Department of Science and Technology, University of Naples “Parthenope”", options: { breakLine: true } },
+    { text: "Tutorial · 20 minutes · Linux with FUSE 3, MPI and CMake · github.com/DagOnStar/DAGonFS" },
+  ], { placeholder: "meta" });
   s.addNotes("0:00–0:30. Audience: users who will run DAGonFS on a workstation or a Slurm cluster. Every command on these slides is from docs/CONFIGURATION.md, docs/TESTING.md and docs/PERFORMANCE.md; expected results are the ones recorded there in November 2026.");
 
   // 2 — agenda
