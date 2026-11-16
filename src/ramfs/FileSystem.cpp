@@ -794,8 +794,8 @@ void FileSystem::FuseSetAttr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, 
 #ifdef __APPLE__
     if (to_set & FUSE_SET_ATTR_ATIME) current.st_atimespec = attr->st_atimespec;
     if (to_set & FUSE_SET_ATTR_MTIME) current.st_mtimespec = attr->st_mtimespec;
-    if (to_set & FUSE_SET_ATTR_CHGTIME) current.st_ctimespec = attr->st_ctimespec;
-    if (to_set & FUSE_SET_ATTR_CRTIME) current.st_birthtimespec = attr->st_birthtimespec;
+    if (to_set & FUSE_SET_ATTR_CTIME) current.st_ctimespec = attr->st_ctimespec;
+    if (to_set & FUSE_SET_ATTR_BTIME) current.st_birthtimespec = attr->st_birthtimespec;
     if (to_set & FUSE_SET_ATTR_FLAGS) current.st_flags = attr->st_flags;
 #else
     if (to_set & FUSE_SET_ATTR_ATIME) current.st_atim = attr->st_atim;
@@ -805,7 +805,7 @@ void FileSystem::FuseSetAttr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, 
     // utimensat(UTIME_NOW): the kernel sets the *_NOW flag and no timestamp.
     setTimeNow(current, (to_set & FUSE_SET_ATTR_ATIME_NOW) != 0, (to_set & FUSE_SET_ATTR_MTIME_NOW) != 0, false);
 #ifdef __APPLE__
-    if (!(to_set & FUSE_SET_ATTR_CHGTIME))
+    if (!(to_set & FUSE_SET_ATTR_CTIME))
 #else
     if (!(to_set & FUSE_SET_ATTR_CTIME))
 #endif
@@ -1605,7 +1605,7 @@ void FileSystem::FuseStatfs(fuse_req_t req, fuse_ino_t ino) {
     fuse_reply_statfs(req, &m_stbuf);
 }
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && FUSE_DARWIN_ENABLE_EXTENSIONS
 void FileSystem::FuseSetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value, size_t size, int flags, uint32_t position)
 #else
 void FileSystem::FuseSetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value, size_t size, int flags)
@@ -1617,7 +1617,7 @@ void FileSystem::FuseSetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, 
         fuse_reply_err(req, ENOENT);
         return;
     }
-#ifndef __APPLE__
+#if !defined(__APPLE__) || !FUSE_DARWIN_ENABLE_EXTENSIONS
     const uint32_t position = 0;
 #endif
     if (name == nullptr || strncmp(name, "system.posix_acl_", 17) == 0) {
@@ -1646,7 +1646,7 @@ void FileSystem::FuseSetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, 
     }
 }
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && FUSE_DARWIN_ENABLE_EXTENSIONS
 void FileSystem::FuseGetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t size, uint32_t position)
 #else
 void FileSystem::FuseGetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t size)
@@ -1657,7 +1657,7 @@ void FileSystem::FuseGetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, 
         fuse_reply_err(req, ENOENT);
         return;
     }
-#ifndef __APPLE__
+#if !defined(__APPLE__) || !FUSE_DARWIN_ENABLE_EXTENSIONS
     const uint32_t position = 0;
 #endif
 

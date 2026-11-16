@@ -50,6 +50,10 @@ int runVolume(const VolumeOptions &options) {
         if (rank == 0) std::cerr << "DAGonFS: no mount root given" << std::endl;
         return 1;
     }
+    if (options.frontend != Frontend::Fuse && options.model == Model::PeerToPeer) {
+        if (rank == 0) std::cerr << "DAGonFS: native and preload frontends currently require client-server mode" << std::endl;
+        return 1;
+    }
 
     DAGONFS_LOG_LEVEL = options.logging ? log4cplus::ALL_LOG_LEVEL : log4cplus::OFF_LOG_LEVEL;
     log4cplus::Initializer initializer;
@@ -69,10 +73,10 @@ int runVolume(const VolumeOptions &options) {
 
     int status = 0;
     if (options.frontend != Frontend::Fuse && rank == 0) {
-        std::thread listener(&DistributedCode::start);
         dagonfs::NativeFrontend frontend(rank, worldSize);
+        // Client-server rank zero only originates MPI requests. MPI's
+        // single-thread level forbids an additional listener here.
         status = frontend.serve(options.root);
-        listener.join();
     } else if (!options.mounts(rank)) {
         // Client-server storage rank: serve the front end until TERMINATE.
         controlPlane->start();

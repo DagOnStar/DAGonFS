@@ -4,7 +4,9 @@
 #include <stdint.h>
 
 #define DAGONFS_NATIVE_MAGIC 0x44474653u
-#define DAGONFS_NATIVE_VERSION 1u
+/* Version 2: a connection carries any number of requests; handles opened on
+ * a connection are closed when it ends. */
+#define DAGONFS_NATIVE_VERSION 2u
 #define DAGONFS_NATIVE_MAX_PATH 4096u
 #define DAGONFS_NATIVE_MAX_IO (8u * 1024u * 1024u)
 
@@ -20,7 +22,8 @@ enum dagonfs_native_opcode {
     DAGONFS_NATIVE_RMDIR,
     DAGONFS_NATIVE_RENAME,
     DAGONFS_NATIVE_LIST,
-    DAGONFS_NATIVE_SHUTDOWN
+    DAGONFS_NATIVE_SHUTDOWN,
+    DAGONFS_NATIVE_FSTAT
 };
 
 struct dagonfs_native_request {

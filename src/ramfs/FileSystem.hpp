@@ -271,7 +271,7 @@ public:
     static void FuseReleaseDir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
     static void FuseFsyncDir(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi);
     static void FuseStatfs(fuse_req_t req, fuse_ino_t ino);
-#ifdef __APPLE__
+#if defined(__APPLE__) && FUSE_DARWIN_ENABLE_EXTENSIONS
     static void FuseSetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value, size_t size, int flags, uint32_t position);
     static void FuseGetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t size, uint32_t position);
 #else

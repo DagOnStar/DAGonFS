@@ -20,11 +20,14 @@ ssize_t dagonfs_client_pread(int64_t handle, void *buffer, size_t size, off_t of
 ssize_t dagonfs_client_pwrite(int64_t handle, const void *buffer, size_t size, off_t offset);
 int dagonfs_client_fsync(int64_t handle);
 int dagonfs_client_stat(const char *path, struct stat *result);
+int dagonfs_client_fstat(int64_t handle, struct stat *result);
 int dagonfs_client_mkdir(const char *path, mode_t mode);
 int dagonfs_client_unlink(const char *path);
 int dagonfs_client_rmdir(const char *path);
 int dagonfs_client_rename(const char *old_path, const char *new_path);
-/** Newline-separated entry names. Returns required bytes, excluding the final NUL. */
+/** Writes newline-separated entry names (not NUL-terminated) and returns their
+ * length. If the buffer is too small, returns the required length with errno
+ * set to ERANGE and leaves the buffer unchanged. */
 ssize_t dagonfs_client_list(const char *path, char *buffer, size_t size);
 int dagonfs_client_shutdown(void);
 

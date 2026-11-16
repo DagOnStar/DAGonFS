@@ -99,12 +99,17 @@ target_compile_definitions(dagonfs_core PUBLIC
         FUSE_USE_VERSION=32 _FILE_OFFSET_BITS=64
         # The C API is used; skip the deprecated MPI C++ bindings.
         OMPI_SKIP_MPICXX=1 MPICH_SKIP_MPICXX=1)
+if(APPLE)
+    # macFUSE defaults to Darwin-specific callback and reply structs. The
+    # filesystem uses the portable libfuse3 struct stat API throughout.
+    target_compile_definitions(dagonfs_core PUBLIC FUSE_DARWIN_ENABLE_EXTENSIONS=0)
+endif()
 target_link_libraries(dagonfs_core PUBLIC dagonfs_options ${FUSE3_LIBRARIES} ${MPI_C_LIBRARIES} ${LOG4CPLUS_LIBRARIES} -lpthread)
 set_target_properties(dagonfs_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(dagonfs_preload SHARED src/frontends/preload/dagonfs_preload.c src/frontends/native/Client.c)
 target_include_directories(dagonfs_preload PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/frontends/native)
-target_link_libraries(dagonfs_preload PRIVATE -lpthread)
+target_link_libraries(dagonfs_preload PRIVATE -lpthread ${CMAKE_DL_LIBS})
 set_target_properties(dagonfs_preload PROPERTIES OUTPUT_NAME dagonfs_preload)
 # The sources include log4cplus headers produced by the external project, so
 # they must not be compiled before it has been installed in the build tree.

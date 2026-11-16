@@ -1,0 +1,14 @@
+{
+  "host": "MacBook-Pro-410.local",
+  "system": "Darwin arm64",
+  "workload": "100 sequential 4 KiB positional writes and reads, five independent runs, two MPI ranks for native, local temporary file for baseline",
+  "units": "operations per second",
+  "native": {
+    "pwrite": [51894.13622530461, 46671.72271971701, 53122.03501861825, 50991.14021895667, 53901.09116499327],
+    "pread": [64319.022624950056, 63488.71748857712, 74092.35019338876, 65325.66101051011, 71142.73046097963]
+  },
+  "local_tempfile": {
+    "pwrite": [311566.2682333056, 321845.59403749334, 373191.4264807835, 345125.11451189837, 368211.5527361509],
+    "pread": [1182857.8755146211, 1116794.4235260582, 1532567.0009406894, 1392932.5311613258, 1419285.2162516003]
+  }
+}

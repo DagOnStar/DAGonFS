@@ -25,12 +25,13 @@ The build produces one executable for both deployment models, `dagonfs`, plus `D
 A volume is created by running `dagonfs` on every rank of an MPI job. The deployment model is chosen **per volume, at run time**:
 
 ```bash
-mpirun -np <P> [--hostfile <file>] dagonfs [--model client-server|peer-to-peer] [--config DAGonFS.ini] [-f|-d] [--log] <root>
+mpirun -np <P> [--hostfile <file>] dagonfs [--model client-server|peer-to-peer] [--frontend fuse3|native|preload] [--config DAGonFS.ini] [-f|-d] [--log] <root>
 ```
 
 | Option | Meaning |
 | --- | --- |
 | `-m`, `--model M` | `client-server` (`cs`): rank 0 mounts `<root>`, ranks 1…P−1 store blocks. `peer-to-peer` (`p2p`): rank *r* mounts `<root>/<r>`, and the namespace is replicated. Default: `client-server`. |
+| `--frontend F` | `fuse3` (default): mount `<root>` through the kernel. `native`: serve the client protocol on the Unix socket `<root>` from rank 0, with no FUSE. `preload`: the same service, used through the `libdagonfs_preload` interposer. `native` and `preload` require `client-server`; see [FRONTENDS.md](FRONTENDS.md). |
 | `-c`, `--config F` | Read `dagonfs_model`, `dagonfs_root_dir`, `fuse_mode` and `enable_logging` from an ini file. |
 | `-f` / `-d` | FUSE in the foreground (default; required under MPI) / foreground with a trace of every FUSE request. |
 | `--log` | Verbose log4cplus output. The legacy form is a trailing `1` (`0` disables). |

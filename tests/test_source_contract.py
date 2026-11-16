@@ -239,6 +239,33 @@ class FuseSourceContractTests(unittest.TestCase):
         self.assertIn("add_dependencies(dagonfs_core log4cplus)", text)
         self.assertNotIn("DAGONFS_P2P", text)
 
+    def test_native_frontend_survives_dead_clients_and_keeps_connections(self):
+        server = source("frontends/native/NativeFrontend.cpp")
+        client = (SRC / "frontends/native/Client.c").read_text()
+        # A client that disappears must not raise SIGPIPE in the volume or the
+        # application, and a connection carries many requests.
+        self.assertIn("signal(SIGPIPE, SIG_IGN)", server)
+        self.assertIn("MSG_NOSIGNAL", server)
+        self.assertIn("MSG_NOSIGNAL", client)
+        self.assertIn("poll(", server)
+        self.assertNotRegex(server, r"\bwrite\(client")
+        # Handles opened on a connection are written back when it ends.
+        self.assertIn("connection == client", server)
+        # A forked child never shares its parent's stream.
+        self.assertIn("connection_owner == getpid()", client)
+        # Native and preload volumes are client-server only.
+        self.assertIn("frontend != Frontend::Fuse && options.model == Model::PeerToPeer",
+                      source("volume/Volume.cpp"))
+
+    def test_preload_descriptors_are_real_and_interposition_is_portable(self):
+        preload = (SRC / "frontends/preload/dagonfs_preload.c").read_text()
+        # Placeholder descriptors come from the kernel, so they cannot collide.
+        self.assertIn('"/dev/null"', preload)
+        self.assertIn("__DATA,__interpose", preload)
+        self.assertIn("RTLD_NEXT", preload)
+        for name in ("open", "close", "read", "write", "pread", "pwrite", "lseek"):
+            self.assertIn(f"INTERPOSE({name});", preload)
+
     def test_main_treats_argv_as_read_only(self):
         # AGENTS.md: argv is immutable; FUSE receives an owned copy.
         self.assertIsNone(re.search(r"argv\[[^\]]*\]\s*=[^=]", source("main.cpp")))

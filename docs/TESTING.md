@@ -1,11 +1,24 @@
 # Testing and validation
 
+## Validation of 16 November 2026 (native protocol version 2)
+
+| Host | Build and `ctest` | Contract tests | `tests/native_frontend.py` | `tests/mount.py` client-server | `tests/mount.py` peer-to-peer |
+|---|---|---|---|---|---|
+| macOS (M4 Max, macFUSE headers) | pass, 5/5 | 25/25 | pass (native and `DYLD_INSERT_LIBRARIES`) | no `/dev/fuse` | no `/dev/fuse` |
+| Rainbow (Ubuntu, GCC 13) | pass, 5/5 | 25/25 | pass | 30/30, MPI-IO OK (4 ranks) | 30/30, replication and MPI-IO OK (4 ranks) |
+| PurpleJeans wn01 (Slurm job 19772, GCC 12.2.1) | pass, 5/5 | 25/25 | pass | 30/30, MPI-IO OK (2 ranks) | 30/30, replication and MPI-IO OK (2 ranks) |
+
+On macOS, the libfuse3 headers of macFUSE build with
+`FUSE_DARWIN_ENABLE_EXTENSIONS=0`, so the portable `struct stat` callbacks are
+used. The PurpleJeans `low-wn` node wn01 now provides FUSE 3.
+
 DAGonFS is validated at three levels of increasing cost and fidelity. The lower levels run on any machine and in every CI job; the upper levels need a FUSE-capable host with MPI.
 
 | Level | What it checks | Requirements | Command |
 | --- | --- | --- | --- |
 | Source contract | Architectural invariants (every POSIX FUSE operation registered, single-reply handlers, deferred lock replies, no pointers in MPI packets, bounded peer paths, build ordering) | Python 3 | `python3 tests/test_source_contract.py` |
 | Build and smoke | `dagonfs` and the launcher compile with `-Wall -Wextra`; the lock table passes its unit tests; usage and launcher dry-run behave | CMake, C++23 compiler, MPI, FUSE3 headers | `cmake -S . -B build && cmake --build build && ctest --test-dir build` |
+| Native and preload frontends | The socket protocol (open modes, append, truncate, multi-block data, directory and rename semantics, error codes, fork), a C program under the interposer, clean shutdown of every rank | MPI, a C compiler; no FUSE | `python3 tests/native_frontend.py --build-dir build --ranks 2` |
 | Mounted integration | Thirty POSIX scenarios through the kernel, cross-peer replication and cross-peer locks, and parallel MPI-IO with OMPIO and ROMIO | Linux, `/dev/fuse`, `fusermount3`, MPI | `python3 tests/mount.py --model … --ranks …` |
 | Workflow | A DAGonStar workflow whose tasks are Python scripts executed from the volume | the above, plus DAGonStar | `python3 tests/dagonstar/run_workflow.py --model … --ranks …` |
 | Multi-node | Mounted integration with ranks spread over several hosts | Slurm cluster whose nodes provide FUSE | `sbatch … tests/slurm/multinode.sbatch` |

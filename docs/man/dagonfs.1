@@ -1,4 +1,4 @@
-.TH DAGONFS 1 "15 November 2026" "DAGonFS" "User Commands"
+.TH DAGONFS 1 "16 November 2026" "DAGonFS" "User Commands"
 .SH NAME
 dagonfs, DAGonFS_Launcher \- MPI-distributed, in-memory FUSE file system for workflow scratch data
 .SH SYNOPSIS
@@ -7,6 +7,7 @@ dagonfs, DAGonFS_Launcher \- MPI-distributed, in-memory FUSE file system for wor
 [\fImpirun-options\fR]
 .B dagonfs
 [\fB\-m\fR|\fB\-\-model\fR \fIclient-server\fR|\fIpeer-to-peer\fR]
+[\fB\-\-frontend\fR \fIfuse3\fR|\fInative\fR|\fIpreload\fR]
 [\fB\-c\fR|\fB\-\-config\fR \fIfile\fR]
 [\fB\-f\fR|\fB\-d\fR]
 [\fB\-\-log\fR]
@@ -53,6 +54,23 @@ or
 .B peer-to-peer
 (alias
 .BR p2p ).
+.TP
+.BR \-\-frontend " " \fIfrontend\fR
+.B fuse3
+(default) mounts
+.I root
+through the kernel.
+.B native
+serves the DAGonFS client protocol on the Unix socket
+.I root
+from rank 0, without FUSE;
+.B preload
+is the same service used through the
+.B libdagonfs_preload
+interposer
+.RB ( DAGONFS_SOCKET ,
+.BR DAGONFS_PRELOAD_ROOT ).
+Both require the client-server model.
 .TP
 .BR \-c ", " \-\-config " " \fIfile\fR
 Read

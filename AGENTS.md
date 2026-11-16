@@ -8,13 +8,14 @@
   - `blocks/` and `mpi/DataBlockManager.*`: the data plane;
   - `mpi/RequestSender.*`, `mpi/DistributedCode.*` and `mpi/mpi_data.hpp`: the control plane;
   - `locks/LockTable.*`: the volume's advisory-lock table (pure bookkeeping, no FUSE or MPI);
+  - `frontends/native/` (socket protocol, server on rank 0, C client) and `frontends/preload/` (the interposer): the FUSE-free frontends, see `docs/FRONTENDS.md`;
   - `volume/`: `Options` (model, ini and command line, with no MPI or FUSE dependency) and `Volume` (`runVolume`);
   - `main.cpp`: a thin wrapper around `runVolume`;
   - `DAGonFS_Launcher.cpp`: the ini-driven launcher.
 - `python/dagonfs/` contains the Python volume API (standard library only).
 - `docs/` contains all documentation: the Markdown documents and the manual page (`docs/man/dagonfs.1`, installed by `docs/CMakeLists.txt`). Keep the manual page consistent with `docs/CONFIGURATION.md` and `dagonfs --help`.
-- `bench/` contains the benchmark (`fsbench.py`, `workflow.py`, `run.py`, `plot.py`, `slurm/bench.sbatch`). Its charts go to `figures/bench-*.png`, and its results are recorded in `docs/PERFORMANCE.md`.
-- `tests/` contains the source-contract tests, the lock-table unit tests (`test_lock_table.cpp`), the mounted suite and its harness (`mount.py`, `lock_helper.py`), the parallel MPI-IO check (`mpiio_check.c`, built as `dagonfs_mpiio_check` and run by `mount.py`), and the DAGonStar workflow test (`dagonstar/run_workflow.py` with the Python task scripts in `dagonstar/tasks/`). Do not require a mounted filesystem in unit tests.
+- `bench/` contains the benchmark (`fsbench.py`, `workflow.py`, `run.py`, `plot.py`, `slurm/bench.sbatch`). Its charts go to `figures/bench-*.png`, and its results are recorded in `docs/PERFORMANCE.md`. The frontend probe (`frontend_probe.py`, `preload_probe.c`, `plot_frontends.py`, `slurm/frontend_probe.sbatch`) records its results in `docs/PERFORMANCE-FRONTENDS.md`.
+- `tests/` contains the source-contract tests, the lock-table unit tests (`test_lock_table.cpp`), the mounted suite and its harness (`mount.py`, `lock_helper.py`), the native and preload frontend test (`native_frontend.py`, no FUSE needed), the parallel MPI-IO check (`mpiio_check.c`, built as `dagonfs_mpiio_check` and run by `mount.py`), and the DAGonStar workflow test (`dagonstar/run_workflow.py` with the Python task scripts in `dagonstar/tasks/`). Do not require a mounted filesystem in unit tests.
 
 ### Deployment models
 
@@ -30,6 +31,7 @@
 - The listener never issues a system call on a mount point. Namespace replays go to the replayer thread's FIFO.
 - Every change to the namespace or to metadata (names, links, symbolic links, mode, ownership, times, xattrs) must be replicated in peer-to-peer mode. Replicated FUSE handlers call `IsReplay(req, ...)` as their first statement. A replay is identified by the replayer's thread id and is never re-broadcast.
 - The data plane addresses files by their cluster-wide `m_globalId`, never by local inode numbers. The listener reaches files only through the global-id index, never through the inode table.
+- The native frontend serves its Unix socket from rank 0 with `poll()` on one thread; clients keep one connection per process, never raise `SIGPIPE`, and handles are closed when their connection ends. Bump `DAGONFS_NATIVE_VERSION` when the socket protocol changes.
 - Locks are held in one `dagonfs::LockTable` per volume, on rank 0 (`DAGONFS_LOCK_COORDINATOR`); other peers use `LOCK_*` messages. Lock handlers never block the FUSE loop: they register the request with `SubmitLock` and the reply is sent exactly once, by `CompleteLockRequest`. Never reply from a libfuse interrupt callback. `flush` writes the file back before it releases the owner's locks.
 
 ## Engineering rules
@@ -59,6 +61,7 @@ git diff --check
 Mounted tests are driven by `tests/mount.py`, which starts the job, waits for the mounts, runs the suite (and the peer-to-peer replication checks) and always unmounts:
 
 ```bash
+python3 tests/native_frontend.py --build-dir build --ranks 2 -- --oversubscribe   # no FUSE needed
 python3 tests/mount.py --build-dir build --model client-server --ranks 4 -- --oversubscribe
 python3 tests/mount.py --build-dir build --model peer-to-peer  --ranks 4 -- --oversubscribe
 python3 tests/dagonstar/run_workflow.py --build-dir build --model client-server --ranks 4 -- --oversubscribe   # needs DAGonStar

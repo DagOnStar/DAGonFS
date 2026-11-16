@@ -180,7 +180,7 @@ void Nodes::SetINodeAttributes(INode *inode, struct stat* attr, int to_set) {
         #endif
     }
     #ifdef __APPLE__
-    if (to_set & FUSE_SET_ATTR_CHGTIME) {
+    if (to_set & FUSE_SET_ATTR_CTIME) {
         inode->m_fuseEntryParam.attr.st_ctimespec = attr->st_ctimespec;
     #else
     if (to_set & FUSE_SET_ATTR_CTIME) {
@@ -189,7 +189,7 @@ void Nodes::SetINodeAttributes(INode *inode, struct stat* attr, int to_set) {
     }
 
     #ifdef __APPLE__
-    if (to_set & FUSE_SET_ATTR_CRTIME) {
+    if (to_set & FUSE_SET_ATTR_BTIME) {
         inode->m_fuseEntryParam.attr.st_birthtimespec = attr->st_birthtimespec;
     }
     // TODO: Can't seem to find this one.
