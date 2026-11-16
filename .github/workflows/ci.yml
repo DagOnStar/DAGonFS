@@ -26,6 +26,8 @@ jobs:
           python-version: "3.12"
       - name: Byte-compile test helpers
         run: python3 -m py_compile tests/*.py tests/dagonstar/*.py tests/dagonstar/tasks/*.py python/dagonfs/*.py bench/*.py
+      - name: Frontend harness smoke test
+        run: python3 bench/run_frontends.py --command 'true' --output "$RUNNER_TEMP/frontends.csv"
       - name: Architectural invariants
         run: python3 tests/test_source_contract.py -v
       - name: Whitespace errors introduced by the change
@@ -65,6 +67,7 @@ jobs:
           path: |
             build/dagonfs
             build/DAGonFS_Launcher
+            build/libdagonfs_preload.*
           retention-days: 7
 
   mounted:

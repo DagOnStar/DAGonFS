@@ -16,6 +16,7 @@
 #include "../nodes/Nodes.hpp"
 #include "../ramfs/FileSystem.hpp"
 #include "../utils/log_level.hpp"
+#include "../frontends/native/NativeFrontend.hpp"
 
 log4cplus::LogLevel DAGONFS_LOG_LEVEL = log4cplus::OFF_LOG_LEVEL;
 
@@ -67,7 +68,12 @@ int runVolume(const VolumeOptions &options) {
     DistributedCode *controlPlane = DistributedCode::getInstance();
 
     int status = 0;
-    if (!options.mounts(rank)) {
+    if (options.frontend != Frontend::Fuse && rank == 0) {
+        std::thread listener(&DistributedCode::start);
+        dagonfs::NativeFrontend frontend(rank, worldSize);
+        status = frontend.serve(options.root);
+        listener.join();
+    } else if (!options.mounts(rank)) {
         // Client-server storage rank: serve the front end until TERMINATE.
         controlPlane->start();
     } else if (peerToPeer) {

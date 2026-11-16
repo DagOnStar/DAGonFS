@@ -92,6 +92,8 @@ add_library(dagonfs_core STATIC
         src/mpi/RequestSender.cpp
         src/locks/LockTable.cpp
         src/utils/ArgumentParser.cpp
+        src/frontends/native/NativeFrontend.cpp
+        src/frontends/native/Client.c
 )
 target_compile_definitions(dagonfs_core PUBLIC
         FUSE_USE_VERSION=32 _FILE_OFFSET_BITS=64
@@ -99,6 +101,11 @@ target_compile_definitions(dagonfs_core PUBLIC
         OMPI_SKIP_MPICXX=1 MPICH_SKIP_MPICXX=1)
 target_link_libraries(dagonfs_core PUBLIC dagonfs_options ${FUSE3_LIBRARIES} ${MPI_C_LIBRARIES} ${LOG4CPLUS_LIBRARIES} -lpthread)
 set_target_properties(dagonfs_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(dagonfs_preload SHARED src/frontends/preload/dagonfs_preload.c src/frontends/native/Client.c)
+target_include_directories(dagonfs_preload PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/frontends/native)
+target_link_libraries(dagonfs_preload PRIVATE -lpthread)
+set_target_properties(dagonfs_preload PROPERTIES OUTPUT_NAME dagonfs_preload)
 # The sources include log4cplus headers produced by the external project, so
 # they must not be compiled before it has been installed in the build tree.
 add_dependencies(dagonfs_core log4cplus)
@@ -132,7 +139,7 @@ else()
     set(DAGONFS_INSTALL_RPATH "$ORIGIN/../lib")
 endif()
 set_target_properties(dagonfs PROPERTIES INSTALL_RPATH "${DAGONFS_INSTALL_RPATH}")
-install(TARGETS dagonfs ${PROJECT_NAME}_Launcher DESTINATION bin)
+install(TARGETS dagonfs ${PROJECT_NAME}_Launcher dagonfs_preload DESTINATION bin)
 install(TARGETS dagonfs_core dagonfs_options ARCHIVE DESTINATION lib)
 install(FILES src/volume/Options.hpp src/volume/Volume.hpp DESTINATION include/dagonfs)
 install(DIRECTORY ${EXTERNAL_INSTALL_LOCATION}/lib/ DESTINATION lib FILES_MATCHING PATTERN "liblog4cplus*")
@@ -157,6 +164,9 @@ if(BUILD_TESTING)
     # The lock table is pure bookkeeping: unit-tested without MPI or FUSE.
     add_executable(test_lock_table tests/test_lock_table.cpp src/locks/LockTable.cpp)
     add_test(NAME dagonfs-lock-table COMMAND test_lock_table)
+    add_executable(test_frontend_options tests/test_frontend_options.cpp)
+    target_link_libraries(test_frontend_options PRIVATE dagonfs_options)
+    add_test(NAME dagonfs-frontend-options COMMAND test_frontend_options)
     # Parallel MPI-IO client for the mounted tests (tests/mount.py runs it as
     # an MPI job of its own against the mounted volume).
     add_executable(dagonfs_mpiio_check tests/mpiio_check.c)

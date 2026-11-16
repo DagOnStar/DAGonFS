@@ -41,7 +41,21 @@ const char *modelName(Model model) {
     return model == Model::PeerToPeer ? "peer-to-peer" : "client-server";
 }
 
+std::optional<Frontend> parseFrontend(std::string_view text) {
+    if (text == "fuse" || text == "fuse3") return Frontend::Fuse;
+    if (text == "native" || text == "mpi-io" || text == "mpiio") return Frontend::Native;
+    if (text == "preload" || text == "interpose" || text == "ld-preload") return Frontend::Preload;
+    return std::nullopt;
+}
+
+const char *frontendName(Frontend frontend) {
+    if (frontend == Frontend::Native) return "native";
+    if (frontend == Frontend::Preload) return "preload";
+    return "fuse3";
+}
+
 bool VolumeOptions::mounts(int rank) const {
+    if (frontend != Frontend::Fuse) return rank == 0;
     return model == Model::PeerToPeer || rank == 0;
 }
 
@@ -91,6 +105,14 @@ bool applyIni(const IniValues &values, VolumeOptions &options, std::string &erro
     if (auto entry = values.find("dagonfs_root_dir"); entry != values.end() && !entry->second.empty()) {
         options.root = entry->second;
     }
+    if (auto entry = values.find("dagonfs_frontend"); entry != values.end()) {
+        const auto frontend = parseFrontend(entry->second);
+        if (!frontend) {
+            error = "dagonfs_frontend must be 'fuse3', 'native' or 'preload', not '" + entry->second + "'";
+            return false;
+        }
+        options.frontend = *frontend;
+    }
     if (auto entry = values.find("fuse_mode"); entry != values.end()) {
         if (entry->second != "f" && entry->second != "d") {
             error = "fuse_mode must be 'f' (foreground) or 'd' (debug)";
@@ -137,6 +159,22 @@ ParseStatus parseCommandLine(int argc, const char *const argv[], VolumeOptions &
         if (arg == "-f") { options.debug = false; continue; }
         if (arg == "-d") { options.debug = true; continue; }
         if (arg == "--log") { options.logging = true; continue; }
+        std::string frontendText;
+        bool isFrontend = false;
+        if (arg == "--frontend") {
+            if (i + 1 >= args.size()) { error = arg + " requires a value"; return ParseStatus::Error; }
+            frontendText = args[++i];
+            isFrontend = true;
+        } else if (arg.rfind("--frontend=", 0) == 0) {
+            frontendText = arg.substr(11);
+            isFrontend = true;
+        }
+        if (isFrontend) {
+            const auto frontend = parseFrontend(frontendText);
+            if (!frontend) { error = "unknown frontend '" + frontendText + "'"; return ParseStatus::Error; }
+            options.frontend = *frontend;
+            continue;
+        }
         std::string modelText;
         bool isModel = false;
         if ((arg == "--model" || arg == "-m")) {
@@ -170,10 +208,13 @@ ParseStatus parseCommandLine(int argc, const char *const argv[], VolumeOptions &
 
 std::string usage(const std::string &program) {
     return "Usage: mpirun -np <P> [--hostfile <file>] " + program +
-           " [--model client-server|peer-to-peer] [--config DAGonFS.ini] [-f|-d] [--log] <root> [0|1]\n"
+           " [--model client-server|peer-to-peer] [--frontend fuse3|native|preload] [--config DAGonFS.ini] [-f|-d] [--log] <root> [0|1]\n"
            "\n"
            "  -m, --model M    client-server: rank 0 mounts <root>, other ranks store blocks\n"
            "                   peer-to-peer:  rank r mounts <root>/<r>, namespace is replicated\n"
+           "      --frontend F fuse3: mount through the kernel (default)\n"
+           "                   native: serve the client protocol at Unix socket <root>\n"
+           "                   preload: native service used through the POSIX interposer\n"
            "  -c, --config F   read dagonfs_model, dagonfs_root_dir, fuse_mode, enable_logging from F\n"
            "  -f               run FUSE in the foreground (default; required under MPI)\n"
            "  -d               foreground with a trace of every FUSE request\n"

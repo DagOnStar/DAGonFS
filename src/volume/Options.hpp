@@ -23,6 +23,19 @@ enum class Model {
     PeerToPeer,
 };
 
+/** How applications reach a volume. */
+enum class Frontend {
+    /** Kernel VFS mount through libfuse3. */
+    Fuse,
+    /** Unix-domain socket protocol used by the C and MPI-aware clients. */
+    Native,
+    /** Native protocol plus an LD_PRELOAD POSIX interposer and virtual path prefix. */
+    Preload,
+};
+
+std::optional<Frontend> parseFrontend(std::string_view text);
+const char *frontendName(Frontend frontend);
+
 /** Parse "client-server" / "cs" or "peer-to-peer" / "p2p" (case-sensitive). */
 std::optional<Model> parseModel(std::string_view text);
 /** Canonical name: "client-server" or "peer-to-peer". */
@@ -31,7 +44,8 @@ const char *modelName(Model model);
 /** Everything needed to create (mount and serve) a DAGonFS volume. */
 struct VolumeOptions {
     Model model = Model::ClientServer;
-    /** Mount point (client-server) or parent of the per-rank mount points (peer-to-peer). */
+    Frontend frontend = Frontend::Fuse;
+    /** FUSE mount root, or the native/preload frontend's Unix socket path. */
     std::string root;
     /** Trace every FUSE request (FUSE "-d"); FUSE always runs in the foreground. */
     bool debug = false;

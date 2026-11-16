@@ -31,6 +31,8 @@
 
 #include "../utils/log_level.hpp"
 
+namespace dagonfs { class NativeFrontend; }
+
 /**
  * @brief The main FUSE code repository.
  *
@@ -39,6 +41,7 @@
  * contents are distributed over the MPI ranks by the data plane.
  */
 class FileSystem {
+    friend class dagonfs::NativeFrontend;
 private:
     /** True if the filesystem is reclaiming inodes at the present point in time. */
     static bool m_reclaimingINodes;

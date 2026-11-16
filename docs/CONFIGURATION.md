@@ -7,7 +7,7 @@
 | Build system | CMake ≥ 3.20 | The first configure downloads and builds log4cplus (network access required once). |
 | Compiler | C++23 (GCC ≥ 12, Clang ≥ 16) | Both executables build with `-Wall -Wextra`. |
 | MPI | Any MPI-3 implementation; the peer-to-peer model requires `MPI_THREAD_MULTIPLE` | Tested with Open MPI 4.1. |
-| FUSE | libfuse ≥ 3.3 headers and runtime, `/dev/fuse`, set-uid `fusermount3` | Nodes that ship only the FUSE 2 helper `fusermount` work too: `tests/slurm/fuse-env.sh` puts a `fusermount3` link to it first on `PATH` (both helpers speak the same protocol). On macOS, macFUSE provides the headers; mounting is untested there. |
+| FUSE | libfuse ≥ 3.3 headers and runtime, `/dev/fuse`, set-uid `fusermount3` | Required only for `--frontend fuse3`; see [FRONTENDS.md](FRONTENDS.md) for the FUSE-free native and preload modes. |
 
 ## 2. Building
 

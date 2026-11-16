@@ -137,6 +137,10 @@ The complete wire specification and ordering guarantees are in [docs/PROTOCOL.md
 
 Requirements: CMake ≥ 3.20, a C++23 compiler, MPI (Open MPI ≥ 4.1 tested; `MPI_THREAD_MULTIPLE` for peer-to-peer), libfuse ≥ 3.3 with `fusermount3` (or the FUSE 2 `fusermount`, through `tests/slurm/fuse-env.sh`). The first configure downloads log4cplus.
 
+The default frontend is FUSE3. FUSE-free deployments can select `--frontend native`
+for the Unix-socket/MPI-IO client protocol or `--frontend preload` for the
+opt-in POSIX interposer; see [docs/FRONTENDS.md](docs/FRONTENDS.md).
+
 ```bash
 git clone https://github.com/DagOnStar/DAGonFS.git
 cd DAGonFS
