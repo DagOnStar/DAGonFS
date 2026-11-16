@@ -14,6 +14,7 @@ The documents are written to be read in order by a newcomer, and individually as
 | [TESTING.md](TESTING.md) | Validation levels, test harness, the DAGonStar workflow test, recorded results |
 | [DEFECT-ANALYSIS.md](DEFECT-ANALYSIS.md) | November 2026 assessment: defects D1–D47, root causes and remedies |
 | [man/dagonfs.1](man/dagonfs.1) | Manual page of `dagonfs` and `DAGonFS_Launcher` (`man docs/man/dagonfs.1`) |
+| [presentations/](presentations/README.md) | A 20-minute scientific talk and a 20-minute hands-on tutorial (PowerPoint, with speaker notes) |
 
 Contributor rules are in [../AGENTS.md](../AGENTS.md). The benchmark scripts are in [../bench](../bench), and the figures in [../figures](../figures).
 

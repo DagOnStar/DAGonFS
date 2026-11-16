@@ -220,6 +220,7 @@ The WiDE '24 paper reported earlier experiments on the code base before the Nove
 | [Testing](docs/TESTING.md) | Harness, the DAGonStar workflow test and recorded results |
 | [Defect analysis](docs/DEFECT-ANALYSIS.md) | Assessment, defects and remedies |
 | [Manual page](docs/man/dagonfs.1) | `dagonfs(1)` and `DAGonFS_Launcher`; read it with `man docs/man/dagonfs.1` |
+| [Presentations](docs/presentations/README.md) | Scientific talk and hands-on tutorial, 20 minutes each (PowerPoint) |
 | [Contributor guide](AGENTS.md) | Rules for changing the code |
 
 ## References
