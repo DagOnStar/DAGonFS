@@ -1,0 +1,90 @@
+{
+  "host": "wn04",
+  "system": "Intel Xeon Gold 5218, Rocky Linux 8.10, GCC 12.2.1, Open MPI 4.1.4 (Slurm job 19788, --exclusive)",
+  "workload": "2000 sequential 4 KiB pwrite then pread; modes interleaved per round after a warm-up; 2 MPI ranks",
+  "units": "operations per second",
+  "ops": 2000,
+  "size": 4096,
+  "ranks": 2,
+  "build": "8422144",
+  "fuse": {
+    "pwrite": [
+      30576,
+      37918,
+      30707,
+      38932,
+      36918
+    ],
+    "pread": [
+      415642,
+      414329,
+      419333,
+      420161,
+      415955
+    ]
+  },
+  "fuse-p2p": {
+    "pwrite": [
+      36928,
+      36291,
+      35529,
+      38875,
+      37379
+    ],
+    "pread": [
+      68329,
+      68815,
+      71350,
+      71826,
+      68137
+    ]
+  },
+  "native": {
+    "pwrite": [
+      63582,
+      60969,
+      64173,
+      63554,
+      60624
+    ],
+    "pread": [
+      83252,
+      82352,
+      84282,
+      84102,
+      83704
+    ]
+  },
+  "preload": {
+    "pwrite": [
+      69617,
+      68486,
+      67670,
+      70120,
+      69912
+    ],
+    "pread": [
+      93794,
+      93464,
+      92942,
+      93545,
+      94468
+    ]
+  },
+  "local": {
+    "pwrite": [
+      572256,
+      562081,
+      587414,
+      593766,
+      586031
+    ],
+    "pread": [
+      1166213,
+      1197840,
+      1241492,
+      1283539,
+      1265223
+    ]
+  }
+}

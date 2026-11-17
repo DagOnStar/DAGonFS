@@ -37,10 +37,47 @@ python3 bench/plot_frontends.py figures/OUT.png RESULT.json=LABEL ...
 |---|---|---|---|
 | macOS | Apple M4 Max | macOS 26, Open MPI 5.0 | no `/dev/fuse`: native, preload and local only |
 | Rainbow | AMD Ryzen 9 9900X, 12 cores | Ubuntu, kernel 6.17, GCC 13, Open MPI 4.1.6, libfuse 3.14 | shared workstation, load average ≈ 12 during the runs |
-| PurpleJeans wn01 | AMD EPYC 9124, 16 cores | RHEL 8, GCC 12.2.1, Open MPI 4.1.4 | Slurm `low-wn` node, jobs 19750 (before), 19770 and 19771 (after) |
+| PurpleJeans `low-wn` | 2 × Intel Xeon Gold 5218, 32 cores | Rocky Linux 8.10, GCC 12.2.1, Open MPI 4.1.4 | wn01: jobs 19750 (before), 19770 and 19771 (after); wn04: job 19788 (versus FUSE3-only) |
 
 Sunbow (`193.205.230.23`) was reachable but has no MPI or CMake in its default
 environment, so it has no results.
+
+## Versus the FUSE3-only implementation
+
+The same probe compares the current build (`8422144`) with the FUSE3-only
+build of this morning (`19ce8b8`, before the native and preload frontends were
+added). Both were built from clean trees with the same compiler, flags,
+libfuse and MPI, and run in one exclusive Slurm job on wn04 (job 19788): after
+a warm-up, each of five rounds runs every mode of both builds once, so the
+builds see the same node state. Medians in thousands of operations per second,
+with the ratio to this morning's FUSE3 client-server volume:
+
+| Build, mode | `pwrite` | vs. morning | `pread` | vs. morning |
+|---|---:|---:|---:|---:|
+| this morning, FUSE3 client-server | 37.5 | 1.00 | 416.8 | 1.00 |
+| this morning, FUSE3 peer-to-peer | 37.1 | 0.99 | 70.1 | 0.17 |
+| current, FUSE3 client-server | 36.9 | 0.98 | 416.0 | 1.00 |
+| current, FUSE3 peer-to-peer | 36.9 | 0.98 | 68.8 | 0.17 |
+| current, native | 63.6 | **1.69** | 83.7 | 0.20 |
+| current, preload | 69.6 | **1.85** | 93.5 | 0.22 |
+| local file (reference) | 586.0 | 15.6 | 1,241.5 | 3.0 |
+
+![Current build versus the FUSE3-only build](../figures/frontends-vs-fuse3-only-20261116.png)
+
+- **FUSE3 is unchanged.** Both models perform the same in both builds (within
+  2%, well inside the run-to-run spread): adding the frontends cost the FUSE
+  path nothing, as expected, since its code did not change on Linux.
+- **The socket frontends write 1.7–1.9× faster than FUSE3** on this node: one
+  socket round trip replaces a trip through the kernel's FUSE queue.
+- **FUSE3 client-server still reads 4.5–5× faster** thanks to the kernel page
+  cache; the socket frontends read 1.2–1.3× faster than FUSE3 peer-to-peer,
+  which runs without that cache.
+
+An earlier, non-interleaved job (19783, wn02) showed the current FUSE3 build
+1.6× faster than the morning build. That job ran each build's modes in
+separate blocks, and the current build's FUSE runs came after the native and
+preload runs; a strict alternation of the two builds (job 19785) removed the
+difference. Compare builds only with interleaved runs.
 
 ## Persistent connections: before and after (100 operations)
 
@@ -107,3 +144,4 @@ Findings:
 | `bench/results/frontends-macos-20261116.json`, `frontends-rainbow-20261116.json`, `frontends-purplejeans-20261116.json` | before (protocol version 1), 100 operations |
 | `bench/results/frontends-*-20261116-v2-100ops.json` | after, 100 operations |
 | `bench/results/frontends-*-20261116-v2.json` | after, 2,000 operations |
+| `bench/results/frontends-wn04-19788-morning.json`, `frontends-wn04-19788-today.json` | FUSE3-only build versus current build, interleaved, 2,000 operations |

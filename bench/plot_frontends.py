@@ -55,14 +55,17 @@ def main():
                 high.append(max(values) - median)
             ax.bar(xs, medians, width=width * 0.9, color=COLOURS[index], label=label,
                    yerr=[low, high], error_kw={"elinewidth": 1, "capsize": 2, "ecolor": "#555"})
-        ax.set_xticks(range(len(results)), [r["label"] for r in results])
+        # "\n" in a label (written "\\n" on the command line) breaks it into lines.
+        ax.set_xticks(range(len(results)), [r["label"].replace("\\n", "\n") for r in results], fontsize=9)
         ax.set_yscale("log")
-        ax.set_ylim(bottom=1e4)
         ax.set_title(f"{results[0]['size'] // 1024} KiB {operation}", fontsize=11)
         ax.grid(axis="y", color="#ddd", linewidth=0.6)
         ax.set_axisbelow(True)
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
+    # Set after both panels are drawn, so the shared top fits every bar.
+    top = max(max(v) for r in results for k, _ in MODES if k in r for v in r[k].values())
+    axes[0].set_ylim(1e4, top * 1.5)
     axes[0].set_ylabel("Operations per second (log scale, median, min–max)")
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=len(labels), frameon=False, fontsize=9)
