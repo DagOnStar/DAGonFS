@@ -38,7 +38,8 @@
 #endif
 
 #define SLOTS 1024
-struct slot { int fd; int64_t handle; off_t offset; int flags; };
+/* "used" marks a slot in use: 0 is a valid descriptor (stdin), never a sentinel. */
+struct slot { int used; int fd; int64_t handle; off_t offset; int flags; };
 static struct slot slots[SLOTS];
 static pthread_mutex_t slots_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -79,7 +80,7 @@ static int remote_path(const char *path, const char **inside) {
 static struct slot *find_locked(int fd) {
     int i;
     if (fd < 0) return NULL;
-    for (i = 0; i < SLOTS; ++i) if (slots[i].fd == fd) return &slots[i];
+    for (i = 0; i < SLOTS; ++i) if (slots[i].used && slots[i].fd == fd) return &slots[i];
     return NULL;
 }
 
@@ -106,8 +107,8 @@ static int attach(int64_t handle, int flags) {
     if (fd < 0) return -1;
     pthread_mutex_lock(&slots_mutex);
     for (i = 0; i < SLOTS; ++i) {
-        if (slots[i].fd == 0) {
-            slots[i].fd = fd; slots[i].handle = handle; slots[i].offset = 0; slots[i].flags = flags;
+        if (!slots[i].used) {
+            slots[i].used = 1; slots[i].fd = fd; slots[i].handle = handle; slots[i].offset = 0; slots[i].flags = flags;
             pthread_mutex_unlock(&slots_mutex);
             return fd;
         }
@@ -139,7 +140,7 @@ int WRAP(close)(int fd) {
     struct slot s;
     if (!lookup(fd, &s)) return CALL_REAL(close)(fd);
     pthread_mutex_lock(&slots_mutex);
-    { struct slot *p = find_locked(fd); if (p) p->fd = 0; }
+    { struct slot *p = find_locked(fd); if (p) p->used = 0; }
     pthread_mutex_unlock(&slots_mutex);
     CALL_REAL(close)(fd);
     return dagonfs_client_close(s.handle);
