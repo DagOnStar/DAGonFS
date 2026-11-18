@@ -54,6 +54,25 @@ Use `model="client-server"` when every task runs on the node hosting rank 0. Use
 
 In a peer-to-peer volume, a file written and closed on one peer can be read on any other peer as soon as `close` returns. Namespace changes (creation, rename, removal) reach the other peers asynchronously, typically within milliseconds, so a consumer on another node should wait for the producer task's completion, which DAGonStar's dependency graph already enforces. Tasks that run concurrently and update the same file must serialise their updates with `fcntl`/`lockf` or `flock` locks, which DAGonFS enforces across all peers.
 
+## Using the DAGonStar ad-hoc file-system interface
+
+DAGonStar (`dagon/adhoc.py`) manages a DAGonFS volume as a workflow resource:
+the workflow starts it before its tasks, injects its location into every bound
+task, and stops it after the last task, also after failures:
+
+```python
+fs = workflow.create_adhoc_filesystem("dagonfs", mountpoint="/tmp/dfs.sock",
+                                      frontend="native", ranks=4,
+                                      executable="/opt/dagonfs/bin/dagonfs")
+fs.bind(task)   # task sees DAGON_ADHOC_PATH, DAGON_ADHOC_ACCESS, DAGONFS_SOCKET
+```
+
+With `frontend="fuse3"` (default) tasks use the mount point in
+`DAGONFS_MOUNTPOINT`. With `native`, they use the socket through
+`python -m dagonfs` (this module must be importable on the task's
+`PYTHONPATH`); with `preload`, the interposer variables are exported as well.
+See DAGonStar's `docs/adhoc_filesystems.md` for the provider-neutral contract.
+
 ## Validated example: Python task scripts
 
 `tests/dagonstar/run_workflow.py` is a complete, tested example ([TESTING.md](TESTING.md) §2.2). It creates a volume with either model, copies the task scripts of `tests/dagonstar/tasks/` onto the volume and runs a fan-out/fan-in workflow whose tasks execute those scripts from the volume:

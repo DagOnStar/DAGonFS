@@ -1,5 +1,39 @@
 # Testing and validation
 
+## Python native client and macOS FUSE3 (16 November 2026, later run)
+
+The standard-library client `python/dagonfs/native.py` (and `python -m
+dagonfs`) is checked by the contract tests (constants, opcodes and structure
+sizes against `Protocol.h`) and by a third pass of `tests/native_frontend.py`
+(directory trees across two requests of 8 MiB, rename, errors, relative-path
+rejection), which CI now runs with three ranks.
+
+| Host | Contract tests | `tests/native_frontend.py` (native, preload, Python client) | `tests/mount.py` client-server, 2 ranks |
+|---|---|---|---|
+| macOS 26 (M4 Max, Open MPI 5.0, macFUSE) | 28/28 | pass, 3 ranks | 22 pass, 5 skipped, 3 fail (below) |
+
+macFUSE now mounts DAGonFS on this host, so the mounted suite runs on macOS.
+`tests/lock_helper.py` used the Linux `struct flock` layout and failed with
+`EINVAL` on macOS; it now packs the Darwin layout, and the record-lock tests
+pass. Three scenarios are skipped on macOS because the kernel answers them
+before DAGonFS sees the request (confirmed with a `-d` trace): `mknod` of a
+regular file (superuser only), `SEEK_DATA`/`SEEK_HOLE` (`ENOTTY`, not
+forwarded), and `posix_fallocate` (absent from Python on macOS). Three remain
+open on macOS and pass on Linux:
+
+- `test_fifo`: the FIFO is created, but opening it through macFUSE fails with
+  `EPERM`.
+- `test_flock_between_processes`: the test expects `flock` and POSIX locks to
+  be independent (Linux semantics); on macOS a POSIX lock is refused while a
+  `flock` lock is held.
+- `test_blocked_lock_is_interrupted_by_a_signal`: the waiting lock is granted
+  instead of interrupted.
+
+These are recorded as platform differences, not fixed; DAGonFS keeps Linux as
+its supported FUSE3 platform. Ordinary file creation, writes and reads through
+the macOS FUSE3 mount pass, and DAGonStar's ad-hoc benchmark workflow (one
+producer, verifying readers) ran on all three frontends on this host.
+
 ## Validation of 16 November 2026 (native protocol version 2)
 
 | Host | Build and `ctest` | Contract tests | `tests/native_frontend.py` | `tests/mount.py` client-server | `tests/mount.py` peer-to-peer |

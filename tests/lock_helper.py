@@ -23,7 +23,24 @@ import signal
 import struct
 import sys
 
-FLOCK_FORMAT = "hhqqi4x"  # struct flock on LP64 Linux (32 bytes)
+if sys.platform == "darwin":
+    # struct flock on macOS: l_start, l_len, l_pid, l_type, l_whence (24 bytes).
+    FLOCK_FORMAT = "qqihh"
+
+    def pack_flock(kind, whence, start, length, pid):
+        return struct.pack(FLOCK_FORMAT, start, length, pid, kind, whence)
+
+    def unpack_flock(data):
+        start, length, pid, kind, whence = struct.unpack(FLOCK_FORMAT, data)
+        return kind, whence, start, length, pid
+else:
+    FLOCK_FORMAT = "hhqqi4x"  # struct flock on LP64 Linux (32 bytes)
+
+    def pack_flock(kind, whence, start, length, pid):
+        return struct.pack(FLOCK_FORMAT, kind, whence, start, length, pid)
+
+    def unpack_flock(data):
+        return struct.unpack(FLOCK_FORMAT, data)
 BUSY = (errno.EAGAIN, errno.EACCES)
 
 
@@ -88,8 +105,8 @@ def main(argv):
         say("granted")
     elif command == "getlk":
         start, length = int(argv[3]), int(argv[4])
-        query = struct.pack(FLOCK_FORMAT, fcntl.F_WRLCK, os.SEEK_SET, start, length, 0)
-        result = struct.unpack(FLOCK_FORMAT, fcntl.fcntl(fd, fcntl.F_GETLK, query))
+        query = pack_flock(fcntl.F_WRLCK, os.SEEK_SET, start, length, 0)
+        result = unpack_flock(fcntl.fcntl(fd, fcntl.F_GETLK, query))
         names = {fcntl.F_RDLCK: "rdlck", fcntl.F_WRLCK: "wrlck", fcntl.F_UNLCK: "unlck"}
         say("{} {} {}".format(names.get(result[0], result[0]), result[2], result[3]))
     elif command == "deadlock":

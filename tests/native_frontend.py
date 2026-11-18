@@ -239,6 +239,46 @@ def preload_checks(build, socket, scratch):
     assert local.read_text() == "local"
 
 
+def python_client_checks(socket, scratch):
+    """The standard-library client in python/dagonfs speaks the same protocol."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+    from dagonfs.native import MAX_IO, Client as PythonClient, answers
+    assert answers(str(socket))
+    payload = os.urandom(MAX_IO + 4097)            # spans two requests
+    local = scratch / "py-in"
+    (local / "sub").mkdir(parents=True)
+    (local / "sub" / "big.bin").write_bytes(payload)
+    (local / "small.txt").write_text("dagonfs\n")
+    with PythonClient(str(socket)) as volume:
+        volume.makedirs("/py/deep/tree")
+        volume.makedirs("/py/deep/tree")         # idempotent
+        assert volume.put(str(local), "/py/in") == len(payload) + 8
+        assert volume.listdir("/py/in") == ["small.txt", "sub"]
+        assert volume.stat("/py/in/sub/big.bin").st_size == len(payload)
+        assert volume.read_bytes("/py/in/sub/big.bin") == payload
+        volume.rename("/py/in/small.txt", "/py/in/moved.txt")
+        assert not volume.exists("/py/in/small.txt")
+        assert volume.get("/py/in", str(scratch / "py-out")) == len(payload) + 8
+        assert (scratch / "py-out" / "moved.txt").read_text() == "dagonfs\n"
+        for name, error in (("/py/missing", errno.ENOENT),):
+            try:
+                volume.stat(name)
+            except OSError as caught:
+                assert caught.errno == error, caught
+            else:
+                raise AssertionError("stat of a missing path succeeded")
+        try:
+            volume.stat("relative")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("relative paths must be rejected")
+        volume.unlink("/py/in/moved.txt")
+        volume.unlink("/py/in/sub/big.bin")
+        volume.rmdir("/py/in/sub")
+        volume.rmdir("/py/in")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--build-dir", default="build")
@@ -269,6 +309,8 @@ def main():
         print("native: ok")
         preload_checks(build, socket, scratch)
         print("preload: ok")
+        python_client_checks(socket, scratch)
+        print("python client: ok")
         assert client.lib.dagonfs_client_shutdown() == 0
         assert volume.wait(timeout=60) == 0, volume.returncode
         print("shutdown: ok")

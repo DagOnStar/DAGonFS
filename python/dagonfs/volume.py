@@ -8,6 +8,7 @@ import sys
 import time
 
 MODELS = ("client-server", "peer-to-peer")
+FRONTENDS = ("fuse3", "native", "preload")
 
 
 class VolumeError(RuntimeError):
@@ -48,7 +49,8 @@ class Volume:
     """A DAGonFS volume spanning the ranks of one MPI job.
 
     :param root: mount point (client-server) or parent of the per-rank mount
-        points ``<root>/<rank>`` (peer-to-peer).
+        points ``<root>/<rank>`` (peer-to-peer); for the ``native`` and
+        ``preload`` frontends, the Unix socket served by rank 0.
     :param model: ``"client-server"`` or ``"peer-to-peer"``.
     :param ranks: number of MPI processes.
     :param executable: path of ``dagonfs`` (default: ``$DAGONFS``, then ``PATH``).
@@ -58,12 +60,28 @@ class Volume:
         waited for by :meth:`start` (default: rank 0 only).
     :param debug: trace FUSE requests; :param logging: verbose logging.
     :param log: file receiving the job's output (default: ``<root>.log``).
+    :param frontend: ``"fuse3"`` (default), ``"native"`` or ``"preload"``.
+        The FUSE-free frontends need no kernel module, serve only the
+        client-server model, and are stopped through the socket.
+    :param preload_library: ``libdagonfs_preload`` path used by
+        :meth:`environment` for the ``preload`` frontend.
+    :param preload_root: path prefix the interposer redirects (default ``/dagonfs``).
     """
 
     def __init__(self, root, model="client-server", ranks=2, executable=None, mpirun=None,
-                 mpirun_args=(), local_ranks=(0,), debug=False, logging=False, log=None):
+                 mpirun_args=(), local_ranks=(0,), debug=False, logging=False, log=None,
+                 frontend="fuse3", preload_library=None, preload_root="/dagonfs"):
         if model not in MODELS:
             raise ValueError(f"model must be one of {MODELS}, not {model!r}")
+        if frontend not in FRONTENDS:
+            raise ValueError(f"frontend must be one of {FRONTENDS}, not {frontend!r}")
+        if frontend != "fuse3" and model != "client-server":
+            raise ValueError("the native and preload frontends serve only client-server volumes")
+        if not str(preload_root).startswith("/"):
+            raise ValueError("preload_root must be an absolute path")
+        self.frontend = frontend
+        self.preload_library = preload_library
+        self.preload_root = str(preload_root).rstrip("/") or "/"
         if ranks < 1:
             raise ValueError("ranks must be positive")
         self.root = Path(root)
@@ -82,9 +100,20 @@ class Volume:
         self._log = None
 
     # -- layout ---------------------------------------------------------------
+    @property
+    def mounted(self):
+        """True if the volume is exposed through FUSE mount points."""
+        return self.frontend == "fuse3"
+
+    @property
+    def socket(self):
+        """The native socket (``None`` for a FUSE volume)."""
+        return None if self.mounted else self.root
+
     def mounts(self, rank):
         """True if ``rank`` exposes a mount point."""
-        return 0 <= rank < self.ranks and (self.model == "peer-to-peer" or rank == 0)
+        return (self.mounted and 0 <= rank < self.ranks
+                and (self.model == "peer-to-peer" or rank == 0))
 
     def mountpoint(self, rank=0):
         """Mount point of ``rank`` (``None`` if that rank does not mount the volume)."""
@@ -95,10 +124,36 @@ class Volume:
     def command(self):
         """The launch command, as a list of arguments (no shell is used)."""
         command = [self.mpirun, "-np", str(self.ranks), *self.mpirun_args, self.executable,
-                   "--model", self.model, "-d" if self.debug else "-f"]
+                   "--model", self.model]
+        if not self.mounted:
+            command += ["--frontend", self.frontend]
+        command.append("-d" if self.debug else "-f")
         if self.logging:
             command.append("--log")
         return command + [str(self.root)]
+
+    def environment(self):
+        """Variables that let a client process use this volume.
+
+        Only the ``preload`` frontend sets the interposer variable
+        (``LD_PRELOAD``, or ``DYLD_INSERT_LIBRARIES`` on macOS).
+        """
+        if self.mounted:
+            return {"DAGONFS_MOUNTPOINT": str(self.mountpoint(0) or self.root)}
+        environment = {"DAGONFS_SOCKET": str(self.root)}
+        if self.frontend == "preload":
+            environment["DAGONFS_PRELOAD_ROOT"] = self.preload_root
+            if self.preload_library:
+                variable = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
+                environment[variable] = str(self.preload_library)
+        return environment
+
+    def client(self):
+        """A :class:`dagonfs.native.Client` for a native or preload volume."""
+        if self.mounted:
+            raise VolumeError("a FUSE volume is used through its mount point, not a client")
+        from .native import Client
+        return Client(self.root)
 
     # -- life cycle -----------------------------------------------------------
     @property
@@ -109,10 +164,21 @@ class Volume:
         """Launch the volume and wait until the local mount points are mounted."""
         if self._job is not None:
             raise VolumeError("volume already started")
-        self.root.mkdir(parents=True, exist_ok=True)
+        if self.mounted:
+            self.root.mkdir(parents=True, exist_ok=True)
+        else:
+            self.root.parent.mkdir(parents=True, exist_ok=True)
         self._log = open(self.log_path, "w", encoding="utf-8")
         self._job = subprocess.Popen(self.command(), stdout=self._log, stderr=subprocess.STDOUT,
                                      cwd=self.root.parent)
+        if not self.mounted:
+            from .native import wait_until_ready
+            if not wait_until_ready(str(self.root), timeout, alive=lambda: self.running):
+                status = self._job.poll()
+                self.stop()
+                detail = f"exited with status {status}" if status is not None else "did not answer in time"
+                raise VolumeError(f"DAGonFS {detail}; see {self.log_path}")
+            return self
         mounted = lambda: all(is_mounted(self.mountpoint(r)) for r in self.local_ranks)
         if not _wait_for(lambda: mounted() or not self.running, timeout) or not mounted():
             status = self._job.poll()
@@ -125,6 +191,12 @@ class Volume:
         """Unmount the volume and wait for the MPI job; returns its exit status."""
         if self._job is None:
             return None
+        if not self.mounted and self.running:
+            from .native import Client
+            try:
+                Client(self.root, timeout=timeout).shutdown()
+            except OSError:
+                pass  # terminated below if it does not exit
         for rank in self.local_ranks:
             unmount(self.mountpoint(rank))
         try:

@@ -66,6 +66,43 @@ is a no-op, a directory cannot be moved below itself (`EINVAL`), and type
 mismatches return `EISDIR`, `ENOTDIR` or `ENOTEMPTY`. `dagonfs_client_list`
 returns the required length with `errno = ERANGE` when the buffer is too small.
 
+## Python client and command line
+
+`python/dagonfs/native.py` implements the version-2 protocol with the Python
+standard library only, so a workflow engine can drive a FUSE-free volume
+without compiling or preloading anything. It keeps one connection per
+`Client`, raises `OSError` with the server's `errno`, rejects relative paths,
+and splits transfers into requests of at most 8 MiB:
+
+```python
+from dagonfs import Volume
+
+with Volume("/tmp/v.sock", ranks=4, frontend="native") as volume:
+    with volume.client() as client:
+        client.put("inputs", "/run/inputs")         # file or directory tree
+        client.get("/run/results", "results")
+        print(client.listdir("/run"))
+# leaving the block sends SHUTDOWN and waits for every rank
+```
+
+`Volume(frontend="native" | "preload")` waits until the socket answers a
+`STAT /` request (not merely until the socket file exists), stops the volume
+with `SHUTDOWN`, and reports `environment()`: `DAGONFS_SOCKET`, plus
+`DAGONFS_PRELOAD_ROOT` and the platform's preload variable for the `preload`
+frontend. The same operations are available to shell tasks:
+
+```sh
+python -m dagonfs --socket /tmp/v.sock wait --timeout 30
+python -m dagonfs --socket /tmp/v.sock put inputs /run/inputs
+python -m dagonfs --socket /tmp/v.sock ls /run
+python -m dagonfs --socket /tmp/v.sock get /run/results results
+python -m dagonfs --socket /tmp/v.sock shutdown
+```
+
+`tests/test_source_contract.py` checks the Python constants, opcodes and
+structure sizes against `Protocol.h`; `tests/native_frontend.py` exercises the
+client against a running volume (CI runs it with three ranks).
+
 ## Interposer coverage
 
 The interposer handles absolute paths below `DAGONFS_PRELOAD_ROOT` and passes

@@ -203,6 +203,8 @@ class PythonPosixIntegrationTests(unittest.TestCase):
 
     def test_mknod_regular_file_keeps_mode_and_owner(self):
         # mknod used to drop permission bits and swap uid/gid.
+        if sys.platform == "darwin" and os.geteuid() != 0:
+            self.skipTest("macOS mknod(2) creates regular files only for the superuser")
         path = self.workdir / "node"
         os.mknod(path, stat.S_IFREG | 0o640)
         info = path.stat()
@@ -435,6 +437,8 @@ class PythonPosixIntegrationTests(unittest.TestCase):
 
     # ------------------------------------------- space, ranges and copies
     def test_fallocate_extends_punches_and_zeroes(self):
+        if not hasattr(os, "posix_fallocate"):
+            self.skipTest("os.posix_fallocate is unavailable on this platform")
         path = self.workdir / "allocated"
         fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
         try:
@@ -475,6 +479,8 @@ class PythonPosixIntegrationTests(unittest.TestCase):
     def test_seek_data_and_hole(self):
         if not hasattr(os, "SEEK_DATA"):
             self.skipTest("SEEK_DATA is unavailable")
+        if sys.platform == "darwin":
+            self.skipTest("macFUSE does not forward SEEK_DATA/SEEK_HOLE to the file system")
         path = self.workdir / "sparse-query"
         path.write_bytes(pattern(10000))
         fd = os.open(str(path), os.O_RDONLY)

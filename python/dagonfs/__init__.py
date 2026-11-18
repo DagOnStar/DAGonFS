@@ -12,8 +12,14 @@ unmounting it::
 
 The deployment model is chosen per volume at run time; the same ``dagonfs``
 executable serves both models.
+
+FUSE-free volumes (``frontend="native"`` or ``"preload"``) are served on a Unix
+socket; :mod:`dagonfs.native` is a standard-library client for them, and
+``python -m dagonfs`` exposes it on the command line.
 """
 
-from .volume import MODELS, Volume, VolumeError, is_mounted, unmount
+from .native import Client, NativeStat
+from .volume import FRONTENDS, MODELS, Volume, VolumeError, is_mounted, unmount
 
-__all__ = ["MODELS", "Volume", "VolumeError", "is_mounted", "unmount"]
+__all__ = ["Client", "FRONTENDS", "MODELS", "NativeStat", "Volume", "VolumeError",
+           "is_mounted", "unmount"]

@@ -8,6 +8,8 @@ cannot enforce.
 
 from pathlib import Path
 import re
+import struct
+import sys
 import unittest
 
 
@@ -271,6 +273,39 @@ class FuseSourceContractTests(unittest.TestCase):
         self.assertIsNone(re.search(r"argv\[[^\]]*\]\s*=[^=]", source("main.cpp")))
         self.assertIn("const char *const argv[]", source("volume/Options.hpp"))
         self.assertIn("parser.copy_args", source("ramfs/FileSystem.cpp"))
+
+
+
+class PythonNativeClientContractTests(unittest.TestCase):
+    """python/dagonfs/native.py mirrors src/frontends/native/Protocol.h."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "python"))
+        from dagonfs import native
+        self.native = native
+        self.header = source("frontends/native/Protocol.h")
+
+    def test_constants_match_protocol_header(self):
+        for name, value in (("MAGIC", self.native.MAGIC), ("VERSION", self.native.VERSION)):
+            match = re.search(r"#define DAGONFS_NATIVE_%s (0x[0-9A-Fa-f]+|\d+)u" % name, self.header)
+            self.assertEqual(int(match.group(1), 0), value, name)
+        self.assertIn("#define DAGONFS_NATIVE_MAX_PATH 4096u", self.header)
+        self.assertIn("#define DAGONFS_NATIVE_MAX_IO (8u * 1024u * 1024u)", self.header)
+
+    def test_opcodes_match_protocol_header(self):
+        body = re.search(r"enum dagonfs_native_opcode \{(.*?)\};", self.header, re.S).group(1)
+        names = re.findall(r"DAGONFS_NATIVE_(\w+)", body)
+        self.assertEqual([getattr(self.native, name) for name in names], list(range(1, len(names) + 1)))
+
+    def test_struct_layouts_follow_c_alignment(self):
+        types = {"uint16_t": "H", "uint32_t": "I", "int32_t": "i", "int64_t": "q", "uint64_t": "Q"}
+        for struct_name, packed in (("request", self.native.REQUEST), ("reply", self.native.REPLY)):
+            body = re.search(r"struct dagonfs_native_%s \{(.*?)\};" % struct_name, self.header, re.S).group(1)
+            fields = re.findall(r"(u?int\d+_t) (\w+);", body)
+            natural = struct.Struct("@" + "".join(types[kind] for kind, _ in fields))
+            # The C structs end on an 8-byte boundary on LP64 Linux and macOS.
+            self.assertEqual((natural.size + 7) // 8 * 8, packed.size, struct_name)
+            self.assertEqual(len(packed.unpack(bytes(packed.size))), len(fields), struct_name)
 
 
 if __name__ == "__main__":
