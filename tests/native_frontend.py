@@ -65,6 +65,12 @@ int main(int argc, char **argv) {
     /* Paths outside the root still reach the operating system. */
     fd = open(argv[2], O_CREAT | O_WRONLY | O_TRUNC, 0600);
     CHECK(fd >= 0 && write(fd, "local", 5) == 5 && close(fd) == 0);
+    /* Descriptor 0 is an ordinary descriptor, not a free slot: reading stdin
+       and reusing 0 for a local file must reach the operating system. */
+    CHECK(read(0, buffer, 3) == 3 && memcmp(buffer, "in\n", 3) == 0);
+    CHECK(close(0) == 0);
+    fd = open(argv[2], O_RDONLY);
+    CHECK(fd == 0 && read(fd, buffer, 5) == 5 && memcmp(buffer, "local", 5) == 0 && close(fd) == 0);
     puts("preload ok");
     return 0;
 }
@@ -235,7 +241,7 @@ def preload_checks(build, socket, scratch):
     env = dict(os.environ, DAGONFS_SOCKET=str(socket), DAGONFS_PRELOAD_ROOT="/dagonfs")
     env["DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"] = str(library)
     local = scratch / "local.txt"
-    subprocess.run([str(binary), "/dagonfs", str(local)], env=env, check=True, timeout=60)
+    subprocess.run([str(binary), "/dagonfs", str(local)], env=env, check=True, timeout=60, input=b"in\n")
     assert local.read_text() == "local"
 
 
